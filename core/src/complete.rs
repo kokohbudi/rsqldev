@@ -141,6 +141,39 @@ pub fn tables(sql: &str) -> Vec<TableRef> {
     out
 }
 
+/// Cursor sits where a table name goes: right after FROM / JOIN / INTO / UPDATE / TABLE /
+/// DESC[RIBE], or after a comma in a FROM list. Drives the automatic table popup.
+pub fn expects_table(text: &str, pos: usize) -> bool {
+    let pos = pos.min(text.len());
+    let before = &text[..word_start(text, pos)];
+    // A qualifier (`x.`) is column / schema completion, not this.
+    if before.ends_with('.') {
+        return false;
+    }
+    let t = tokens(before);
+    let is_kw = |tok: &Tok, ks: &[&str]| matches!(tok, Tok::Word(w) if ks.iter().any(|k| w.eq_ignore_ascii_case(k)));
+    match t.last() {
+        Some(tok) if is_kw(tok, &["FROM", "JOIN", "INTO", "UPDATE", "TABLE", "DESC", "DESCRIBE"]) => true,
+        Some(Tok::Punct(',')) => {
+            // Comma inside a FROM list: the nearest clause keyword before it is FROM.
+            let mut depth = 0i32;
+            for tok in t.iter().rev() {
+                match tok {
+                    Tok::Punct(')') => depth += 1,
+                    Tok::Punct('(') if depth == 0 => return false,
+                    Tok::Punct('(') => depth -= 1,
+                    _ if depth > 0 => {}
+                    tok if is_kw(tok, &["FROM"]) => return true,
+                    tok if is_kw(tok, &["SELECT", "WHERE", "SET", "ON", "BY", "VALUES", "HAVING", "INTO", "USING"]) => return false,
+                    _ => {}
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// The table a qualifier (`e` in `e.`) points at: alias first, then table name.
 pub fn resolve<'a>(refs: &'a [TableRef], q: &str) -> Option<&'a TableRef> {
     let q = unquote(q);
@@ -212,6 +245,22 @@ mod tests {
         assert_eq!(resolve(&r, "X").unwrap().name, "\"Emp\"");
         assert_eq!(stored(Db::Oracle, "emp"), "EMP");
         assert_eq!(stored(Db::Oracle, "\"Emp\""), "Emp");
+    }
+
+    #[test]
+    fn table_position() {
+        let at = |s: &str| expects_table(s, s.len());
+        assert!(at("select * from "));
+        assert!(at("select * from em"));
+        assert!(at("select * FROM emp e join de"));
+        assert!(at("select * from emp e, de"));
+        assert!(at("insert into "));
+        assert!(at("update em"));
+        assert!(!at("select a, b"), "comma in select list");
+        assert!(!at("select * from emp where a in (1, "));
+        assert!(!at("select * from emp e where e."));
+        assert!(!at("select na"));
+        assert!(!at("select * from emp -- from\nwhere x"));
     }
 
     #[test]

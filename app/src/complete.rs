@@ -3,7 +3,9 @@
 //! (or the tables of schema `x`). Names come from the connection's metadata cache.
 
 use crate::conn::{Conn, ConnRef};
-use rsqldev_core::complete::{context, filter, match_case, resolve, stored, tables};
+use rsqldev_core::complete::{context, expects_table, filter, match_case, resolve, stored, tables};
+use std::cell::Cell;
+use std::time::{Duration, Instant};
 use rsqldev_core::registry::Kind;
 use rsqldev_core::script;
 use wxdragon::prelude::*;
@@ -47,6 +49,41 @@ pub fn show(editor: StyledTextCtrl, conn: &ConnRef, explicit: bool) {
             });
         }
     }
+}
+
+thread_local! {
+    /// Bumped on every keystroke: a pending automatic popup only fires if it is still the latest.
+    static TYPED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// After a typing pause, pop the table list up by itself where a table name goes
+/// (`FROM em|`, `JOIN |`, `INTO |`), like SQL Developer.
+pub fn typed(editor: StyledTextCtrl, conn: &ConnRef, ch: char) {
+    if !(ch.is_alphanumeric() || ch == '_' || ch == ' ') {
+        return;
+    }
+    let me = TYPED.with(|t| {
+        t.set(t.get() + 1);
+        t.get()
+    });
+    let pos = editor.get_current_pos();
+    let (conn, at) = (conn.clone(), Instant::now());
+    crate::hub::every_tick(move || {
+        if TYPED.with(Cell::get) != me || !editor.is_valid() {
+            return false;
+        }
+        if at.elapsed() < Duration::from_millis(300) {
+            return true;
+        }
+        if editor.get_current_pos() == pos && !editor.auto_comp_active() && expects_table(&editor.get_text(), pos as usize) {
+            let (db, schema) = {
+                let c = conn.borrow();
+                (c.kind, c.schema.clone())
+            };
+            Conn::names(&conn, &schema, move |names| popup(editor, db, names, false));
+        }
+        false
+    });
 }
 
 /// Columns of every (owner, table), one metadata query after another.

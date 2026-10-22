@@ -242,6 +242,8 @@ impl Worksheet {
             if let (Some(w), Some(k)) = (w.upgrade(), e.get_key()) {
                 if k == '.' as i32 {
                     crate::complete::show(w.editor, &w.conn(), false);
+                } else if let Some(c) = char::from_u32(k as u32) {
+                    crate::complete::typed(w.editor, &w.conn(), c);
                 }
             }
         });
