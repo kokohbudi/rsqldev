@@ -91,12 +91,30 @@ impl Sessions {
                     v.status.set_label(&format!("{n} session(s){} · refreshed {when}", if blocked > 0 { format!(", {blocked} blocked (listed first)") } else { String::new() }));
                 }
                 Err(_) if i + 1 < qs.len() => v.run(qs, i + 1),
-                Err(e) => v.status.set_label(&format!(
-                    "{e}{}",
-                    if v.db == Kind::Oracle { "  (needs SELECT on V$SESSION, e.g. the SELECT_CATALOG_ROLE)" } else { "" }
-                )),
+                Err(e) => v.failed(&e),
             }
         });
+    }
+
+    /// Show why the list is unavailable in the grid (full text, with what to ask a DBA for),
+    /// keep the status to one line, and stop auto-refresh from repeating a query that fails.
+    fn failed(&self, e: &str) {
+        self.auto.set_value(false);
+        let user = self.conn.borrow().cfg.user.to_uppercase();
+        let denied = e.contains("ORA-00942") || e.contains("ORA-01031") || e.to_lowercase().contains("permission denied") || e.contains("VIEW SERVER STATE");
+        let hint: &[String] = &match (self.db, denied) {
+            (Kind::Oracle, true) => vec![
+                format!("{user} may not read V$SESSION. Ask a DBA for:"),
+                format!("  GRANT SELECT ON SYS.V_$SESSION TO {user};   (or the SELECT_CATALOG_ROLE)"),
+                format!("Kill Session also needs:  GRANT ALTER SYSTEM TO {user};"),
+            ],
+            (Kind::Mssql, true) => vec![format!("Ask a DBA for:  GRANT VIEW SERVER STATE TO [{user}];")],
+            (Kind::Mysql, true) => vec![format!("Ask a DBA for the PROCESS privilege:  GRANT PROCESS ON *.* TO '{user}';")],
+            _ => vec![],
+        };
+        let rows: Vec<Vec<rsqldev_core::Cell>> = e.lines().map(str::to_string).chain(hint.iter().cloned()).filter(|l| !l.trim().is_empty()).map(|l| vec![Some(l)]).collect();
+        self.grid.set(vec![rsqldev_core::Column { name: "Sessions are not available".into(), type_name: String::new(), numeric: false }], rows);
+        self.status.set_label(if denied { "No privilege to list sessions (see below)" } else { "Could not list sessions (see below)" });
     }
 
     /// Kill the session under the grid cursor, after confirming the exact statement.
