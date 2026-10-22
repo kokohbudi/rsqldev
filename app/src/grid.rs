@@ -286,7 +286,7 @@ impl ResultGrid {
             for (ci, v) in row.cur.iter().enumerate() {
                 let (r, c) = (ri as i32, ci as i32);
                 match v {
-                    Some(s) => g.set_cell_value(r, c, rsqldev_core::lob::grid_text(st.cols.get(ci).map_or("", |c| c.type_name.as_str()), s)),
+                    Some(s) => g.set_cell_value(r, c, &rsqldev_core::lob::grid_text(st.cols.get(ci).map_or("", |c| c.type_name.as_str()), s)),
                     None => {
                         g.set_cell_value(r, c, NULL_TEXT);
                         g.set_cell_text_colour(r, c, &grey);
@@ -527,7 +527,7 @@ impl ResultGrid {
         let Some(row) = st.rows.get_mut(r) else { return };
         let text = if binary {
             row.edit();
-            let t = "(BLOB)".to_string();
+            let t = format!("(BLOB {})", rsqldev_core::lob::size(bytes.len()));
             row.blobs.insert(c, Rc::new(bytes));
             t
         } else {

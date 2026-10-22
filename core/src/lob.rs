@@ -1,6 +1,6 @@
 //! Large values stay out of RAM. A cell longer than [`INLINE`] characters is written to a temp
-//! file as it is fetched; the grid keeps a short marker shown as `(BLOB)` / `(CLOB)` and the value
-//! is read back only when it is viewed, saved, exported or used in DML.
+//! file as it is fetched; the grid keeps a short marker shown as `(BLOB 5.2 MB)` / `(CLOB 1.1 MB)`
+//! and the value is read back only when it is viewed, saved, exported or used in DML.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -35,7 +35,8 @@ pub fn spill(bytes: &[u8], kind: &str) -> Option<String> {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     std::fs::create_dir_all(dir()).ok()?;
     std::fs::write(path(id), bytes).ok()?;
-    Some(format!("{TAG}{id}{TAG}({kind})"))
+    // Size comes free here: the bytes are already in hand.
+    Some(format!("{TAG}{id}{TAG}({kind} {})", size(bytes.len())))
 }
 
 /// Keep a fetched cell in memory, or spill it when large. Binary cells arrive as hex text
@@ -71,9 +72,16 @@ pub fn is_blob_type(type_name: &str) -> bool {
     ["BLOB", "BYTEA", "IMAGE", "LONG RAW", "LONG_RAW"].iter().any(|k| t.contains(k))
 }
 
-/// Grid text for a cell of a column of type `type_name`.
-pub fn grid_text<'a>(type_name: &str, s: &'a str) -> &'a str {
-    if is_blob_type(type_name) && !is_lob(s) { "(BLOB)" } else { display(s) }
+/// Grid text for a cell of a column of type `type_name`. An in-memory BLOB's size is its hex
+/// length / 2: no decoding, no extra query.
+pub fn grid_text<'a>(type_name: &str, s: &'a str) -> Cow<'a, str> {
+    // Already a label (a file staged by Load Value): keep it.
+    if is_blob_type(type_name) && !is_lob(s) && !s.starts_with("(BLOB") {
+        let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("\\x")).unwrap_or(s);
+        Cow::Owned(format!("(BLOB {})", size(hex.len() / 2)))
+    } else {
+        Cow::Borrowed(display(s))
+    }
 }
 
 /// Text to show in the grid: the marker label for spilled cells.
@@ -134,13 +142,14 @@ mod tests {
         let data: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
         let cell = keep(format!("0x{}", crate::hex(&data)), true);
         assert!(cell.len() < 100 && is_lob(&cell), "{cell:?}");
-        assert_eq!(display(&cell), "(BLOB)");
-        assert_eq!(size(100_000), "97.7 KB");
+        assert_eq!(display(&cell), "(BLOB 97.7 KB)");
+        assert_eq!(grid_text("BLOB", "0x0102"), "(BLOB 2 bytes)");
+        assert_eq!(grid_text("RAW(16)", "0102"), "0102");
         assert_eq!(bytes(&cell).unwrap(), data);
         assert!(expand(&cell).starts_with("0x00010203"));
         let text = "é".repeat(40_000);
         let t = keep(text.clone(), false);
-        assert_eq!(display(&t), "(CLOB)");
+        assert_eq!(display(&t), "(CLOB 78.1 KB)");
         assert_eq!(expand(&t), text);
         release(&cell);
         assert!(bytes(&cell).is_none());
