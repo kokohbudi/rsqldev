@@ -4,6 +4,14 @@ Native SQL Developer clone in Rust. wxWidgets (via wxDragon) renders real Cocoa 
 macOS and Win32 widgets on Windows. Multi-database like DBeaver, with on-demand native driver
 download (Oracle Instant Client) instead of JDBC.
 
+## Download
+
+Prebuilt macOS (universal) and Windows builds, install guide and tutorial:
+https://kokohbudi.github.io/rsqldev/ · [Releases](https://github.com/kokohbudi/rsqldev/releases)
+
+Release: bump `version` in `Cargo.toml`, then `git tag v0.x.y && git push --tags`
+(`.github/workflows/release.yml` builds and publishes the zips).
+
 ## Run
 
     cargo run --release -p rsqldev

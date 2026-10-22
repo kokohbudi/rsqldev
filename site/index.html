@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rsqldev — SQL client native</title>
+<meta name="description" content="rsqldev: SQL client native ala Oracle SQL Developer untuk Oracle, PostgreSQL, MySQL, SQL Server, ClickHouse, SQLite dan DuckDB. Ringan, tanpa Java.">
+<style>
+:root {
+  --bg: #ffffff; --fg: #1d2330; --muted: #5b6475; --line: #e3e6ec; --card: #f6f7f9;
+  --accent: #c74634; --accent-fg: #ffffff; --code: #f1f3f6;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #14171c; --fg: #e6e9ef; --muted: #9aa3b2; --line: #2a2f38; --card: #1b1f26; --accent: #e8664f; --accent-fg: #14171c; --code: #20252d; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 0 16px 64px; }
+header { padding: 56px 0 24px; }
+h1 { font-size: 2.4rem; margin: 0 0 8px; letter-spacing: -0.02em; }
+h2 { font-size: 1.45rem; margin: 48px 0 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+h3 { font-size: 1.1rem; margin: 24px 0 8px; }
+p.lead { font-size: 1.15rem; color: var(--muted); margin: 0 0 24px; }
+a { color: var(--accent); }
+.downloads { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin: 24px 0 8px; }
+.dl { display: block; padding: 16px 18px; border-radius: 10px; background: var(--accent); color: var(--accent-fg); text-decoration: none; font-weight: 600; }
+.dl small { display: block; font-weight: 400; opacity: 0.85; }
+.note { color: var(--muted); font-size: 0.92rem; }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
+code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--code); padding: 12px 14px; border-radius: 8px; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.card h3 { margin-top: 0; }
+.card p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+ol li, ul li { margin: 4px 0; }
+footer { margin-top: 56px; color: var(--muted); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>rsqldev</h1>
+  <p class="lead">SQL client native ala Oracle SQL Developer, multi-database seperti DBeaver — tapi tanpa Java. Jendela asli macOS dan Windows, pakai memory sekitar 4–8× lebih kecil.</p>
+  <div class="downloads">
+    <a class="dl" href="https://github.com/kokohbudi/rsqldev/releases/latest/download/rsqldev-macos-universal.zip">Download untuk macOS<small>Apple Silicon &amp; Intel · macOS 11+</small></a>
+    <a class="dl" href="https://github.com/kokohbudi/rsqldev/releases/latest/download/rsqldev-windows-x64.zip">Download untuk Windows<small>Windows 10 / 11 · 64-bit</small></a>
+  </div>
+  <p class="note">Semua versi &amp; catatan rilis: <a href="https://github.com/kokohbudi/rsqldev/releases">halaman Releases</a>. Kode sumber: <a href="https://github.com/kokohbudi/rsqldev">github.com/kokohbudi/rsqldev</a>.</p>
+</header>
+
+<h2>Database yang didukung</h2>
+<table>
+  <tr><th>Database</th><th>Driver</th></tr>
+  <tr><td>Oracle</td><td>Oracle Instant Client — diunduh otomatis dari oracle.com saat pertama konek (atau arahkan ke folder Instant Client yang sudah ada)</td></tr>
+  <tr><td>PostgreSQL &amp; turunannya (Redshift, CockroachDB, YugabyteDB, TimescaleDB, Greenplum, …)</td><td>Sudah tertanam</td></tr>
+  <tr><td>MySQL &amp; turunannya (MariaDB, TiDB, Doris, StarRocks, OceanBase, …)</td><td>Sudah tertanam</td></tr>
+  <tr><td>SQL Server, Azure SQL, Babelfish</td><td>Sudah tertanam</td></tr>
+  <tr><td>ClickHouse</td><td>Sudah tertanam (HTTP/HTTPS)</td></tr>
+  <tr><td>SQLite, DuckDB</td><td>Sudah tertanam (file lokal)</td></tr>
+</table>
+
+<h2>Instalasi</h2>
+<h3>macOS</h3>
+<ol>
+  <li>Download <code>rsqldev-macos-universal.zip</code>, lalu klik dua kali untuk ekstrak.</li>
+  <li>Pindahkan <code>rsqldev.app</code> ke folder <b>Applications</b>.</li>
+  <li>Pertama kali dibuka, macOS akan menolak karena aplikasi belum ditandatangani Apple. Klik kanan <code>rsqldev.app</code> → <b>Open</b> → <b>Open</b>. Cukup sekali.</li>
+</ol>
+<p class="note">Kalau muncul pesan “rusak / damaged”, jalankan di Terminal lalu buka lagi:</p>
+<pre><code>xattr -dr com.apple.quarantine /Applications/rsqldev.app</code></pre>
+<h3>Windows</h3>
+<ol>
+  <li>Download <code>rsqldev-windows-x64.zip</code>, klik kanan → <b>Extract All…</b></li>
+  <li>Buka folder hasil ekstrak, jalankan <code>rsqldev.exe</code>.</li>
+  <li>Kalau SmartScreen muncul (“Windows protected your PC”), klik <b>More info</b> → <b>Run anyway</b>.</li>
+</ol>
+
+<h2>Mulai pakai</h2>
+<h3>1. Buat koneksi</h3>
+<ol>
+  <li>Menu <b>File → New Connection…</b> (<code>Ctrl/Cmd+Shift+C</code>).</li>
+  <li>Pilih <b>Database Type</b>, isi host, port, database/service name, user, password. Centang <b>Save Password</b> kalau mau (disimpan di Keychain / Windows Credential Manager).</li>
+  <li>Klik <b>Test</b>, lalu <b>Connect</b>.</li>
+</ol>
+<p class="note">Oracle: saat pertama konek, rsqldev menawarkan download Oracle Instant Client (cek checksum SHA-256). Bisa juga lewat <b>Tools → Drivers…</b>.</p>
+
+<h3>2. Jalankan SQL</h3>
+<table>
+  <tr><th>Aksi</th><th>Shortcut</th></tr>
+  <tr><td>Run statement di bawah kursor</td><td><code>Ctrl/Cmd+Enter</code></td></tr>
+  <tr><td>Run script (semua statement, termasuk PL/SQL &amp; perintah SQL*Plus)</td><td><code>F5</code></td></tr>
+  <tr><td>Explain plan</td><td><code>F10</code></td></tr>
+  <tr><td>Commit / Rollback</td><td><code>F11</code> / <code>F12</code></td></tr>
+  <tr><td>Autocomplete tabel &amp; kolom</td><td><code>Ctrl+Space</code>, atau otomatis setelah ketik <code>alias.</code></td></tr>
+  <tr><td>Format SQL</td><td><code>Ctrl/Cmd+F7</code></td></tr>
+  <tr><td>Find / Replace</td><td><code>Ctrl/Cmd+F</code> / <code>Ctrl/Cmd+R</code>, lalu <code>F3</code> / <code>Shift+F3</code></td></tr>
+  <tr><td>SQL history</td><td><code>F8</code></td></tr>
+  <tr><td>Batalkan query yang lama</td><td><code>Ctrl/Cmd+.</code></td></tr>
+</table>
+<p class="note">Selama query jalan, progress bar di kanan bawah menunjukkan durasinya, jadi aplikasi tidak terlihat hang.</p>
+
+<h3>3. Lihat dan edit data</h3>
+<ul>
+  <li>Klik dua kali tabel di panel <b>Connections</b> → tab <b>Data</b>. Edit cell langsung, tambah/hapus baris, lalu <b>Commit</b>.</li>
+  <li>Kolom <b>Filter</b> menerima klausa WHERE, contoh <code>status = 'ACTIVE'</code>.</li>
+  <li>Klik kanan cell: <b>View Value…</b> (teks panjang / CLOB, BLOB sebagai gambar / teks / hex), <b>Save Value to File…</b>, <b>Load Value from File…</b> (upload BLOB).</li>
+</ul>
+
+<h3>4. Import &amp; export</h3>
+<ul>
+  <li><b>Export</b>: klik kanan grid hasil → CSV, Excel (xlsx), JSON, atau INSERT statement.</li>
+  <li><b>Import</b>: tab Data → tombol <b>Import</b> → pilih CSV / xlsx / xls / ods. Kolom dicocokkan dengan nama header; baris masuk sebagai baris baru untuk dicek dulu, lalu <b>Commit</b>. Kalau ada yang gagal, semuanya di-rollback.</li>
+</ul>
+
+<h2>Koneksi lanjutan</h2>
+<p>Isi kolom <b>Options</b> di dialog koneksi, dipisah titik koma:</p>
+<table>
+  <tr><th>Kebutuhan</th><th>Options</th></tr>
+  <tr><td>Lewat SSH tunnel / bastion</td><td><code>ssh=user@bastion:22; ssh_key=~/.ssh/id_ed25519</code><br><span class="note">Pakai key atau ssh-agent (bukan password). Butuh OpenSSH client — sudah ada di macOS dan Windows 10+.</span></td></tr>
+  <tr><td>PostgreSQL dengan verifikasi sertifikat</td><td><code>sslmode=verify-full</code></td></tr>
+  <tr><td>SQL Server lokal dengan sertifikat self-signed</td><td><code>trust_cert=true</code></td></tr>
+  <tr><td>MySQL lewat SSL</td><td><code>ssl=true</code> (tambah <code>verify=false</code> untuk sertifikat self-signed)</td></tr>
+  <tr><td>ClickHouse lewat HTTPS</td><td><code>https=true</code> (port 8443)</td></tr>
+  <tr><td>Oracle wallet / tnsnames.ora</td><td><code>tns_admin=/path/ke/folder</code></td></tr>
+</table>
+
+<h2>Build sendiri dari source</h2>
+<pre><code>git clone https://github.com/kokohbudi/rsqldev
+cd rsqldev
+cargo run --release -p rsqldev          # langsung jalan
+scripts/bundle-macos.sh --install       # macOS: buat .app universal, pasang ke ~/Applications</code></pre>
+<p class="note">Butuh Rust (rustup) dan CMake. Untuk app universal macOS: <code>rustup target add aarch64-apple-darwin x86_64-apple-darwin</code>.</p>
+
+<footer>
+  <p>rsqldev · <a href="https://github.com/kokohbudi/rsqldev/issues">Laporkan bug / minta fitur</a></p>
+</footer>
+</main>
+</body>
+</html>

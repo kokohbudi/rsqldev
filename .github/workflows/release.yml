@@ -1,0 +1,58 @@
+# Push a tag like v0.2.0 to build the downloads and publish them as a GitHub Release.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Universal app bundle
+        run: scripts/bundle-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/rsqldev-macos-universal.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Release build
+        run: cargo build --release -p rsqldev
+      - name: Zip with the VC++ runtime next to the exe (runs without the redistributable)
+        shell: pwsh
+        run: |
+          $out = "rsqldev-windows-x64"
+          New-Item -ItemType Directory $out | Out-Null
+          Copy-Item target/release/rsqldev.exe $out
+          foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
+            $p = Join-Path $env:WINDIR "System32\$dll"
+            if (Test-Path $p) { Copy-Item $p $out }
+          }
+          Compress-Archive -Path $out -DestinationPath "$out.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: rsqldev-windows-x64.zip
+
+  publish:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "rsqldev $GITHUB_REF_NAME" --generate-notes \
+            macos/rsqldev-macos-universal.zip windows/rsqldev-windows-x64.zip
