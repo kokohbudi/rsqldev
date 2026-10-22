@@ -3,10 +3,11 @@
 # evict them (the repo has 10 GB of cache); a warm cache recompiles only rsqldev's own crates.
 name: build
 on:
+  # Pushes only: a PR from develop shows the same commit's push build (no second run).
   push:
     branches: [main, develop]
-  pull_request:
   workflow_call:
+  workflow_dispatch:
 permissions:
   contents: read
 env:
