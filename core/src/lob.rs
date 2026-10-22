@@ -4,6 +4,7 @@
 
 use std::borrow::Cow;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -11,6 +12,18 @@ use std::time::{Duration, SystemTime};
 pub const INLINE: usize = 64 * 1024;
 const TAG: char = '\u{1}';
 static NEXT: AtomicU64 = AtomicU64::new(1);
+
+/// Random per-process token inside every marker: a fetched value that happens to start with
+/// TAG cannot pass for a spill marker (and so cannot read another cell's file).
+fn secret() -> &'static str {
+    static S: OnceLock<String> = OnceLock::new();
+    S.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_nanos());
+        format!("{:016x}", h.finish())
+    })
+}
 
 fn dir() -> PathBuf {
     std::env::temp_dir().join(format!("rsqldev-lobs-{}", std::process::id()))
@@ -36,7 +49,7 @@ pub fn spill(bytes: &[u8], kind: &str) -> Option<String> {
     std::fs::create_dir_all(dir()).ok()?;
     std::fs::write(path(id), bytes).ok()?;
     // Size comes free here: the bytes are already in hand.
-    Some(format!("{TAG}{id}{TAG}({kind} {})", size(bytes.len())))
+    Some(format!("{TAG}{}:{id}{TAG}({kind} {})", secret(), size(bytes.len())))
 }
 
 /// Keep a fetched cell in memory, or spill it when large. Binary cells arrive as hex text
@@ -58,7 +71,11 @@ pub fn keep(s: String, binary: bool) -> String {
 }
 
 fn id(s: &str) -> Option<u64> {
-    s.strip_prefix(TAG)?.split_once(TAG)?.0.parse().ok()
+    let (sec, id) = s.strip_prefix(TAG)?.split_once(TAG)?.0.split_once(':')?;
+    if sec != secret() {
+        return None;
+    }
+    id.parse().ok()
 }
 
 pub fn is_lob(s: &str) -> bool {
@@ -154,5 +171,8 @@ mod tests {
         release(&cell);
         assert!(bytes(&cell).is_none());
         assert_eq!(display("plain"), "plain");
+        // Data that imitates a marker is just data.
+        let fake = format!("{TAG}0000000000000000:1{TAG}(BLOB 1 KB)");
+        assert!(!is_lob(&fake) && bytes(&fake).is_none() && display(&fake) == fake);
     }
 }
