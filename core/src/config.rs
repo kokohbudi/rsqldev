@@ -49,6 +49,8 @@ pub struct Prefs {
     pub client_dirs: BTreeMap<String, String>,
     /// "light" (SQL Developer default), "dark" or "system".
     pub theme: String,
+    /// Look up the latest release on start (one HTTPS request to GitHub).
+    pub check_updates: bool,
 }
 
 impl Default for Prefs {
@@ -60,6 +62,7 @@ impl Default for Prefs {
             nls_date_format: "DD-MON-RR".into(),
             client_dirs: BTreeMap::new(),
             theme: "light".into(),
+            check_updates: true,
         }
     }
 }

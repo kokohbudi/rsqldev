@@ -10,6 +10,7 @@ pub mod export;
 pub mod format;
 pub mod import;
 pub mod lob;
+pub mod migrate;
 pub mod registry;
 pub mod script;
 pub mod worker;

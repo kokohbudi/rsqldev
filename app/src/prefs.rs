@@ -12,6 +12,8 @@ pub fn show(parent: &Frame) {
     let size = SpinCtrl::builder(&dlg).with_range(6, 48).with_initial_value(p.editor_font_size).build();
     let auto = CheckBox::builder(&dlg).with_label("Autocommit").build();
     auto.set_value(p.autocommit);
+    let upd = CheckBox::builder(&dlg).with_label("Check for updates on start").build();
+    upd.set_value(p.check_updates);
     let nls = TextCtrl::builder(&dlg).with_value(&p.nls_date_format).build();
     const THEMES: [(&str, &str); 3] = [("light", "Light (SQL Developer)"), ("dark", "Dark"), ("system", "Follow system")];
     let theme = Choice::builder(&dlg).with_choices(THEMES.iter().map(|t| t.1.to_string()).collect()).build();
@@ -20,6 +22,7 @@ pub fn show(parent: &Frame) {
     crate::ui::row(&dlg, &g, "Editor font", &font);
     crate::ui::row(&dlg, &g, "Font size", &size);
     crate::ui::row(&dlg, &g, "", &auto);
+    crate::ui::row(&dlg, &g, "", &upd);
     crate::ui::row(&dlg, &g, "Oracle NLS date format", &nls);
     let note = StaticText::builder(&dlg).with_label("Connection settings apply to new connections.").build();
     let bs = BoxSizer::builder(Orientation::Horizontal).build();
@@ -38,6 +41,7 @@ pub fn show(parent: &Frame) {
         p.editor_font = font.get_value();
         p.editor_font_size = size.value();
         p.autocommit = auto.get_value();
+        p.check_updates = upd.get_value();
         p.nls_date_format = nls.get_value();
         let new_theme = THEMES[theme.get_selection().unwrap_or(0) as usize].0.to_string();
         let changed = new_theme != p.theme;

@@ -186,9 +186,37 @@ fn undmg(_: &Path, _: &Path) -> Result<()> {
     bail!(".dmg archives are macOS only")
 }
 
+/// Where people download rsqldev.
+pub const DOWNLOAD_PAGE: &str = "https://kokohbudi.github.io/rsqldev/";
+
+/// Latest published version (`0.2.2`) from GitHub Releases.
+pub fn latest_version() -> Result<String> {
+    let r = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(concat!("rsqldev/", env!("CARGO_PKG_VERSION")))
+        .build()?
+        .get("https://api.github.com/repos/kokohbudi/rsqldev/releases/latest")
+        .send()?
+        .error_for_status()?;
+    let v: serde_json::Value = serde_json::from_str(&r.text()?)?;
+    let tag = v["tag_name"].as_str().ok_or_else(|| anyhow::anyhow!("no tag_name in the release"))?;
+    Ok(tag.trim_start_matches('v').to_string())
+}
+
+/// `latest` is a higher dotted version than `current`.
+pub fn is_newer(latest: &str, current: &str) -> bool {
+    let nums = |v: &str| v.split(['.', '-']).map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    nums(latest) > nums(current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versions() {
+        assert!(is_newer("0.10.0", "0.9.9") && is_newer("0.2.3", "0.2.2") && !is_newer("0.2.2", "0.2.2") && !is_newer("0.2.1", "0.2.2"));
+    }
 
     #[cfg(unix)]
     #[test]

@@ -72,6 +72,8 @@ const ID_REPLACE: i32 = ID_HIGHEST + 25;
 const ID_FIND_NEXT: i32 = ID_HIGHEST + 26;
 const ID_FIND_PREV: i32 = ID_HIGHEST + 27;
 const ID_FORMAT: i32 = ID_HIGHEST + 28;
+const ID_IMPORT_CONNS: i32 = ID_HIGHEST + 29;
+const ID_UPDATES: i32 = ID_HIGHEST + 30;
 
 enum Page {
     Sheet(SheetRef),
@@ -150,6 +152,64 @@ impl App {
             let _ = std::fs::create_dir_all(config::config_root());
             let _ = std::fs::write(config::config_root().join("history.toml"), s);
         }
+    }
+
+    /// File ▸ Import Connections: SQL Developer / DBeaver files from their default locations
+    /// (or a picked file), choose which to add. Names already in use get a numeric suffix.
+    fn import_connections(&self) {
+        use rsqldev_core::migrate;
+        let mut files = migrate::default_files();
+        if files.is_empty() {
+            let d = FileDialog::builder(&self.frame)
+                .with_message("SQL Developer connections.json / connections.xml, or DBeaver data-sources.json")
+                .with_style(FileDialogStyle::Open)
+                .with_wildcard("Connection files (*.json;*.xml)|*.json;*.xml|All files (*)|*")
+                .build();
+            if d.show_modal() != ID_OK {
+                return;
+            }
+            files.extend(d.get_path().map(std::path::PathBuf::from));
+        }
+        let mut found = vec![];
+        for f in &files {
+            match migrate::read(f) {
+                Ok(v) => found.extend(v),
+                Err(e) => ui::error(&self.frame, &format!("Could not read {}: {e:#}", f.display())),
+            }
+        }
+        if found.is_empty() {
+            return ui::info(&self.frame, "No connections found in SQL Developer or DBeaver.");
+        }
+        let labels: Vec<String> = found
+            .iter()
+            .map(|f| {
+                let c = &f.conn;
+                let at = if c.host.is_empty() { c.database.clone() } else { format!("{}:{}/{}", c.host, c.port.map(|p| p.to_string()).unwrap_or_default(), c.database) };
+                format!("{}   [{} · {}]   {at}", c.name, f.source, c.driver)
+            })
+            .collect();
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let d = MultiChoiceDialog::builder(&self.frame, "Connections to import (passwords are asked on first connect):", "Import Connections", &refs).build();
+        d.set_selections(&(0..refs.len() as i32).collect::<Vec<_>>());
+        if d.show_modal() != ID_OK {
+            return;
+        }
+        let picked = d.get_selections();
+        {
+            let mut cs = self.conns.borrow_mut();
+            for i in &picked {
+                let mut c = found[*i as usize].conn.clone();
+                let base = c.name.clone();
+                let mut n = 2;
+                while cs.iter().any(|x| x.name == c.name) {
+                    c.name = format!("{base} ({n})");
+                    n += 1;
+                }
+                cs.push(c);
+            }
+        }
+        self.save_conns();
+        self.status(0, &format!("Imported {} connection(s)", picked.len()));
     }
 
     fn save_conns(&self) {
@@ -494,6 +554,8 @@ impl App {
         let editor_focus = sheet.as_ref().is_some_and(|s| s.editor.has_focus());
         match id {
             ID_NEW_CONN | ID_NEW => self.new_connection(),
+            ID_IMPORT_CONNS => self.import_connections(),
+            ID_UPDATES => check_updates(true),
             ID_OPEN => {
                 let d = FileDialog::builder(&self.frame).with_message("Open SQL file").with_style(FileDialogStyle::Open).with_wildcard("SQL files (*.sql)|*.sql|All files (*)|*").build();
                 if d.show_modal() == ID_OK {
@@ -640,6 +702,32 @@ impl App {
 
 /// Status bar activity: an animated bar and elapsed time whenever a connection is connecting,
 /// executing or fetching (see `worker::busy`), so long work never looks like a hang.
+/// Look up the latest release in the background. On start (`manual` false) a newer version
+/// only shows in the status bar; Help ▸ Check for Updates reports either way.
+fn check_updates(manual: bool) {
+    use rsqldev_core::download;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(download::latest_version().map_err(|e| format!("{e:#}")));
+    });
+    hub::every_tick(move || {
+        let Ok(r) = rx.try_recv() else { return true };
+        let cur = env!("CARGO_PKG_VERSION");
+        match r {
+            Ok(v) if download::is_newer(&v, cur) => {
+                app().status(0, &format!("rsqldev {v} is available (you have {cur}): Help ▸ Check for Updates"));
+                if manual && ui::confirm(&app().frame, &format!("rsqldev {v} is available (you have {cur}).\n\nOpen the download page?")) {
+                    ui::open_url(download::DOWNLOAD_PAGE);
+                }
+            }
+            Ok(_) if manual => ui::info(&app().frame, &format!("rsqldev {cur} is the latest version.")),
+            Err(e) if manual => ui::error(&app().frame, &format!("Could not check for updates: {e}")),
+            _ => {}
+        }
+        false
+    });
+}
+
 fn activity_bar(sb: StatusBar) {
     const F_TIME: usize = 4;
     const F_BAR: usize = 5;
@@ -677,6 +765,7 @@ fn activity_bar(sb: StatusBar) {
 fn menus(frame: &Frame) {
     let file = Menu::builder()
         .append_item(ID_NEW_CONN, "New Connection…\tCtrl+Shift+C", "Create a database connection")
+        .append_item(ID_IMPORT_CONNS, "&Import Connections…", "Import connections from Oracle SQL Developer or DBeaver")
         .append_item(ID_OPEN, "&Open…\tCtrl+O", "Open a SQL file in a worksheet")
         .append_item(ID_SAVE, "&Save\tCtrl+S", "")
         .append_item(ID_SAVEAS, "Save &As…", "")
@@ -732,6 +821,7 @@ fn menus(frame: &Frame) {
     let help = Menu::builder()
         .append_item(ID_START, "&Start Page", "")
         .append_item(ID_KEYS, "&Keyboard Shortcuts", "")
+        .append_item(ID_UPDATES, "Check for &Updates…", "")
         .append_separator()
         .append_item(ID_ABOUT, "&About rsqldev", "")
         .build();
@@ -975,6 +1065,8 @@ fn main() {
         frame.set_status_text(if a.conns.borrow().is_empty() { "No connections yet: File ▸ New Connection…" } else { "Ready" }, 0);
         if let Ok(name) = std::env::var("RSQLDEV_SELFTEST") {
             selftest(name);
+        } else if a.prefs().check_updates {
+            check_updates(false);
         }
     });
 }
