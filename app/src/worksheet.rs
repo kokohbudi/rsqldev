@@ -377,6 +377,17 @@ impl Worksheet {
         self.defines.borrow_mut().substitute(sql, &mut |name| crate::ui::ask(&p, &format!("Enter value for {name}:"), "Enter Substitution Variable", ""))
     }
 
+    /// Tint editor lines named in a compile-error report (`LINE/COL  ERROR` rows, numbered from
+    /// the statement that starts at 1-based editor line `start`).
+    fn mark_errors(&self, start: i32, err: &str) {
+        for l in err.lines() {
+            let Some((n, _)) = l.split_once('/') else { continue };
+            if let Ok(n) = n.trim().parse::<i32>() {
+                self.editor.marker_add(start + n - 2, editor::MARK_ERROR);
+            }
+        }
+    }
+
     fn line_of(&self, pos: usize) -> i32 {
         self.editor.line_from_position(pos as i32) + 1
     }
@@ -411,6 +422,7 @@ impl Worksheet {
             None => (false, sql),
         };
         *self.last.borrow_mut() = Some(if block { format!("\u{1}{sql}") } else { sql.clone() });
+        self.editor.marker_delete_all(editor::MARK_ERROR);
         self.started.set(Some(Instant::now()));
         self.status.set_label("Executing…");
         self.elapsed.set_label("");
@@ -428,6 +440,7 @@ impl Worksheet {
                 Err(e) => {
                     me.script_out.clear();
                     me.out(&format!("Error starting at line : {line} in command -\n{sql2}\nError report -\n{e}"));
+                    me.mark_errors(line, &e);
                     me.bottom.set_selection(P_SCRIPT);
                     w.set_label("");
                     task.set_label(&format!("Task completed in {secs}"));
@@ -451,6 +464,7 @@ impl Worksheet {
     }
 
     pub fn run_script(&self) {
+        self.editor.marker_delete_all(editor::MARK_ERROR);
         let (text, base) = self.source();
         let items: Vec<Item> = script::split(&text, self.kind())
             .into_iter()
@@ -563,7 +577,10 @@ impl Worksheet {
                     }
                     me.dbms_lines(&r.output);
                 }
-                Err(e) => me.out(&format!("\nError starting at line : {line} in command -\n{sql}\nError report -\n{e}\n")),
+                Err(e) => {
+                    me.out(&format!("\nError starting at line : {line} in command -\n{sql}\nError report -\n{e}\n"));
+                    me.mark_errors(line, &e);
+                }
             }
             next(items);
         });

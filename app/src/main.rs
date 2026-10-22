@@ -14,6 +14,7 @@ mod icons;
 mod theme;
 mod object_view;
 mod prefs;
+mod sessions;
 mod ui;
 mod value;
 mod worksheet;
@@ -74,10 +75,12 @@ const ID_FIND_PREV: i32 = ID_HIGHEST + 27;
 const ID_FORMAT: i32 = ID_HIGHEST + 28;
 const ID_IMPORT_CONNS: i32 = ID_HIGHEST + 29;
 const ID_UPDATES: i32 = ID_HIGHEST + 30;
+const ID_SESSIONS: i32 = ID_HIGHEST + 31;
 
 enum Page {
     Sheet(SheetRef),
     Obj(Rc<ObjectView>),
+    Sessions(Rc<sessions::Sessions>),
 }
 
 impl Page {
@@ -85,6 +88,7 @@ impl Page {
         match self {
             Page::Sheet(s) => s.panel,
             Page::Obj(o) => o.panel,
+            Page::Sessions(s) => s.panel,
         }
     }
 }
@@ -297,6 +301,7 @@ impl App {
             let mine = match &pages[i] {
                 Page::Sheet(s) => s.conn().borrow().cfg.name == name,
                 Page::Obj(o) => o.key.starts_with(&format!("{name}|")),
+                Page::Sessions(s) => s.conn_name == name,
             };
             if mine {
                 let idx = self.nb.get_page_index(&pages[i].panel());
@@ -555,6 +560,12 @@ impl App {
         match id {
             ID_NEW_CONN | ID_NEW => self.new_connection(),
             ID_IMPORT_CONNS => self.import_connections(),
+            ID_SESSIONS => self.pick_conn(|c| {
+                let a = app();
+                let title = format!("Sessions: {}", c.borrow().cfg.name);
+                let s = sessions::Sessions::new(&a.nb, c);
+                a.add_page(Page::Sessions(s), &title);
+            }),
             ID_UPDATES => check_updates(true),
             ID_OPEN => {
                 let d = FileDialog::builder(&self.frame).with_message("Open SQL file").with_style(FileDialogStyle::Open).with_wildcard("SQL files (*.sql)|*.sql|All files (*)|*").build();
@@ -815,6 +826,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_WORKSHEET, "SQL &Worksheet\tAlt+F10", "")
         .append_item(ID_UNSHARED, "&Unshared SQL Worksheet\tCtrl+Shift+N", "")
         .append_separator()
+        .append_item(ID_SESSIONS, "S&essions…", "Sessions and locks of a connection: who blocks whom, kill session")
         .append_item(ID_DRIVERS, "&Drivers…", "Download or locate native client drivers")
         .append_item(ID_PREFERENCES, "&Preferences…", "")
         .build();

@@ -3162,6 +3162,7 @@ dependencies = [
 name = "rsqldev"
 version = "0.2.2"
 dependencies = [
+ "chrono",
  "embed-manifest",
  "image",
  "rsqldev-core",

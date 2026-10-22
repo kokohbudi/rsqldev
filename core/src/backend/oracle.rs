@@ -83,6 +83,35 @@ pub fn format_model(fmt: &str, y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32,
     out
 }
 
+/// `CREATE [OR REPLACE] [EDITIONABLE] PACKAGE BODY [owner.]name …` → (ALL_ERRORS type, owner, name),
+/// identifiers as the dictionary stores them.
+pub fn plsql_target(sql: &str) -> Option<(String, Option<String>, String)> {
+    let words: Vec<&str> = sql.split_whitespace().take(8).collect();
+    let up: Vec<String> = words.iter().map(|w| w.to_uppercase()).collect();
+    if up.first()? != "CREATE" {
+        return None;
+    }
+    let mut i = 1;
+    while matches!(up.get(i).map(String::as_str), Some("OR" | "REPLACE" | "EDITIONABLE" | "NONEDITIONABLE")) {
+        i += 1;
+    }
+    let mut kind = up.get(i)?.clone();
+    if !matches!(kind.as_str(), "PROCEDURE" | "FUNCTION" | "PACKAGE" | "TRIGGER" | "TYPE") {
+        return None;
+    }
+    if matches!(kind.as_str(), "PACKAGE" | "TYPE") && up.get(i + 1).map(String::as_str) == Some("BODY") {
+        kind += " BODY";
+        i += 1;
+    }
+    let raw = words.get(i + 1)?.split(['(', ';']).next()?;
+    let ident = |s: &str| if s.starts_with('"') { s.trim_matches('"').to_string() } else { s.to_uppercase() };
+    let (owner, name) = match raw.split_once('.') {
+        Some((o, n)) => (Some(ident(o)), ident(n)),
+        None => (None, ident(raw)),
+    };
+    Some((kind, owner, name))
+}
+
 /// `+07:00` / `-03:30` (ODPI gives the minute offset with the hour's sign).
 fn tz_offset(h: i32, m: i32) -> String {
     format!("{}{:02}:{:02}", if h < 0 || m < 0 { '-' } else { '+' }, h.abs(), m.abs())
@@ -145,6 +174,20 @@ impl Backend for Oracle {
         let mut st = self.c.statement(sql).fetch_array_size(fetch as u32).build()?;
         if !st.is_query() {
             st.execute(&[])?;
+            // ORA-24344 "success with compilation error": report ALL_ERRORS like SHOW ERRORS.
+            if self.c.last_warning().is_some_and(|w| w.db_error().is_some_and(|e| e.code() == 24344)) {
+                if let Some((kind, owner, name)) = plsql_target(sql) {
+                    let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+                    let owner = owner.map_or("SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')".to_string(), |o| lit(&o));
+                    let q = format!("SELECT line, position, text FROM all_errors WHERE owner = {owner} AND name = {} AND type = {} ORDER BY sequence", lit(&name), lit(&kind));
+                    let mut msg = format!("{} {name} compiled with errors\nLINE/COL  ERROR\n", crate::script::title_case(&kind));
+                    for r in self.c.query(&q, &[])? {
+                        let r = r?;
+                        msg += &format!("{}/{}  {}\n", r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?.trim_end());
+                    }
+                    anyhow::bail!("{}", msg.trim_end());
+                }
+            }
             let n = st.row_count().ok();
             if self.autocommit && (st.is_dml() || st.is_plsql()) {
                 self.c.commit()?;
@@ -284,6 +327,9 @@ mod tests {
         assert_eq!(super::format_model("DD-MON-RR HH.MI.SSXFF AM", 2003, 6, 17, 13, 0, 0, 120000000), "17-JUN-03 01.00.00.120000000 PM");
         assert_eq!(super::format_model("DY DD \"de\" MONTH", 2026, 10, 22, 0, 0, 0, 0), "THU 22 de OCTOBER");
         assert_eq!(super::tz_offset(7, 0), "+07:00");
+        assert_eq!(super::plsql_target("create or replace package body hr.pkg as"), Some(("PACKAGE BODY".into(), Some("HR".into()), "PKG".into())));
+        assert_eq!(super::plsql_target("CREATE EDITIONABLE PROCEDURE \"MyProc\"(a number) is"), Some(("PROCEDURE".into(), None, "MyProc".into())));
+        assert_eq!(super::plsql_target("create table t (a int)"), None);
         assert_eq!(super::tz_offset(-3, -30), "-03:30");
     }
 }

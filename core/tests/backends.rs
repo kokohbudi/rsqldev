@@ -42,6 +42,13 @@ fn exercise(c: ConnConfig, pw: &str, owner: &str) {
         run(b, "UPDATE rsq_t SET tz = TIMESTAMP '2026-01-02 03:04:05 +07:00'");
     }
     b.commit().unwrap();
+    if db == Kind::Oracle {
+        // Compilation errors come back as an error listing ALL_ERRORS (SHOW ERRORS).
+        let e = b.execute("CREATE OR REPLACE PROCEDURE rsq_bad AS\nBEGIN\n  no_such_thing;\nEND;", 1, &mut |_| true).unwrap_err().to_string();
+        assert!(e.contains("Procedure RSQ_BAD compiled with errors") && e.contains("3/3") && e.contains("PLS-"), "{e}");
+        run(b, "CREATE OR REPLACE PROCEDURE rsq_bad AS\nBEGIN\n  NULL;\nEND;");
+        run(b, "DROP PROCEDURE rsq_bad");
+    }
     if db == Kind::Mysql {
         let (c, r) = query_all(b, "SELECT bt, b, tx FROM rsq_t WHERE id = 1").unwrap();
         assert_eq!(r[0][0].as_deref(), Some("5"), "BIT renders as a number");
@@ -69,6 +76,16 @@ fn exercise(c: ConnConfig, pw: &str, owner: &str) {
     let cnt = dialect::count_sql(db, "SELECT id, name FROM rsq_t ORDER BY id").unwrap();
     let cnt = if db == Kind::Mssql { cnt.replace(" ORDER BY id", "") } else { cnt }; // T-SQL: no ORDER BY in a derived table
     assert_eq!(query_all(b, &cnt).unwrap().1[0][0].as_deref(), Some("120"), "{cnt}");
+
+    // Session monitor: the first candidate that runs lists at least this session.
+    if let Some(qs) = dialect::sessions_sql(db) {
+        let res: Vec<_> = qs.iter().map(|q| query_all(b, q)).collect();
+        match res.iter().find_map(|r| r.as_ref().ok()) {
+            Some((_, rows)) => assert!(!rows.is_empty() || db == Kind::Clickhouse, "no sessions listed"),
+            // The app user may lack SELECT on v$session; the UI shows that message.
+            None => assert!(db == Kind::Oracle && format!("{:#}", res[0].as_ref().unwrap_err()).contains("ORA-00942"), "{:?}", res.iter().map(|r| r.as_ref().err().map(|e| format!("{e:#}"))).collect::<Vec<_>>()),
+        }
+    }
 
     // Object browser: every folder query and every viewer tab for the test table.
     let schemas = query_all(b, dialect::schemas_sql(db)).unwrap().1;
