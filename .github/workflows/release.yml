@@ -1,4 +1,5 @@
-# Push a tag like v0.2.0 to build the downloads and publish them as a GitHub Release.
+# Push a tag like v0.3.0: build.yml makes the packages (reusing the platform caches), then they
+# are published as a GitHub Release.
 name: release
 on:
   push:
@@ -7,66 +8,13 @@ on:
 permissions:
   contents: read
 jobs:
-  macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
-      - name: Universal app bundle
-        run: scripts/bundle-macos.sh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos
-          path: dist/rsqldev-macos-universal.zip
-
-  windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
-      - name: Release build
-        run: cargo build --release -p rsqldev
-      - name: Zip with the VC++ runtime next to the exe (runs without the redistributable)
-        shell: pwsh
-        run: |
-          $out = "rsqldev-windows-x64"
-          New-Item -ItemType Directory $out | Out-Null
-          Copy-Item target/release/rsqldev.exe $out
-          foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
-            $p = Join-Path $env:WINDIR "System32\$dll"
-            if (Test-Path $p) { Copy-Item $p $out }
-          }
-          Compress-Archive -Path $out -DestinationPath "$out.zip"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows
-          path: rsqldev-windows-x64.zip
-
-  linux:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { arch: x86_64, runner: ubuntu-latest }
-          - { arch: aarch64, runner: ubuntu-24.04-arm }
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build in container
-        run: scripts/build-linux.sh "${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: linux-${{ matrix.arch }}
-          path: dist/rsqldev-linux-${{ matrix.arch }}.tar.gz
+  build:
+    uses: ./.github/workflows/build.yml
 
   publish:
+    needs: build
     # Publish when macOS and Windows built; a failed Linux architecture is just left out.
-    needs: [macos, windows, linux]
-    if: ${{ !cancelled() && needs.macos.result == 'success' && needs.windows.result == 'success' }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -76,5 +24,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          test -f macos/rsqldev-macos-universal.zip && test -f windows/rsqldev-windows-x64.zip
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "rsqldev $GITHUB_REF_NAME" --generate-notes \
             macos/rsqldev-macos-universal.zip windows/rsqldev-windows-x64.zip linux-*/rsqldev-linux-*.tar.gz
