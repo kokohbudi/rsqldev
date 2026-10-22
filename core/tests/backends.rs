@@ -66,6 +66,9 @@ fn exercise(c: ConnConfig, pw: &str, owner: &str) {
     .unwrap();
     assert_eq!(batches, 1);
     run(b, "SELECT 1 FROM rsq_t WHERE id = 1"); // connection still usable after abandoning a cursor
+    let cnt = dialect::count_sql(db, "SELECT id, name FROM rsq_t ORDER BY id").unwrap();
+    let cnt = if db == Kind::Mssql { cnt.replace(" ORDER BY id", "") } else { cnt }; // T-SQL: no ORDER BY in a derived table
+    assert_eq!(query_all(b, &cnt).unwrap().1[0][0].as_deref(), Some("120"), "{cnt}");
 
     // Object browser: every folder query and every viewer tab for the test table.
     let schemas = query_all(b, dialect::schemas_sql(db)).unwrap().1;

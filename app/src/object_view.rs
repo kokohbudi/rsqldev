@@ -246,6 +246,7 @@ impl ObjectView {
             }
         });
         d.grid.load(rows, d.hidden.map_or(0, |_| 1), d.editable);
+        d.grid.st.borrow_mut().count = Conn::counter(&self.conn, &sql, d.status);
     }
 
     /// Generated DML for pending grid edits, with the values each statement binds (staged BLOB

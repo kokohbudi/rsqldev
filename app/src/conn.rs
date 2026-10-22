@@ -6,6 +6,7 @@
 
 use rsqldev_core::config::{ConnConfig, Prefs};
 use rsqldev_core::dialect;
+use wxdragon::prelude::StaticText;
 use rsqldev_core::registry::{self, Kind};
 use rsqldev_core::worker::{Cmd, Reply, Session};
 use rsqldev_core::{Cell, Column, Event};
@@ -95,6 +96,29 @@ impl Conn {
             None => false,
         });
         c
+    }
+
+    /// A separate metadata session exists (not DuckDB / in-memory SQLite), so metadata queries
+    /// never wait behind an open worksheet cursor.
+    pub fn has_meta(&self) -> bool {
+        self.meta.is_some()
+    }
+
+    /// Count Rows for a grid: runs `SELECT COUNT(*)` over `sql` on the metadata session and shows
+    /// the total in `label`. None when it cannot (no separate session, statement not countable).
+    pub fn counter(this: &ConnRef, sql: &str, label: StaticText) -> Option<std::rc::Rc<dyn Fn()>> {
+        let (kind, meta) = (this.borrow().kind, this.borrow().has_meta());
+        let q = dialect::count_sql(kind, sql).filter(|_| meta)?;
+        let c = this.clone();
+        Some(std::rc::Rc::new(move || {
+            label.set_label("Counting rows…");
+            Conn::meta_query(&c, &q, move |r| {
+                label.set_label(&match r {
+                    Ok(r) => format!("Total rows: {}", r.rows.first().and_then(|x| x.first().cloned().flatten()).unwrap_or_default()),
+                    Err(e) => format!("Count failed: {e}"),
+                })
+            });
+        }))
     }
 
     pub fn is_up(&self) -> bool {

@@ -54,6 +54,18 @@ pub fn quote(db: Db, ident: &str) -> String {
     }
 }
 
+/// `SELECT COUNT(*)` over a query, for Count Rows without fetching. None when the statement
+/// cannot be wrapped (not a plain query; SQL Server forbids a CTE inside a derived table).
+pub fn count_sql(db: Db, sql: &str) -> Option<String> {
+    let kw = crate::first_keyword(sql);
+    let body = sql.trim().trim_end_matches(';').trim_end();
+    match kw.as_str() {
+        "WITH" if db == Db::Mssql => None,
+        "SELECT" | "WITH" | "VALUES" => Some(format!("SELECT COUNT(*) FROM ({body}) rsq_count")),
+        _ => None,
+    }
+}
+
 /// Bind placeholder number `n` (1-based) for [`crate::Backend::execute_binds`].
 pub fn placeholder(db: Db, n: usize) -> String {
     match db {
@@ -526,6 +538,13 @@ pub fn fold(db: Db, ident: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counting() {
+        assert_eq!(count_sql(Db::Oracle, "select * from emp;").unwrap(), "SELECT COUNT(*) FROM (select * from emp) rsq_count");
+        assert!(count_sql(Db::Mssql, "with a as (select 1 x) select * from a").is_none());
+        assert!(count_sql(Db::Oracle, "update t set a = 1").is_none());
+    }
 
     #[test]
     fn templates_fill_and_every_folder_lists() {

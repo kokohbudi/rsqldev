@@ -573,6 +573,9 @@ impl App {
             ID_FIND | ID_REPLACE | ID_FIND_NEXT | ID_FIND_PREV => {
                 if let Some(s) = sheet {
                     match id {
+                        // Focus outside the editor: search the result grid instead.
+                        ID_FIND if !editor_focus => s.results.find(true),
+                        ID_FIND_NEXT if !editor_focus => s.results.find(false),
                         ID_FIND | ID_REPLACE => s.find.open(id == ID_REPLACE),
                         _ => s.find.next(id == ID_FIND_PREV),
                     }

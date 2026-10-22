@@ -22,7 +22,7 @@ pub struct Worksheet {
     conn: RefCell<ConnRef>,
     conn_choice: Choice,
     bottom: AuiNotebook,
-    results: ResultGrid,
+    pub results: ResultGrid,
     script_out: TextCtrl,
     explain: ResultGrid,
     dbms: TextCtrl,
@@ -445,6 +445,7 @@ impl Worksheet {
         });
         if query {
             self.results.load(rows, 0, false);
+            self.results.st.borrow_mut().count = Conn::counter(&self.conn(), &sql, self.status);
             self.bottom.set_selection(P_RESULT);
         }
     }

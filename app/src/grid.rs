@@ -66,6 +66,12 @@ pub struct State {
     pub on_change: Option<Rc<dyn Fn(&State)>>,
     /// Export target table name and dialect for INSERT export.
     pub db: Option<Kind>,
+    /// Column filters (column, lowercase text): rows not containing the text are hidden.
+    filters: Vec<(usize, String)>,
+    /// Last "Find in Results" text, for Find Next.
+    find: String,
+    /// Count every row of the result on the server (set by the worksheet / data tab).
+    pub count: Option<Rc<dyn Fn()>>,
 }
 
 #[derive(Clone)]
@@ -85,6 +91,15 @@ const ID_LOAD_VALUE: i32 = 7008;
 const ID_VIEW_VALUE: i32 = 7009;
 const ID_XLSX: i32 = 7010;
 const FETCH_ALL_STEP: usize = 100_000;
+const ID_FIND: i32 = 7011;
+const ID_FIND_NEXT: i32 = 7012;
+const ID_COPY_CSV: i32 = 7013;
+const ID_COPY_MD: i32 = 7014;
+const ID_COPY_IN: i32 = 7015;
+const ID_COPY_INSERT: i32 = 7016;
+const ID_COUNT: i32 = 7017;
+const ID_FILTER: i32 = 7018;
+const ID_CLEAR_FILTERS: i32 = 7019;
 
 impl ResultGrid {
     pub fn new(parent: &dyn WxWidget) -> ResultGrid {
@@ -124,6 +139,12 @@ impl ResultGrid {
         let me = g.clone();
         grid.on_cell_changed(move |e| me.cell_edited(e.get_row(), e.get_col()));
         let me = g.clone();
+        grid.on_label_right_click(move |e| {
+            if e.get_row() < 0 && e.get_col() >= 0 {
+                me.column_menu(e.get_col() as usize);
+            }
+        });
+        let me = g.clone();
         grid.on_cell_right_click(move |e| me.context_menu(Some(e.get_position()), (e.get_row(), e.get_col())));
         g
     }
@@ -144,8 +165,8 @@ impl ResultGrid {
                 rsqldev_core::lob::release(v);
             }
         }
-        let keep = (st.on_change.take(), st.db);
-        *st = State { on_change: keep.0, db: keep.1, ..State::default() };
+        let keep = (st.on_change.take(), st.db, st.count.take(), std::mem::take(&mut st.find));
+        *st = State { on_change: keep.0, db: keep.1, count: keep.2, find: keep.3, ..State::default() };
         drop(st);
         self.redraw_all();
     }
@@ -333,6 +354,9 @@ impl ResultGrid {
         g.end_batch();
         drop(st);
         self.changed();
+        if !self.st.borrow().filters.is_empty() {
+            self.apply_filters();
+        }
     }
 
     fn mark_row(g: Grid, st: &State, ri: usize) {
@@ -462,10 +486,21 @@ impl ResultGrid {
             let st = self.st.borrow();
             (st.editable, st.hidden as i32)
         };
+        let has_count = self.st.borrow().count.is_some();
         let mut b = Menu::builder()
             .append_item(ID_COPY, "Copy", "Copy selected cells")
             .append_item(ID_COPY_HDR, "Copy with Headers", "Copy selected cells with column names")
+            .append_item(ID_COPY_CSV, "Copy as CSV", "")
+            .append_item(ID_COPY_MD, "Copy as Markdown", "")
+            .append_item(ID_COPY_IN, "Copy as IN List", "Distinct values of the first selected column: (a, b, c)")
+            .append_item(ID_COPY_INSERT, "Copy as INSERT", "")
+            .append_separator()
+            .append_item(ID_FIND, "Find in Results…", "Search the fetched rows")
+            .append_item(ID_FIND_NEXT, "Find Next", "")
             .append_separator();
+        if has_count {
+            b = b.append_item(ID_COUNT, "Count Rows", "Count every row of the result on the server, without fetching them");
+        }
         if r >= 0 && c >= hidden {
             b = b.append_item(ID_VIEW_VALUE, "View Value…", "Show the whole value: long text, BLOB as image / text / hex");
             b = b.append_item(ID_SAVE_VALUE, "Save Value to File…", "Write this cell (BLOB bytes or text) to a file");
@@ -597,6 +632,101 @@ impl ResultGrid {
         }
     }
 
+    /// Find in Results: case-insensitive, over the fetched (and not filtered-out) rows, from the
+    /// cell after the cursor, wrapping. `ask` prompts for the text first.
+    pub fn find(&self, ask: bool) {
+        let mut text = self.st.borrow().find.clone();
+        if ask || text.is_empty() {
+            match crate::ui::ask(&self.grid, "Find in fetched rows:", "Find in Results", &text) {
+                Some(t) if !t.is_empty() => text = t,
+                _ => return,
+            }
+            self.st.borrow_mut().find = text.clone();
+        }
+        let needle = text.to_lowercase();
+        let hit = {
+            let st = self.st.borrow();
+            let (nc, nr) = (st.cols.len(), st.rows.len());
+            if nc <= st.hidden || nr == 0 {
+                return;
+            }
+            let width = nc - st.hidden;
+            let total = nr * width;
+            let (r0, c0) = (self.grid.get_grid_cursor_row().max(0) as usize, (self.grid.get_grid_cursor_col().max(st.hidden as i32) as usize).saturating_sub(st.hidden));
+            let start = (r0 * width + c0 + 1) % total;
+            (0..total).map(|k| (start + k) % total).map(|k| (k / width, k % width + st.hidden)).find(|&(r, c)| {
+                self.grid.is_row_shown(r as i32) && st.rows[r].cur[c].as_deref().is_some_and(|v| rsqldev_core::lob::display(v).to_lowercase().contains(&needle))
+            })
+        };
+        match hit {
+            Some((r, c)) => {
+                self.grid.set_grid_cursor(r as i32, c as i32);
+                self.grid.make_cell_visible(r as i32, c as i32);
+                self.grid.select_block(r as i32, c as i32, r as i32, c as i32, false);
+            }
+            None => crate::app().status(0, &format!("'{text}' not found in the fetched rows")),
+        }
+    }
+
+    /// Header right-click: filter this column, clear filters, sort.
+    fn column_menu(&self, col: usize) {
+        const SORT: i32 = 7020;
+        if col < self.st.borrow().hidden {
+            return;
+        }
+        let has = !self.st.borrow().filters.is_empty();
+        let mut b = Menu::builder().append_item(ID_FILTER, "Filter Column…", "Show only rows whose value contains a text").append_item(SORT, "Sort", "");
+        if has {
+            b = b.append_item(ID_CLEAR_FILTERS, "Clear Filters", "");
+        }
+        let mut m = b.build();
+        let me = self.clone();
+        m.on_selected(move |e| match e.get_id() {
+            ID_FILTER => {
+                let name = me.st.borrow().cols[col].name.clone();
+                let cur = me.st.borrow().filters.iter().find(|f| f.0 == col).map(|f| f.1.clone()).unwrap_or_default();
+                if let Some(t) = crate::ui::ask(&me.grid, &format!("Show rows where {name} contains (empty = no filter):"), "Filter Column", &cur) {
+                    let mut st = me.st.borrow_mut();
+                    st.filters.retain(|f| f.0 != col);
+                    if !t.is_empty() {
+                        st.filters.push((col, t.to_lowercase()));
+                    }
+                    drop(st);
+                    me.apply_filters();
+                }
+            }
+            ID_CLEAR_FILTERS => {
+                me.st.borrow_mut().filters.clear();
+                me.apply_filters();
+            }
+            SORT => me.sort_by(col),
+            _ => {}
+        });
+        self.grid.popup_menu(&mut m, None);
+        m.destroy_menu();
+    }
+
+    /// Hide fetched rows that fail a column filter (client side, fetched rows only).
+    fn apply_filters(&self) {
+        let st = self.st.borrow();
+        let g = self.grid;
+        g.begin_batch();
+        let mut shown = 0;
+        for (r, row) in st.rows.iter().enumerate() {
+            let ok = st.filters.iter().all(|(c, t)| row.cur[*c].as_deref().is_some_and(|v| rsqldev_core::lob::display(v).to_lowercase().contains(t)));
+            if ok {
+                g.show_row(r as i32);
+                shown += 1;
+            } else {
+                g.hide_row(r as i32);
+            }
+        }
+        g.end_batch();
+        let msg = if st.filters.is_empty() { String::new() } else { format!("Filter: {shown} of {} fetched rows shown", st.rows.len()) };
+        drop(st);
+        crate::app().status(0, &msg);
+    }
+
     /// Stream the result to a file: rows already in the grid first, then the rest of the open
     /// cursor straight into the file (never into the grid), so memory stays flat.
     fn export_to(&self, fmt: export::Format, path: std::path::PathBuf) {
@@ -675,6 +805,28 @@ impl ResultGrid {
 
     fn menu(&self, id: i32) {
         match id {
+            ID_COPY_CSV | ID_COPY_MD | ID_COPY_IN | ID_COPY_INSERT => {
+                let (c, r) = self.selection(false);
+                let db = self.st.borrow().db.unwrap_or(Kind::Oracle);
+                let text = match id {
+                    ID_COPY_CSV => export::csv(&c, &r),
+                    ID_COPY_MD => export::markdown(&c, &r),
+                    ID_COPY_IN => match c.first() {
+                        Some(col) => export::in_list(db, col, &r),
+                        None => return,
+                    },
+                    _ => export::inserts(db, "TABLE_NAME", &c, &r),
+                };
+                Clipboard::get().set_text(&text);
+            }
+            ID_FIND => self.find(true),
+            ID_FIND_NEXT => self.find(false),
+            ID_COUNT => {
+                let f = self.st.borrow().count.clone();
+                if let Some(f) = f {
+                    f()
+                }
+            }
             ID_COPY | ID_COPY_HDR => {
                 let (c, r) = self.selection(false);
                 Clipboard::get().set_text(&export::tsv((id == ID_COPY_HDR).then_some(&c[..]), &r));

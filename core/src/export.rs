@@ -31,6 +31,24 @@ pub fn tsv(cols: Option<&[Column]>, rows: &[Vec<Cell>]) -> String {
     lines.join("\n")
 }
 
+/// Markdown table (Copy As Markdown): pipes escaped, line breaks flattened.
+pub fn markdown(cols: &[Column], rows: &[Vec<Cell>]) -> String {
+    let cell = |s: &str| lob::display(s).replace('|', "\\|").replace(['\n', '\r'], " ");
+    let mut out = format!("| {} |\n|{}|\n", cols.iter().map(|c| cell(&c.name)).collect::<Vec<_>>().join(" | "), cols.iter().map(|c| if c.numeric { " ---: " } else { " --- " }).collect::<Vec<_>>().join("|"));
+    for r in rows {
+        out += &format!("| {} |\n", r.iter().map(|v| v.as_deref().map(cell).unwrap_or_default()).collect::<Vec<_>>().join(" | "));
+    }
+    out
+}
+
+/// `(1, 2, 3)` / `('a', 'b')` from the first selected column, for pasting into `WHERE x IN`.
+/// Distinct values in order; NULLs skipped.
+pub fn in_list(db: Db, col: &Column, rows: &[Vec<Cell>]) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let items: Vec<String> = rows.iter().filter_map(|r| r.first().cloned().flatten()).filter(|v| seen.insert(v.clone())).map(|v| crate::dml::literal(db, col, &Some(v))).collect();
+    format!("({})", items.join(", "))
+}
+
 fn json_str(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
@@ -217,6 +235,16 @@ mod tests {
         assert!(json(&cols, &rows).contains("{\"ID\":1,\"N\":\"a,\\\"b\\\"\"},\n{\"ID\":null,\"N\":null}\n]}]}"));
         assert_eq!(tsv(None, &rows), "1\ta,\"b\"\n\t");
         assert_eq!(inserts(Db::Postgres, "t", &cols, &rows[..1]), "INSERT INTO t (\"ID\", \"N\") VALUES (1, 'a,\"b\"');\n");
+    }
+
+    #[test]
+    fn copy_as() {
+        let cols = vec![Column { name: "ID".into(), type_name: "NUMBER".into(), numeric: true }, Column { name: "N".into(), type_name: "VARCHAR2".into(), numeric: false }];
+        let rows = vec![vec![Some("1".into()), Some("a|b".into())], vec![Some("2".into()), None]];
+        assert_eq!(markdown(&cols, &rows), "| ID | N |\n| ---: | --- |\n| 1 | a\\|b |\n| 2 |  |\n");
+        let names = vec![vec![Some("O'Neil".into())], vec![None], vec![Some("x".into())], vec![Some("O'Neil".into())]];
+        assert_eq!(in_list(Db::Oracle, &cols[1], &names), "('O''Neil', 'x')");
+        assert_eq!(in_list(Db::Oracle, &cols[0], &[vec![Some("1".into())], vec![Some("2".into())]]), "(1, 2)");
     }
 
     #[test]
