@@ -26,6 +26,6 @@ futures-util = "0.3"
 rusqlite = { version = "0.40", features = ["bundled", "column_decltype"] }
 duckdb = { version = "1", features = ["bundled"] }
 oracle = "0.6"
-rust_xlsxwriter = "0.101.0"
+rust_xlsxwriter = { version = "0.101.0", features = ["constant_memory"] }
 calamine = { version = "0.37.0", features = ["dates"] }
 csv = "1.4.0"

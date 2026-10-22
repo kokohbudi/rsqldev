@@ -84,6 +84,7 @@ const ID_SAVE_VALUE: i32 = 7007;
 const ID_LOAD_VALUE: i32 = 7008;
 const ID_VIEW_VALUE: i32 = 7009;
 const ID_XLSX: i32 = 7010;
+const FETCH_ALL_STEP: usize = 100_000;
 
 impl ResultGrid {
     pub fn new(parent: &dyn WxWidget) -> ResultGrid {
@@ -216,6 +217,20 @@ impl ResultGrid {
                 self.append_rows(start);
                 if last {
                     self.finish();
+                } else if fetch_all && start / FETCH_ALL_STEP != self.st.borrow().rows.len() / FETCH_ALL_STEP {
+                    // Every 100,000 rows: confirm before holding even more in memory.
+                    self.st.borrow_mut().fetch_all = false;
+                    let n = self.st.borrow().rows.len();
+                    let more = crate::ui::confirm(
+                        &self.grid,
+                        &format!("{n} rows are loaded in the grid. Keep fetching?\n\nTo save a large result, use Export: it streams to the file without loading the grid."),
+                    );
+                    let mut st = self.st.borrow_mut();
+                    if more {
+                        st.fetch_all = true;
+                    } else {
+                        st.after_all.clear();
+                    }
                 }
             }
             Err(TryRecvError::Empty) => {}
@@ -582,6 +597,68 @@ impl ResultGrid {
         }
     }
 
+    /// Stream the result to a file: rows already in the grid first, then the rest of the open
+    /// cursor straight into the file (never into the grid), so memory stays flat.
+    fn export_to(&self, fmt: export::Format, path: std::path::PathBuf) {
+        let (cols, rows, hidden, db, rx) = {
+            let mut st = self.st.borrow_mut();
+            let vis: Vec<usize> = (st.hidden..st.cols.len()).collect();
+            let cols: Vec<Column> = vis.iter().map(|&i| st.cols[i].clone()).collect();
+            let rows: Vec<Vec<Cell>> = st.rows.iter().filter(|r| !r.deleted).map(|r| vis.iter().map(|&i| r.cur[i].clone()).collect()).collect();
+            // The rest of the cursor goes to the file: the grid keeps what it has.
+            let rx = st.rx.take();
+            st.done = true;
+            (cols, rows, st.hidden, st.db.unwrap_or(Kind::Oracle), rx)
+        };
+        let fail = move |grid: &Grid, path: &std::path::Path, e: rsqldev_core::Error| {
+            let _ = std::fs::remove_file(path);
+            crate::ui::error(grid, &format!("Export failed: {e:#}"));
+        };
+        let ex = match export::Export::create(&path, fmt, &cols, db, "EXPORT_TABLE").and_then(|mut x| x.rows(&rows).map(|_| x)) {
+            Ok(x) => x,
+            Err(e) => return fail(&self.grid, &path, e),
+        };
+        drop(rows);
+        let grid = self.grid;
+        let done = move |ex: export::Export, path: &std::path::Path| match ex.finish() {
+            Ok(n) => crate::app().status(0, &format!("Exported {n} rows to {}", path.display())),
+            Err(e) => fail(&grid, path, e),
+        };
+        let Some(rx) = rx else { return done(ex, &path) };
+        let mut ex = Some(ex);
+        crate::hub::every_tick(move || {
+            let r = rx.borrow();
+            // Bounded per tick so the UI stays responsive while a big result drains.
+            for _ in 0..20 {
+                let ev = match r.as_ref() {
+                    Some(rx) => rx.try_recv(),
+                    None => Err(TryRecvError::Disconnected),
+                };
+                match ev {
+                    Ok(Event::Rows(b)) if !b.is_empty() => {
+                        let b: Vec<Vec<Cell>> = b.into_iter().map(|row| row.into_iter().skip(hidden).collect()).collect();
+                        let x = ex.as_mut().unwrap();
+                        let res = x.rows(&b);
+                        // Streamed rows never reach the grid: free their spilled LOB files now.
+                        b.iter().flatten().flatten().for_each(|v| rsqldev_core::lob::release(v));
+                        if let Err(e) = res {
+                            fail(&grid, &path, e);
+                            return false;
+                        }
+                        crate::app().status(0, &format!("Exporting… {} rows", x.count()));
+                    }
+                    Ok(Event::Columns(_)) => {}
+                    Err(TryRecvError::Empty) => return true,
+                    Ok(Event::Rows(_)) | Err(TryRecvError::Disconnected) => {
+                        done(ex.take().unwrap(), &path);
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+    }
+
     /// Export… button: pick a format, then save.
     pub fn export_dialog(&self) {
         let d = SingleChoiceDialog::builder(&self.grid, "Format:", "Export", &["CSV", "Excel (xlsx)", "JSON", "INSERT statements"]).build();
@@ -620,20 +697,13 @@ impl ResultGrid {
                     return;
                 }
                 let Some(path) = d.get_path() else { return };
-                let me = self.clone();
-                self.fetch_all(move || {
-                    let (c, r) = me.selection(true);
-                    let db = me.st.borrow().db.unwrap_or(Kind::Oracle);
-                    let data = match id {
-                        ID_CSV => Ok(export::csv(&c, &r).into_bytes()),
-                        ID_XLSX => export::xlsx(&c, &r),
-                        ID_JSON => Ok(export::json(&c, &r).into_bytes()),
-                        _ => Ok(export::inserts(db, "EXPORT_TABLE", &c, &r).into_bytes()),
-                    };
-                    if let Err(e) = data.and_then(|d| Ok(std::fs::write(&path, d)?)) {
-                        crate::ui::error(&me.grid, &format!("Export failed: {e}"));
-                    }
-                });
+                let fmt = match id {
+                    ID_CSV => export::Format::Csv,
+                    ID_XLSX => export::Format::Xlsx,
+                    ID_JSON => export::Format::Json,
+                    _ => export::Format::Inserts,
+                };
+                self.export_to(fmt, std::path::PathBuf::from(path));
             }
             _ => {}
         }
