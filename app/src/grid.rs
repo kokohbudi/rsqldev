@@ -63,6 +63,7 @@ const ID_INSERT: i32 = 7005;
 const ID_FETCH_ALL: i32 = 7006;
 const ID_SAVE_VALUE: i32 = 7007;
 const ID_LOAD_VALUE: i32 = 7008;
+const ID_VIEW_VALUE: i32 = 7009;
 
 impl ResultGrid {
     pub fn new(parent: &dyn WxWidget) -> ResultGrid {
@@ -411,6 +412,7 @@ impl ResultGrid {
             .append_item(ID_COPY_HDR, "Copy with Headers", "Copy selected cells with column names")
             .append_separator();
         if r >= 0 && c >= hidden {
+            b = b.append_item(ID_VIEW_VALUE, "View Value…", "Show the whole value: long text, BLOB as image / text / hex");
             b = b.append_item(ID_SAVE_VALUE, "Save Value to File…", "Write this cell (BLOB bytes or text) to a file");
             if editable {
                 b = b.append_item(ID_LOAD_VALUE, "Load Value from File…", "Replace this cell with a file's contents; Commit to post");
@@ -426,6 +428,7 @@ impl ResultGrid {
         let me = self.clone();
         m.on_selected(move |e| match e.get_id() {
             ID_SAVE_VALUE => me.save_value(r as usize, c as usize),
+            ID_VIEW_VALUE => me.view_value(r as usize, c as usize),
             ID_LOAD_VALUE => me.load_value(r as usize, c as usize),
             id => me.menu(id),
         });
@@ -494,13 +497,45 @@ impl ResultGrid {
                 Err(_) => return crate::ui::error(&self.grid, "This column holds text and the file is not UTF-8 text."),
             }
         };
-        row.cur[c] = Some(text.clone());
-        self.grid.set_cell_value(r as i32, c as i32, &text);
-        self.grid.set_cell_text_colour(r as i32, c as i32, &crate::theme::c(crate::theme::p().text));
+        drop(st);
+        self.set_cell(r, c, Some(text));
+    }
+
+    /// Write a value into a cell from code (dialogs, file loads) and mark the row dirty.
+    fn set_cell(&self, r: usize, c: usize, v: Cell) {
+        let mut st = self.st.borrow_mut();
+        let Some(row) = st.rows.get_mut(r) else { return };
+        row.cur[c] = v.clone();
+        let p = crate::theme::p();
+        self.grid.set_cell_value(r as i32, c as i32, v.as_deref().unwrap_or(NULL_TEXT));
+        self.grid.set_cell_text_colour(r as i32, c as i32, &crate::theme::c(if v.is_some() { p.text } else { p.null }));
         Self::mark_row(self.grid, &st, r);
         drop(st);
         self.grid.force_refresh();
         self.changed();
+    }
+
+    fn view_value(&self, r: usize, c: usize) {
+        let (col, text, bytes, editable) = {
+            let st = self.st.borrow();
+            let (Some(row), Some(col)) = (st.rows.get(r), st.cols.get(c)) else { return };
+            let binary = rsqldev_core::is_binary(&col.type_name);
+            let bytes = row.blobs.get(&c).map(|b| b.to_vec()).or_else(|| row.cur[c].as_deref().filter(|_| binary).map(|s| rsqldev_core::cell_bytes(col, s)));
+            (col.clone(), row.cur[c].clone(), bytes, st.editable && c >= st.hidden)
+        };
+        match crate::value::show(&self.grid, &col, text.as_deref(), bytes.as_deref(), editable) {
+            crate::value::Outcome::Text(v) => {
+                if v != text {
+                    if let Some(row) = self.st.borrow_mut().rows.get_mut(r) {
+                        row.blobs.remove(&c);
+                    }
+                    self.set_cell(r, c, v);
+                }
+            }
+            crate::value::Outcome::Save => self.save_value(r, c),
+            crate::value::Outcome::Load => self.load_value(r, c),
+            crate::value::Outcome::Keep => {}
+        }
     }
 
     /// Export… button: pick a format, then save.

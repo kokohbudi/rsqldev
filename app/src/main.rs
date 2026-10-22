@@ -15,6 +15,7 @@ mod theme;
 mod object_view;
 mod prefs;
 mod ui;
+mod value;
 mod worksheet;
 
 use conn::{Conn, ConnRef};

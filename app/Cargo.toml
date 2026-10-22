@@ -8,6 +8,7 @@ rsqldev-core = { path = "../core" }
 wxdragon = { version = "0.9.23", features = ["stc", "aui"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 
 [build-dependencies]
 embed-manifest = "1.4"
