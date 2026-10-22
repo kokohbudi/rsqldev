@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Rows per round trip for grids. Fetch-on-scroll is always on: a batch is fetched only when
+/// the last loaded row scrolls into view, so this only trades round trips for a little memory.
+pub const FETCH_ROWS: usize = 100;
+
 static BUSY: AtomicUsize = AtomicUsize::new(0);
 
 /// Connection threads currently working on a database: connecting, executing, fetching.

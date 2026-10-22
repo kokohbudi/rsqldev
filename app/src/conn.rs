@@ -214,7 +214,7 @@ impl Conn {
 
     /// Worksheet / data-tab statement with fetch-on-demand rows.
     pub fn exec(this: &ConnRef, sql: &str, done: impl FnOnce(Done) + 'static) -> Rows {
-        let fetch = this.borrow().prefs.fetch_size;
+        let fetch = rsqldev_core::worker::FETCH_ROWS;
         Conn::exec_on(this, false, sql, fetch, done)
     }
 

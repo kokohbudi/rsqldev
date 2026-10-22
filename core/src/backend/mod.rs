@@ -79,19 +79,28 @@ pub(crate) struct Batcher<'a> {
     sink: &'a mut dyn FnMut(Event) -> bool,
     buf: Vec<Vec<Cell>>,
     fetch: usize,
+    /// Binary columns: large values spill to disk decoded (see `lob`).
+    binary: Vec<bool>,
 }
 
 impl<'a> Batcher<'a> {
     pub fn new(sink: &'a mut dyn FnMut(Event) -> bool, fetch: usize) -> Self {
-        Batcher { sink, buf: Vec::new(), fetch: fetch.max(1) }
+        Batcher { sink, buf: Vec::new(), fetch: fetch.max(1), binary: vec![] }
     }
 
     pub fn columns(&mut self, c: Vec<crate::Column>) -> bool {
+        self.binary = c.iter().map(|c| crate::is_binary(&c.type_name)).collect();
         (self.sink)(Event::Columns(c))
     }
 
     /// False = consumer wants no more rows.
-    pub fn push(&mut self, row: Vec<Cell>) -> bool {
+    pub fn push(&mut self, mut row: Vec<Cell>) -> bool {
+        // Large values go to disk now, so a batch of big BLOBs never sits in memory.
+        for (i, v) in row.iter_mut().enumerate() {
+            if v.as_ref().is_some_and(|s| s.len() > crate::lob::INLINE) {
+                *v = v.take().map(|s| crate::lob::keep(s, self.binary.get(i).copied().unwrap_or(false)));
+            }
+        }
         self.buf.push(row);
         if self.buf.len() >= self.fetch {
             return (self.sink)(Event::Rows(std::mem::take(&mut self.buf)));

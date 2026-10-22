@@ -15,20 +15,39 @@ pub const NULL_TEXT: &str = "(null)";
 #[derive(Clone, Default)]
 pub struct Row {
     pub cur: Vec<Cell>,
-    /// Values as fetched; None for rows inserted in the grid.
+    /// Values as fetched, copied only when the row is first edited (saves a copy of every
+    /// untouched row). None = unedited, or a row inserted in the grid (`new`).
     pub orig: Option<Vec<Cell>>,
+    /// Inserted in the grid (not fetched).
+    pub new: bool,
     pub deleted: bool,
     /// Files loaded into binary cells (column → bytes), posted as bind values on commit.
     pub blobs: HashMap<usize, Rc<Vec<u8>>>,
 }
 
 impl Row {
-    fn fetched(r: Vec<Cell>) -> Row {
-        Row { orig: Some(r.clone()), cur: r, ..Row::default() }
+    fn fetched(cur: Vec<Cell>) -> Row {
+        Row { cur, ..Row::default() }
+    }
+
+    /// Call before changing `cur`: keeps the fetched values for the WHERE clause.
+    fn edit(&mut self) {
+        if !self.new && self.orig.is_none() {
+            self.orig = Some(self.cur.clone());
+        }
+    }
+
+    /// Values as fetched (the key for UPDATE / DELETE).
+    pub fn original(&self) -> &[Cell] {
+        self.orig.as_deref().unwrap_or(&self.cur)
+    }
+
+    fn changed(&self, c: usize) -> bool {
+        self.new || self.blobs.contains_key(&c) || self.orig.as_ref().is_some_and(|o| o[c] != self.cur[c])
     }
 
     pub fn dirty(&self) -> bool {
-        self.deleted || !self.blobs.is_empty() || self.orig.as_ref() != Some(&self.cur)
+        self.deleted || self.new || !self.blobs.is_empty() || self.orig.as_ref().is_some_and(|o| *o != self.cur)
     }
 }
 
@@ -117,6 +136,12 @@ impl ResultGrid {
         let mut st = self.st.borrow_mut();
         if let Some(rx) = st.rx.take() {
             rx.borrow_mut().take();
+        }
+        // Spilled LOB files of the old result are no longer reachable.
+        for row in &st.rows {
+            for v in row.cur.iter().chain(row.orig.iter().flatten()).flatten() {
+                rsqldev_core::lob::release(v);
+            }
         }
         let keep = (st.on_change.take(), st.db);
         *st = State { on_change: keep.0, db: keep.1, ..State::default() };
@@ -261,7 +286,7 @@ impl ResultGrid {
             for (ci, v) in row.cur.iter().enumerate() {
                 let (r, c) = (ri as i32, ci as i32);
                 match v {
-                    Some(s) => g.set_cell_value(r, c, s),
+                    Some(s) => g.set_cell_value(r, c, rsqldev_core::lob::grid_text(st.cols.get(ci).map_or("", |c| c.type_name.as_str()), s)),
                     None => {
                         g.set_cell_value(r, c, NULL_TEXT);
                         g.set_cell_text_colour(r, c, &grey);
@@ -270,7 +295,8 @@ impl ResultGrid {
                 if st.cols.get(ci).is_some_and(|c| c.numeric) {
                     g.set_cell_alignment(r, c, 0x0200 /* wxALIGN_RIGHT */, 0x0800 /* wxALIGN_CENTER_VERTICAL */);
                 }
-                if !st.editable {
+                // BLOB cells change through Load Value, not by typing over "(BLOB)".
+                if !st.editable || st.cols.get(ci).is_some_and(|c| rsqldev_core::lob::is_blob_type(&c.type_name)) {
                     g.set_read_only(r, c, true);
                 }
             }
@@ -299,7 +325,7 @@ impl ResultGrid {
         let r = ri as i32;
         let label = if row.deleted {
             format!("{} ✕", ri + 1)
-        } else if row.orig.is_none() {
+        } else if row.new {
             format!("{} +", ri + 1)
         } else if row.dirty() {
             format!("{} *", ri + 1)
@@ -310,7 +336,7 @@ impl ResultGrid {
         let edited = crate::theme::c(crate::theme::p().edited_bg);
         let removed = crate::theme::c(crate::theme::p().deleted_bg);
         for ci in 0..row.cur.len() {
-            let changed = row.blobs.contains_key(&ci) || row.orig.as_ref().is_none_or(|o| o[ci] != row.cur[ci]);
+            let changed = row.changed(ci);
             if row.deleted {
                 g.set_cell_background_colour(r, ci as i32, &removed);
             } else if changed && st.editable {
@@ -323,6 +349,7 @@ impl ResultGrid {
         let v = self.grid.get_cell_value(r, c);
         let mut st = self.st.borrow_mut();
         let Some(row) = st.rows.get_mut(r as usize) else { return };
+        row.edit();
         row.cur[c as usize] = if v.is_empty() || v == NULL_TEXT { None } else { Some(v) };
         row.blobs.remove(&(c as usize));
         Self::mark_row(self.grid, &st, r as usize);
@@ -335,7 +362,7 @@ impl ResultGrid {
         let n = {
             let mut st = self.st.borrow_mut();
             let w = st.cols.len();
-            st.rows.push(Row { cur: vec![None; w], ..Row::default() });
+            st.rows.push(Row { cur: vec![None; w], new: true, ..Row::default() });
             st.rows.len() - 1
         };
         self.append_rows(n);
@@ -347,7 +374,7 @@ impl ResultGrid {
         let start = {
             let mut st = self.st.borrow_mut();
             let start = st.rows.len();
-            st.rows.extend(rows.into_iter().map(|cur| Row { cur, ..Row::default() }));
+            st.rows.extend(rows.into_iter().map(|cur| Row { cur, new: true, ..Row::default() }));
             start
         };
         self.append_rows(start);
@@ -499,7 +526,8 @@ impl ResultGrid {
         let binary = st.cols.get(c).is_some_and(|col| rsqldev_core::is_binary(&col.type_name));
         let Some(row) = st.rows.get_mut(r) else { return };
         let text = if binary {
-            let t = format!("(BLOB {} bytes)", bytes.len());
+            row.edit();
+            let t = "(BLOB)".to_string();
             row.blobs.insert(c, Rc::new(bytes));
             t
         } else {
@@ -519,6 +547,7 @@ impl ResultGrid {
     fn set_cell(&self, r: usize, c: usize, v: Cell) {
         let mut st = self.st.borrow_mut();
         let Some(row) = st.rows.get_mut(r) else { return };
+        row.edit();
         row.cur[c] = v.clone();
         let p = crate::theme::p();
         self.grid.set_cell_value(r as i32, c as i32, v.as_deref().unwrap_or(NULL_TEXT));
@@ -535,7 +564,8 @@ impl ResultGrid {
             let (Some(row), Some(col)) = (st.rows.get(r), st.cols.get(c)) else { return };
             let binary = rsqldev_core::is_binary(&col.type_name);
             let bytes = row.blobs.get(&c).map(|b| b.to_vec()).or_else(|| row.cur[c].as_deref().filter(|_| binary).map(|s| rsqldev_core::cell_bytes(col, s)));
-            (col.clone(), row.cur[c].clone(), bytes, st.editable && c >= st.hidden)
+            let text = row.cur[c].as_deref().map(|s| rsqldev_core::lob::expand(s).into_owned());
+            (col.clone(), text, bytes, st.editable && c >= st.hidden)
         };
         match crate::value::show(&self.grid, &col, text.as_deref(), bytes.as_deref(), editable) {
             crate::value::Outcome::Text(v) => {

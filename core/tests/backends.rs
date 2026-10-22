@@ -138,12 +138,14 @@ fn exercise(c: ConnConfig, pw: &str, owner: &str) {
         // BLOB upload through binds: > 2000 bytes takes Oracle's temporary-LOB path.
         let bi = cols.iter().position(|c| c.name.eq_ignore_ascii_case("b")).unwrap();
         assert!(is_binary(&cols[bi].type_name), "{:?}", cols[bi]);
-        let payload: Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
+        // 100 KB: past lob::INLINE, so the fetched cell is spilled to disk and read back from there.
+        let payload: Vec<u8> = (0..100_000u32).map(|i| (i * 7) as u8).collect();
         let ins = dml::insert(db, &table, &cols, skip, &row, &[bi]);
         assert_eq!(b.execute_binds(&ins, &[Bind::Bytes(payload.clone())]).unwrap_or_else(|e| panic!("{ins}\n=> {e:#}")), Some(1));
         let up = dml::update(db, &table, &cols, &key, skip, &new, &new, &[bi]).unwrap();
         assert_eq!(b.execute_binds(&up, &[Bind::Bytes(vec![0x50, 0x4B, 0, 0xFF])]).unwrap_or_else(|e| panic!("{up}\n=> {e:#}")), Some(1));
         let (bc, br) = query_all(b, "SELECT b FROM rsq_t WHERE id = 500").unwrap();
+        assert!(rsqldev_core::lob::is_lob(br[0][0].as_deref().unwrap()), "large BLOB spilled, not held in memory");
         assert_eq!(cell_bytes(&bc[0], br[0][0].as_deref().unwrap()), payload, "BLOB download (bind insert)");
         let (bc, br) = query_all(b, "SELECT b FROM rsq_t WHERE id = 7").unwrap();
         assert_eq!(cell_bytes(&bc[0], br[0][0].as_deref().unwrap()), vec![0x50, 0x4B, 0, 0xFF], "BLOB download (bind update)");

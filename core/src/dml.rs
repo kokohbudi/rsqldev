@@ -9,6 +9,9 @@ use crate::{Cell, Column};
 /// literal converts back implicitly.
 pub fn literal(db: Db, col: &Column, v: &Cell) -> String {
     let Some(s) = v else { return "NULL".into() };
+    // Spilled LOB cells: the literal needs the whole value.
+    let full = crate::lob::expand(s);
+    let s = &full.into_owned();
     if col.numeric && !s.is_empty() && s.parse::<f64>().is_ok() {
         return s.clone();
     }

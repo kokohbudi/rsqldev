@@ -881,6 +881,7 @@ fn start_page(parent: &AuiNotebook, recover: &[autosave::Slot]) -> Panel {
 fn main() {
     SystemOptions::set_option_by_int("msw.no-manifest-check", 1);
     let prefs0 = config::load_prefs();
+    rsqldev_core::lob::cleanup_stale();
     let _ = wxdragon::main(move |_| {
         if let Some(a) = wxdragon::app::get_app() {
             a.set_appearance(match prefs0.theme.as_str() {
@@ -964,6 +965,7 @@ fn main() {
             app.save_history();
             app.autosave_tick();
             app.open.borrow_mut().clear();
+            rsqldev_core::lob::cleanup_mine();
             e.skip(true);
         });
         frame.show(true);

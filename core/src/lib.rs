@@ -9,6 +9,7 @@ pub mod download;
 pub mod export;
 pub mod format;
 pub mod import;
+pub mod lob;
 pub mod registry;
 pub mod script;
 pub mod worker;
@@ -92,14 +93,29 @@ pub fn is_binary(type_name: &str) -> bool {
 /// Raw bytes of a grid cell: binary columns are shown as hex (`0x…`, `\x…` or bare), so decode
 /// them; anything else (or text that is not hex) is written as its UTF-8 text.
 pub fn cell_bytes(col: &Column, s: &str) -> Vec<u8> {
+    if let Some(b) = lob::bytes(s) {
+        return b;
+    }
     let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("\\x")).unwrap_or(s);
-    let hex = || -> Option<Vec<u8>> {
-        if !h.len().is_multiple_of(2) {
-            return None;
-        }
-        (0..h.len()).step_by(2).map(|i| u8::from_str_radix(h.get(i..i + 2)?, 16).ok()).collect()
-    };
-    is_binary(&col.type_name).then(hex).flatten().unwrap_or_else(|| s.as_bytes().to_vec())
+    is_binary(&col.type_name).then(|| hex_decode(h)).flatten().unwrap_or_else(|| s.as_bytes().to_vec())
+}
+
+/// Uppercase hex, no prefix.
+pub fn hex(b: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        let _ = write!(s, "{x:02X}");
+    }
+    s
+}
+
+/// Decode hex digits (no prefix); None when not hex.
+pub fn hex_decode(h: &str) -> Option<Vec<u8>> {
+    if !h.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..h.len()).step_by(2).map(|i| u8::from_str_radix(h.get(i..i + 2)?, 16).ok()).collect()
 }
 
 /// Convenience: run a query and collect every row (metadata queries, tests).

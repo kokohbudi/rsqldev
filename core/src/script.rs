@@ -418,7 +418,7 @@ pub fn format_table(cols: &[crate::Column], rows: &[Vec<crate::Cell>]) -> String
     if cols.is_empty() {
         return String::new();
     }
-    let cell = |v: &crate::Cell| v.as_deref().unwrap_or("").replace(['\n', '\r'], " ");
+    let cell = |v: &crate::Cell| crate::lob::display(v.as_deref().unwrap_or("")).replace(['\n', '\r'], " ");
     let w: Vec<usize> = cols
         .iter()
         .enumerate()

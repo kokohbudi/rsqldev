@@ -10,7 +10,6 @@ pub fn show(parent: &Frame) {
     g.add_growable_col(1, 1);
     let font = TextCtrl::builder(&dlg).with_value(&p.editor_font).build();
     let size = SpinCtrl::builder(&dlg).with_range(6, 48).with_initial_value(p.editor_font_size).build();
-    let fetch = SpinCtrl::builder(&dlg).with_range(1, 10000).with_initial_value(p.fetch_size as i32).build();
     let auto = CheckBox::builder(&dlg).with_label("Autocommit").build();
     auto.set_value(p.autocommit);
     let nls = TextCtrl::builder(&dlg).with_value(&p.nls_date_format).build();
@@ -20,7 +19,6 @@ pub fn show(parent: &Frame) {
     crate::ui::row(&dlg, &g, "Appearance", &theme);
     crate::ui::row(&dlg, &g, "Editor font", &font);
     crate::ui::row(&dlg, &g, "Font size", &size);
-    crate::ui::row(&dlg, &g, "SQL array fetch size", &fetch);
     crate::ui::row(&dlg, &g, "", &auto);
     crate::ui::row(&dlg, &g, "Oracle NLS date format", &nls);
     let note = StaticText::builder(&dlg).with_label("Connection settings apply to new connections.").build();
@@ -39,7 +37,6 @@ pub fn show(parent: &Frame) {
     if dlg.show_modal() == ID_OK {
         p.editor_font = font.get_value();
         p.editor_font_size = size.value();
-        p.fetch_size = fetch.value().max(1) as usize;
         p.autocommit = auto.get_value();
         p.nls_date_format = nls.get_value();
         let new_theme = THEMES[theme.get_selection().unwrap_or(0) as usize].0.to_string();

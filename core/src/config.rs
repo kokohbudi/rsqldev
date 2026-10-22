@@ -42,8 +42,6 @@ struct ConnFile {
 pub struct Prefs {
     pub editor_font: String,
     pub editor_font_size: i32,
-    /// Rows fetched per round trip (SQL Developer default 50).
-    pub fetch_size: usize,
     pub autocommit: bool,
     /// Applied to Oracle sessions after connect.
     pub nls_date_format: String,
@@ -58,7 +56,6 @@ impl Default for Prefs {
         Prefs {
             editor_font: if cfg!(windows) { "Consolas".into() } else { "Menlo".into() },
             editor_font_size: 12,
-            fetch_size: 50,
             autocommit: false,
             nls_date_format: "DD-MON-RR".into(),
             client_dirs: BTreeMap::new(),

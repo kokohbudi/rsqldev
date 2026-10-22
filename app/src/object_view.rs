@@ -257,8 +257,9 @@ impl ObjectView {
         let key = dml::Key::new(&st.cols, d.hidden, &d.pk.borrow());
         let skip = d.hidden.map(|_| 0);
         let mut out = vec![];
-        for Row { cur, orig, deleted, blobs } in &st.rows {
-            let changed = |c: usize| orig.as_ref().is_none_or(|o| o[c] != cur[c]);
+        for row in &st.rows {
+            let Row { cur, deleted, blobs, new, .. } = row;
+            let changed = |c: usize| *new || row.original()[c] != cur[c];
             let cols: Vec<usize> = (0..st.cols.len())
                 .filter(|&c| Some(c) != skip && (blobs.contains_key(&c) || (changed(c) && dml::text_needs_bind(self.db, &st.cols[c], &cur[c]))))
                 .collect();
@@ -266,15 +267,16 @@ impl ObjectView {
                 cols.iter()
                     .map(|c| match blobs.get(c) {
                         Some(b) => Bind::Bytes(b.to_vec()),
-                        None => Bind::Text(cur[*c].clone().unwrap_or_default()),
+                        None => Bind::Text(cur[*c].as_deref().map(|s| rsqldev_core::lob::expand(s).into_owned()).unwrap_or_default()),
                     })
                     .collect::<Vec<_>>()
             };
-            match (orig, deleted) {
-                (None, true) => {}
-                (None, false) => out.push((dml::insert(self.db, &table, &st.cols, skip, cur, &cols), binds())),
-                (Some(o), true) => out.push((dml::delete(self.db, &table, &st.cols, &key, o), vec![])),
-                (Some(o), false) => out.extend(dml::update(self.db, &table, &st.cols, &key, skip, o, cur, &cols).map(|s| (s, binds()))),
+            match (new, deleted) {
+                (true, true) => {}
+                (true, false) => out.push((dml::insert(self.db, &table, &st.cols, skip, cur, &cols), binds())),
+                (false, true) => out.push((dml::delete(self.db, &table, &st.cols, &key, row.original()), vec![])),
+                (false, false) if row.dirty() => out.extend(dml::update(self.db, &table, &st.cols, &key, skip, row.original(), cur, &cols).map(|s| (s, binds()))),
+                (false, false) => {}
             }
         }
         out
