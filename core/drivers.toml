@@ -1,0 +1,286 @@
+# Driver registry. Mirrors the role of DBeaver's plugin.xml <driver> entries, but every
+# entry maps to a native backend. `files` = native client libraries downloaded on demand,
+# keyed by "<os>-<arch>" (std::env::consts). Backends without files are built in.
+
+# ---------- Oracle ----------
+[[driver]]
+id = "oracle"
+label = "Oracle"
+category = "Oracle"
+backend = "oracle"
+port = 1521
+database = "FREEPDB1"
+license = "https://www.oracle.com/downloads/licenses/instant-client-lic.html"
+
+[[driver.files]]
+os = "macos-aarch64"
+version = "23.26.2.0.0"
+url = "https://download.oracle.com/otn_software/mac/instantclient/2326200/instantclient-basic-macos.arm64-23.26.2.0.0.dmg"
+sha256 = "c3c4fce37a557192322717c1a8422fe098fc829a41f382f57a288b24ad6ba11e"
+archive = "dmg"
+
+[[driver.files]]
+os = "macos-x86_64"
+version = "19.16.0.0.0"
+url = "https://download.oracle.com/otn_software/mac/instantclient/1916000/instantclient-basic-macos.x64-19.16.0.0.0dbru.dmg"
+sha256 = "725eeb7c00041e926b57c3db508ea7439a1935a37f480c0ac6d46eddc4205331"
+archive = "dmg"
+
+[[driver.files]]
+os = "windows-x86_64"
+version = "23.26.4.0.0"
+url = "https://download.oracle.com/otn_software/nt/instantclient/2326400/instantclient-basic-windows.x64-23.26.4.0.0.zip"
+sha256 = "09e9b81cd492f5ce6f671317c23a0e1f5dee5e786258149d216321c3dad3023f"
+archive = "zip"
+strip = 1
+
+# ---------- PostgreSQL wire protocol ----------
+[[driver]]
+id = "postgres"
+label = "PostgreSQL"
+category = "PostgreSQL"
+backend = "postgres"
+port = 5432
+database = "postgres"
+user = "postgres"
+
+[[driver]]
+id = "greenplum"
+label = "Greenplum"
+category = "PostgreSQL"
+backend = "postgres"
+port = 5432
+database = "postgres"
+
+[[driver]]
+id = "cloudberry"
+label = "Cloudberry"
+category = "PostgreSQL"
+backend = "postgres"
+port = 5432
+database = "postgres"
+
+[[driver]]
+id = "greengage"
+label = "Greengage"
+category = "PostgreSQL"
+backend = "postgres"
+port = 5432
+database = "postgres"
+
+[[driver]]
+id = "timescale"
+label = "TimescaleDB"
+category = "PostgreSQL"
+backend = "postgres"
+port = 5432
+database = "postgres"
+
+[[driver]]
+id = "yugabyte"
+label = "YugabyteDB"
+category = "PostgreSQL"
+backend = "postgres"
+port = 5433
+database = "yugabyte"
+user = "yugabyte"
+
+[[driver]]
+id = "cockroach"
+label = "CockroachDB"
+category = "PostgreSQL"
+backend = "postgres"
+port = 26257
+database = "defaultdb"
+user = "root"
+
+[[driver]]
+id = "materialize"
+label = "Materialize"
+category = "PostgreSQL"
+backend = "postgres"
+port = 6875
+database = "materialize"
+user = "materialize"
+
+[[driver]]
+id = "redshift"
+label = "Amazon Redshift"
+category = "PostgreSQL"
+backend = "postgres"
+port = 5439
+database = "dev"
+options = { sslmode = "require" }
+
+[[driver]]
+id = "risingwave"
+label = "RisingWave"
+category = "PostgreSQL"
+backend = "postgres"
+port = 4566
+database = "dev"
+user = "root"
+
+[[driver]]
+id = "cratedb"
+label = "CrateDB"
+category = "PostgreSQL"
+backend = "postgres"
+port = 5432
+database = "doc"
+user = "crate"
+
+[[driver]]
+id = "gaussdb"
+label = "GaussDB"
+category = "PostgreSQL"
+backend = "postgres"
+port = 8000
+database = "postgres"
+
+[[driver]]
+id = "edb"
+label = "EDB Postgres"
+category = "PostgreSQL"
+backend = "postgres"
+port = 5444
+database = "edb"
+user = "enterprisedb"
+
+[[driver]]
+id = "yellowbrick"
+label = "Yellowbrick"
+category = "PostgreSQL"
+backend = "postgres"
+port = 5432
+database = "yellowbrick"
+
+[[driver]]
+id = "kingbase"
+label = "Kingbase"
+category = "PostgreSQL"
+backend = "postgres"
+port = 54321
+database = "test"
+user = "system"
+
+# ---------- MySQL wire protocol ----------
+[[driver]]
+id = "mysql"
+label = "MySQL"
+category = "MySQL"
+backend = "mysql"
+port = 3306
+user = "root"
+
+[[driver]]
+id = "mariadb"
+label = "MariaDB"
+category = "MySQL"
+backend = "mysql"
+port = 3306
+user = "root"
+
+[[driver]]
+id = "tidb"
+label = "TiDB"
+category = "MySQL"
+backend = "mysql"
+port = 4000
+user = "root"
+
+[[driver]]
+id = "doris"
+label = "Apache Doris"
+category = "MySQL"
+backend = "mysql"
+port = 9030
+user = "root"
+
+[[driver]]
+id = "starrocks"
+label = "StarRocks"
+category = "MySQL"
+backend = "mysql"
+port = 9030
+user = "root"
+
+[[driver]]
+id = "oceanbase"
+label = "OceanBase"
+category = "MySQL"
+backend = "mysql"
+port = 2881
+user = "root"
+
+[[driver]]
+id = "greptime"
+label = "GreptimeDB"
+category = "MySQL"
+backend = "mysql"
+port = 4002
+
+[[driver]]
+id = "mysql_ndb"
+label = "MySQL NDB Cluster"
+category = "MySQL"
+backend = "mysql"
+port = 3306
+user = "root"
+
+[[driver]]
+id = "databend"
+label = "Databend"
+category = "MySQL"
+backend = "mysql"
+port = 3307
+user = "root"
+
+# ---------- TDS ----------
+[[driver]]
+id = "sqlserver"
+label = "SQL Server"
+category = "SQL Server"
+backend = "mssql"
+port = 1433
+database = "master"
+user = "sa"
+
+[[driver]]
+id = "azuresql"
+label = "Azure SQL Server"
+category = "SQL Server"
+backend = "mssql"
+port = 1433
+options = { encrypt = "true", trust_cert = "false" }
+
+[[driver]]
+id = "babelfish"
+label = "Babelfish (TDS)"
+category = "SQL Server"
+backend = "mssql"
+port = 1433
+database = "master"
+
+# ---------- Embedded / file ----------
+[[driver]]
+id = "sqlite"
+label = "SQLite"
+category = "Embedded"
+backend = "sqlite"
+
+[[driver]]
+id = "duckdb"
+label = "DuckDB"
+category = "Embedded"
+backend = "duckdb"
+
+# ---------- Analytical ----------
+[[driver]]
+id = "clickhouse"
+label = "ClickHouse"
+category = "Analytical"
+backend = "clickhouse"
+port = 8123
+database = "default"
+user = "default"

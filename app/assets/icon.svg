@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4b86c4"/>
+      <stop offset="1" stop-color="#22466f"/>
+    </linearGradient>
+    <linearGradient id="db" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#cfe0f3"/>
+      <stop offset="0.55" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#b9cfe8"/>
+    </linearGradient>
+  </defs>
+  <!-- macOS icon grid: 824px body, 100px margin -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <!-- SQL worksheet -->
+  <path d="M400 220h290l90 90v420a30 30 0 0 1-30 30H400a30 30 0 0 1-30-30V250a30 30 0 0 1 30-30z" fill="#ffffff"/>
+  <path d="M690 220v60a30 30 0 0 0 30 30h60z" fill="#c9dbef"/>
+  <rect x="430" y="330" width="210" height="26" rx="13" fill="#336699"/>
+  <rect x="430" y="390" width="300" height="22" rx="11" fill="#9db8d9"/>
+  <rect x="430" y="440" width="250" height="22" rx="11" fill="#9db8d9"/>
+  <rect x="430" y="490" width="280" height="22" rx="11" fill="#9db8d9"/>
+  <!-- database cylinder -->
+  <path d="M200 520c0-38 80-68 180-68s180 30 180 68v230c0 38-80 68-180 68s-180-30-180-68z" fill="url(#db)" stroke="#22466f" stroke-width="14"/>
+  <path d="M200 600c0 38 80 68 180 68s180-30 180-68M200 680c0 38 80 68 180 68s180-30 180-68" fill="none" stroke="#22466f" stroke-width="12"/>
+  <ellipse cx="380" cy="520" rx="180" ry="68" fill="#eef4fb" stroke="#22466f" stroke-width="14"/>
+  <!-- run badge -->
+  <circle cx="735" cy="735" r="125" fill="#2f9e44" stroke="#ffffff" stroke-width="18"/>
+  <path d="M700 670l100 65-100 65z" fill="#ffffff" stroke="#ffffff" stroke-width="14" stroke-linejoin="round"/>
+</svg>

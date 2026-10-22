@@ -1,0 +1,980 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//! rsqldev: a native SQL Developer. wxWidgets gives Cocoa widgets on macOS and Win32 on Windows.
+
+mod autosave;
+mod conn;
+mod connections;
+mod driver_manager;
+mod editor;
+mod grid;
+mod hub;
+mod icons;
+mod theme;
+mod object_view;
+mod prefs;
+mod ui;
+mod worksheet;
+
+use conn::{Conn, ConnRef};
+use connections::Navigator;
+use object_view::ObjectView;
+use rsqldev_core::config::{self, ConnConfig, Prefs};
+use rsqldev_core::dialect;
+use rsqldev_core::registry::{self, Kind};
+use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+use worksheet::{SheetRef, Worksheet};
+use wxdragon::prelude::*;
+
+// wx stock ids (wx/defs.h) so the native Edit menu and macOS app menu behave.
+const ID_NEW: i32 = 5002;
+const ID_OPEN: i32 = 5000;
+const ID_CLOSE_TAB: i32 = 5001;
+const ID_SAVEAS: i32 = 5004;
+const ID_UNDO: i32 = 5007;
+const ID_REDO: i32 = 5008;
+const ID_PREFERENCES: i32 = 5022;
+const ID_CUT: i32 = 5031;
+const ID_COPY: i32 = 5032;
+const ID_PASTE: i32 = 5033;
+const ID_SELECTALL: i32 = 5037;
+
+const ID_RUN: i32 = ID_HIGHEST + 1;
+const ID_SCRIPT: i32 = ID_HIGHEST + 2;
+const ID_EXPLAIN: i32 = ID_HIGHEST + 3;
+const ID_COMMIT: i32 = ID_HIGHEST + 4;
+const ID_ROLLBACK: i32 = ID_HIGHEST + 5;
+const ID_CANCEL_STMT: i32 = ID_HIGHEST + 6;
+const ID_HISTORY: i32 = ID_HIGHEST + 7;
+const ID_CLEAR: i32 = ID_HIGHEST + 8;
+const ID_WORKSHEET: i32 = ID_HIGHEST + 9;
+pub const ID_UNSHARED: i32 = ID_HIGHEST + 10;
+const ID_DRIVERS: i32 = ID_HIGHEST + 11;
+const ID_TOGGLE_NAV: i32 = ID_HIGHEST + 12;
+const ID_NEW_CONN: i32 = ID_HIGHEST + 13;
+const ID_SAVEALL: i32 = ID_HIGHEST + 14;
+const ID_BACK: i32 = ID_HIGHEST + 15;
+const ID_FORWARD: i32 = ID_HIGHEST + 16;
+const ID_RECOVER: i32 = ID_HIGHEST + 17;
+const ID_START: i32 = ID_HIGHEST + 18;
+const ID_KEYS: i32 = ID_HIGHEST + 19;
+const ID_THEME_LIGHT: i32 = ID_HIGHEST + 20;
+const ID_THEME_DARK: i32 = ID_HIGHEST + 21;
+const ID_THEME_SYSTEM: i32 = ID_HIGHEST + 22;
+
+enum Page {
+    Sheet(SheetRef),
+    Obj(Rc<ObjectView>),
+}
+
+impl Page {
+    fn panel(&self) -> Panel {
+        match self {
+            Page::Sheet(s) => s.panel,
+            Page::Obj(o) => o.panel,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct History {
+    #[serde(default)]
+    entries: Vec<String>,
+}
+
+pub struct App {
+    frame: Frame,
+    nb: AuiNotebook,
+    _left: AuiNotebook,
+    start: std::cell::Cell<Panel>,
+    nav: Navigator,
+    split: SplitterWindow,
+    nav_shown: std::cell::Cell<bool>,
+    prefs: RefCell<Prefs>,
+    conns: RefCell<Vec<ConnConfig>>,
+    open: RefCell<HashMap<String, ConnRef>>,
+    pages: RefCell<Vec<Page>>,
+    history: RefCell<Vec<String>>,
+    _timer: Timer<Frame>,
+}
+
+thread_local! {
+    static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
+}
+
+pub fn app() -> Rc<App> {
+    APP.with(|a| a.borrow().clone().expect("app initialised"))
+}
+
+impl App {
+    pub fn prefs(&self) -> Prefs {
+        self.prefs.borrow().clone()
+    }
+
+    pub fn set_prefs(&self, p: Prefs) {
+        if let Err(e) = config::save_prefs(&p) {
+            ui::error(&self.frame, &format!("Saving preferences failed: {e}"));
+        }
+        *self.prefs.borrow_mut() = p;
+    }
+
+    pub fn add_history(&self, sql: &str) {
+        let sql = sql.trim().to_string();
+        let mut h = self.history.borrow_mut();
+        h.retain(|s| *s != sql);
+        h.push(sql);
+        let n = h.len();
+        if n > 500 {
+            h.drain(..n - 500);
+        }
+    }
+
+    pub fn history(&self) -> Vec<String> {
+        self.history.borrow().clone()
+    }
+
+    fn save_history(&self) {
+        let h = History { entries: self.history() };
+        if let Ok(s) = toml::to_string(&h) {
+            let _ = std::fs::create_dir_all(config::config_root());
+            let _ = std::fs::write(config::config_root().join("history.toml"), s);
+        }
+    }
+
+    fn save_conns(&self) {
+        if let Err(e) = config::save_connections(&self.conns.borrow()) {
+            ui::error(&self.frame, &format!("Saving connections failed: {e}"));
+        }
+        self.nav.reload(&self.conns.borrow());
+    }
+
+    pub fn connection_names(&self) -> Vec<String> {
+        self.names()
+    }
+
+    /// Rename the document tab showing `panel`.
+    pub fn retitle(&self, panel: &Panel, title: &str) {
+        let i = self.nb.get_page_index(panel);
+        if i >= 0 {
+            self.nb.set_page_text(i as usize, title);
+        }
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.conns.borrow().iter().map(|c| c.name.clone()).collect()
+    }
+
+    /// Store a dialog result; returns the connection name to connect to, if requested.
+    fn store(&self, (old, cfg, pw, go): connections::DialogResult) {
+        let old = old.as_deref();
+        if let Some(o) = old {
+            self.disconnect(o);
+            if o != cfg.name {
+                config::delete_password(o);
+            }
+        }
+        if cfg.save_password && !pw.is_empty() {
+            let _ = config::set_password(&cfg.name, &pw);
+        } else if !cfg.save_password {
+            config::delete_password(&cfg.name);
+        }
+        let name = cfg.name.clone();
+        {
+            let mut cs = self.conns.borrow_mut();
+            cs.retain(|c| Some(c.name.as_str()) != old && c.name != name);
+            cs.push(cfg);
+        }
+        self.save_conns();
+        if go {
+            let pw = (!pw.is_empty()).then_some(pw);
+            self.connect_with(&name, pw, |c| app().open_worksheet(c));
+        }
+    }
+
+    pub fn new_connection(&self) {
+        let saved = self.conns.borrow().clone();
+        if let Some(r) = connections::edit_dialog(&self.frame, None, &saved) {
+            self.store(r);
+        }
+    }
+
+    pub fn edit_connection(&self, name: &str) {
+        let saved = self.conns.borrow().clone();
+        let cfg = saved.iter().find(|c| c.name == name).cloned();
+        if let Some(r) = cfg.and_then(|c| connections::edit_dialog(&self.frame, Some(&c), &saved)) {
+            self.store(r);
+        }
+    }
+
+    pub fn delete_connection(&self, name: &str) {
+        self.disconnect(name);
+        config::delete_password(name);
+        self.conns.borrow_mut().retain(|c| c.name != name);
+        self.save_conns();
+    }
+
+    pub fn open_conn(&self, name: &str) -> Option<ConnRef> {
+        self.open.borrow().get(name).filter(|c| c.borrow().is_up()).cloned()
+    }
+
+    pub fn disconnect(&self, name: &str) {
+        self.open.borrow_mut().remove(name);
+        let mut pages = self.pages.borrow_mut();
+        let mut i = pages.len();
+        while i > 0 {
+            i -= 1;
+            let mine = match &pages[i] {
+                Page::Sheet(s) => s.conn().borrow().cfg.name == name,
+                Page::Obj(o) => o.key.starts_with(&format!("{name}|")),
+            };
+            if mine {
+                let idx = self.nb.get_page_index(&pages[i].panel());
+                pages.remove(i);
+                if idx >= 0 {
+                    self.nb.delete_page(idx as usize);
+                }
+            }
+        }
+    }
+
+    pub fn connect(&self, name: &str, f: impl FnOnce(ConnRef) + 'static) {
+        self.connect_with(name, None, f)
+    }
+
+    fn connect_with(&self, name: &str, pw: Option<String>, f: impl FnOnce(ConnRef) + 'static) {
+        let existing = self.open.borrow().get(name).cloned();
+        if let Some(c) = existing.filter(|c| !c.borrow().failed()) {
+            let c2 = c.clone();
+            return Conn::when_ready(&c, move |r| {
+                if r.is_ok() {
+                    f(c2)
+                }
+            });
+        }
+        let Some(cfg) = self.conns.borrow().iter().find(|c| c.name == name).cloned() else { return };
+        let file = registry::find(&cfg.driver).is_some_and(|d| d.backend.is_file());
+        let pw = match pw.or_else(|| cfg.save_password.then(|| config::get_password(name)).flatten()) {
+            Some(p) => p,
+            None if file => String::new(),
+            None => match ui::ask_password(&self.frame, &format!("Password for {}@{}:", cfg.user, cfg.name)) {
+                Some(p) => p,
+                None => return,
+            },
+        };
+        self.frame.set_status_text(&format!("Connecting to {name}…"), 0);
+        let c = Conn::open(cfg, pw.clone(), self.prefs());
+        self.open.borrow_mut().insert(name.to_string(), c.clone());
+        let name = name.to_string();
+        let c2 = c.clone();
+        Conn::when_ready(&c, move |r| {
+            let app = app();
+            match r {
+                Ok(()) => {
+                    app.frame.set_status_text(&format!("Connected: {name}"), 0);
+                    f(c2)
+                }
+                Err(fail) => {
+                    app.open.borrow_mut().remove(&name);
+                    app.frame.set_status_text("Connection failed", 0);
+                    match fail.missing_driver.as_deref().and_then(registry::find) {
+                        Some(d) => driver_manager::download_with_progress(&app.frame, d, move |ok| {
+                            if ok {
+                                crate::app().connect_with(&name, Some(pw), f);
+                            }
+                        }),
+                        None => ui::error(&app.frame, &format!("Connection \"{name}\" failed:\n\n{}", fail.error)),
+                    }
+                }
+            }
+        });
+    }
+
+    fn add_page(&self, page: Page, title: &str) {
+        let panel = page.panel();
+        self.pages.borrow_mut().push(page);
+        self.nb.add_page(&panel, title, true);
+    }
+
+    pub fn open_worksheet(&self, c: ConnRef) {
+        let title = c.borrow().cfg.name.clone();
+        let ws = Worksheet::new(&self.nb, c);
+        self.add_page(Page::Sheet(ws.clone()), &title);
+        ws.editor.set_focus();
+    }
+
+    pub fn open_object(&self, conn: &str, owner: &str, kind: &'static str, name: &str) {
+        let Some(c) = self.open_conn(conn) else { return };
+        let key = format!("{conn}|{owner}|{kind}|{name}");
+        let idx = self.pages.borrow().iter().find(|p| matches!(p, Page::Obj(o) if o.key == key)).map(|p| self.nb.get_page_index(&p.panel()));
+        if let Some(i) = idx.filter(|i| *i >= 0) {
+            self.nb.set_selection(i as usize);
+            return;
+        }
+        let v = ObjectView::new(&self.nb, c, owner, kind, name);
+        self.add_page(Page::Obj(v), name);
+    }
+
+    pub fn ddl_to_worksheet(&self, conn: &str, owner: &str, kind: &'static str, name: &str) {
+        let Some(c) = self.open_conn(conn) else { return };
+        let db = c.borrow().kind;
+        let Some((sql, col)) = dialect::tabs(db, kind).into_iter().find_map(|t| match t.view {
+            dialect::View::Ddl(s, col) => Some((s, col)),
+            dialect::View::Code(s) => Some((s, usize::MAX)),
+            _ => None,
+        }) else {
+            return;
+        };
+        let sql = dialect::fill(db, &sql, owner, name);
+        let c2 = c.clone();
+        Conn::meta_query(&c, &sql, move |r| {
+            let app = app();
+            let text = match r {
+                Ok(r) if col == usize::MAX => r.rows.into_iter().filter_map(|row| row.into_iter().next().flatten()).collect(),
+                Ok(r) => r.rows.into_iter().next().and_then(|row| row.into_iter().nth(col).flatten()).unwrap_or_default(),
+                Err(e) => return ui::error(&app.frame, &e),
+            };
+            app.open_worksheet(c2);
+            if let Some(ws) = app.current_sheet() {
+                ws.editor.set_text(text.trim_start());
+                ws.editor.set_save_point();
+            }
+        });
+    }
+
+    fn sheets(&self) -> Vec<SheetRef> {
+        self.pages.borrow().iter().filter_map(|p| if let Page::Sheet(s) = p { Some(s.clone()) } else { None }).collect()
+    }
+
+    /// Mirror worksheet text to autosave slots (called every ~2 s).
+    fn autosave_tick(&self) {
+        for s in self.sheets() {
+            let text = s.editor.get_text();
+            if *s.autosaved.borrow() != text {
+                let path = s.path.borrow().as_ref().map(|p| p.display().to_string());
+                autosave::write(s.autosave_id, &s.conn().borrow().cfg.name, path, &text);
+                *s.autosaved.borrow_mut() = text;
+            }
+        }
+    }
+
+    /// Slots not belonging to an open worksheet.
+    fn recoverable(&self) -> Vec<autosave::Slot> {
+        let open: Vec<String> = self.sheets().iter().map(|s| format!("{}.toml", s.autosave_id)).collect();
+        autosave::list().into_iter().filter(|sl| !sl.file.file_name().is_some_and(|f| open.iter().any(|o| *o == f.to_string_lossy()))).collect()
+    }
+
+    /// Reopen an autosaved worksheet on its connection.
+    pub fn recover(&self, slot: autosave::Slot) {
+        if !self.names().contains(&slot.conn) {
+            return ui::error(&self.frame, &format!("Connection \"{}\" no longer exists. The text is kept in:\n{}", slot.conn, slot.file.display()));
+        }
+        let conn = slot.conn.clone();
+        self.connect(&conn, move |c| {
+            let app = app();
+            app.open_worksheet(c);
+            if let Some(ws) = app.current_sheet() {
+                ws.editor.set_text(&slot.text);
+                *ws.path.borrow_mut() = slot.path.clone().map(Into::into);
+                autosave::remove_file(&slot.file);
+            }
+        });
+    }
+
+    fn show_start_page(&self) {
+        let cur = self.start.get();
+        if cur.is_valid() && self.nb.get_page_index(&cur) >= 0 {
+            self.nb.set_selection(self.nb.get_page_index(&cur) as usize);
+            return;
+        }
+        let p = start_page(&self.nb, &self.recoverable());
+        self.nb.insert_page(0, &p, "Start Page", true);
+        self.start.set(p);
+    }
+
+    /// Index into `pages` of the selected document tab.
+    fn current(&self) -> Option<usize> {
+        let sel = self.nb.get_selection();
+        if sel < 0 {
+            return None;
+        }
+        self.pages.borrow().iter().position(|p| self.nb.get_page_index(&p.panel()) == sel)
+    }
+
+    /// Drop pages whose tab was closed with the × button (AuiNotebook destroys them itself),
+    /// and keep the title / status bar in sync with the selected tab.
+    fn sync_tabs(&self) {
+        self.pages.borrow_mut().retain(|p| p.panel().is_valid() && self.nb.get_page_index(&p.panel()) >= 0);
+        let title = match self.current().map(|i| self.pages.borrow()[i].panel()) {
+            Some(p) => self.nb.get_page_text(self.nb.get_page_index(&p) as usize),
+            None => String::new(),
+        };
+        let want = if title.is_empty() { "rsqldev".to_string() } else { format!("rsqldev : {title}") };
+        if self.frame.get_title() != want {
+            self.frame.set_title(&want);
+            if self.current_sheet().is_none() {
+                for f in 1..4 {
+                    self.frame.set_status_text("", f);
+                }
+            }
+        }
+    }
+
+    /// Appearance can only be set before windows exist: restart to apply.
+    /// Open worksheets are autosaved and offered on the Start Page afterwards.
+    pub fn offer_restart(&self) {
+        if !ui::confirm(&self.frame, "The new appearance applies after a restart.\n\nRestart rsqldev now? Open worksheets are kept and offered on the Start Page.") {
+            return;
+        }
+        self.autosave_tick();
+        self.save_history();
+        match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(std::env::args().skip(1)).spawn()) {
+            Ok(_) => self.frame.close(true),
+            Err(e) => ui::error(&self.frame, &format!("Could not restart: {e}\nPlease restart rsqldev manually.")),
+        }
+    }
+
+    pub fn status(&self, field: i32, text: &str) {
+        self.frame.set_status_text(text, field);
+    }
+
+    fn current_sheet(&self) -> Option<SheetRef> {
+        let i = self.current()?;
+        match &self.pages.borrow()[i] {
+            Page::Sheet(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    fn close_current(&self) {
+        let Some(i) = self.current() else { return };
+        if let Some(Page::Sheet(s)) = self.pages.borrow().get(i) {
+            if s.editor.is_modified() && !s.editor.get_text().trim().is_empty() && !ui::confirm(&self.frame, "Close worksheet without saving?") {
+                return;
+            }
+        }
+        if let Some(Page::Sheet(s)) = self.pages.borrow().get(i) {
+            autosave::remove(s.autosave_id);
+        }
+        let idx = self.nb.get_page_index(&self.pages.borrow()[i].panel());
+        self.pages.borrow_mut().remove(i);
+        if idx >= 0 {
+            self.nb.delete_page(idx as usize);
+        }
+    }
+
+    /// Connection for a new worksheet: the current tab's, else the tree selection's.
+    fn pick_conn(&self, f: impl FnOnce(ConnRef) + 'static) {
+        if let Some(s) = self.current_sheet() {
+            return f(s.conn());
+        }
+        let names = self.names();
+        if names.is_empty() {
+            return self.new_connection();
+        }
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let d = SingleChoiceDialog::builder(&self.frame, "Connection:", "Select Connection", &refs).build();
+        if d.show_modal() == ID_OK && d.get_selection() >= 0 {
+            self.connect(&names[d.get_selection() as usize], f);
+        }
+    }
+
+    pub fn menu(&self, id: i32) -> bool {
+        let sheet = self.current_sheet();
+        let editor_focus = sheet.as_ref().is_some_and(|s| s.editor.has_focus());
+        match id {
+            ID_NEW_CONN | ID_NEW => self.new_connection(),
+            ID_OPEN => {
+                let d = FileDialog::builder(&self.frame).with_message("Open SQL file").with_style(FileDialogStyle::Open).with_wildcard("SQL files (*.sql)|*.sql|All files (*)|*").build();
+                if d.show_modal() == ID_OK {
+                    if let Some(p) = d.get_path() {
+                        self.pick_conn(move |c| {
+                            let app = app();
+                            app.open_worksheet(c);
+                            if let Some(ws) = app.current_sheet() {
+                                if let Err(e) = ws.open_file(p.into()) {
+                                    ui::error(&app.frame, &e.to_string());
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            ID_SAVE | ID_SAVEAS => {
+                if let Some(s) = sheet {
+                    s.save(id == ID_SAVEAS)
+                }
+            }
+            ID_CLOSE_TAB => self.close_current(),
+            ID_RECOVER => {
+                let slots = self.recoverable();
+                if slots.is_empty() {
+                    return {
+                        ui::info(&self.frame, "No unsaved worksheets to recover.");
+                        true
+                    };
+                }
+                let labels: Vec<String> = slots.iter().map(autosave::label).collect();
+                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                let d = SingleChoiceDialog::builder(&self.frame, "Worksheets closed without saving:", "Recover Worksheet", &refs).build();
+                if d.show_modal() == ID_OK && d.get_selection() >= 0 {
+                    self.recover(slots[d.get_selection() as usize].clone());
+                }
+            }
+            ID_START => self.show_start_page(),
+            ID_THEME_LIGHT | ID_THEME_DARK | ID_THEME_SYSTEM => {
+                let t = match id {
+                    ID_THEME_DARK => "dark",
+                    ID_THEME_SYSTEM => "system",
+                    _ => "light",
+                };
+                let mut p = self.prefs();
+                if p.theme != t {
+                    p.theme = t.into();
+                    self.set_prefs(p);
+                    self.offer_restart();
+                }
+            }
+            ID_KEYS => ui::info(&self.frame, SHORTCUTS),
+            ID_SAVEALL => {
+                let sheets: Vec<SheetRef> = self.pages.borrow().iter().filter_map(|p| if let Page::Sheet(s) = p { Some(s.clone()) } else { None }).collect();
+                for s in sheets.into_iter().filter(|s| s.editor.is_modified()) {
+                    s.save(false);
+                }
+            }
+            ID_BACK | ID_FORWARD => {
+                let (n, i) = (self.nb.page_count() as i32, self.nb.get_selection());
+                if n > 1 && i >= 0 {
+                    self.nb.set_selection(((i + if id == ID_BACK { n - 1 } else { 1 }) % n) as usize);
+                }
+            }
+            ID_EXIT => self.frame.close(false),
+            ID_UNDO | ID_REDO | ID_CUT | ID_COPY | ID_PASTE | ID_SELECTALL if editor_focus => {
+                let e = sheet.unwrap().editor;
+                match id {
+                    ID_UNDO => e.undo(),
+                    ID_REDO => e.redo(),
+                    ID_CUT => e.cut(),
+                    ID_COPY => e.copy(),
+                    ID_PASTE => e.paste(),
+                    _ => e.select_all(),
+                }
+            }
+            ID_RUN | ID_SCRIPT | ID_EXPLAIN | ID_COMMIT | ID_ROLLBACK | ID_CANCEL_STMT | ID_HISTORY | ID_CLEAR => {
+                let Some(s) = sheet else { return true };
+                match id {
+                    ID_RUN => s.run_statement(),
+                    ID_SCRIPT => s.run_script(),
+                    ID_EXPLAIN => s.explain_plan(),
+                    ID_COMMIT => s.commit(),
+                    ID_ROLLBACK => s.rollback(),
+                    ID_CANCEL_STMT => s.cancel(),
+                    ID_HISTORY => s.history(),
+                    _ => s.clear(),
+                }
+            }
+            ID_WORKSHEET => self.pick_conn(|c| app().open_worksheet(c)),
+            ID_UNSHARED => {
+                if let Some(s) = sheet {
+                    let (cfg, prefs) = (s.conn().borrow().cfg.clone(), self.prefs());
+                    let pw = config::get_password(&cfg.name).or_else(|| ui::ask_password(&self.frame, "Password:"));
+                    if let Some(pw) = pw {
+                        let c = Conn::open(cfg, pw, prefs);
+                        let c2 = c.clone();
+                        Conn::when_ready(&c, move |r| match r {
+                            Ok(()) => app().open_worksheet(c2),
+                            Err(f) => ui::error(&app().frame, &f.error),
+                        });
+                    }
+                }
+            }
+            ID_TOGGLE_NAV => {
+                if self.nav_shown.replace(!self.nav_shown.get()) {
+                    self.split.unsplit(Some(&self.nav.panel));
+                } else {
+                    self.split.split_vertically(&self.nav.panel, &self.nb, 280);
+                }
+            }
+            ID_DRIVERS => driver_manager::show(&self.frame),
+            ID_PREFERENCES => prefs::show(&self.frame),
+            ID_ABOUT => ui::info(
+                &self.frame,
+                &format!("rsqldev {}\nNative SQL Developer in Rust + wxWidgets.\n\nDrivers: {} built in or downloadable.", env!("CARGO_PKG_VERSION"), registry::drivers().len()),
+            ),
+            _ => return false,
+        }
+        true
+    }
+}
+
+fn menus(frame: &Frame) {
+    let file = Menu::builder()
+        .append_item(ID_NEW_CONN, "New Connection…\tCtrl+Shift+C", "Create a database connection")
+        .append_item(ID_OPEN, "&Open…\tCtrl+O", "Open a SQL file in a worksheet")
+        .append_item(ID_SAVE, "&Save\tCtrl+S", "")
+        .append_item(ID_SAVEAS, "Save &As…", "")
+        .append_item(ID_SAVEALL, "Save A&ll\tCtrl+Shift+S", "")
+        .append_item(ID_CLOSE_TAB, "&Close\tCtrl+W", "Close the current tab")
+        .append_item(ID_RECOVER, "&Recover Unsaved Worksheet…\tCtrl+Shift+T", "Reopen a worksheet closed without saving")
+        .append_separator()
+        .append_item(ID_EXIT, "E&xit\tCtrl+Q", "")
+        .build();
+    let edit = Menu::builder()
+        .append_item(ID_UNDO, "&Undo\tCtrl+Z", "")
+        .append_item(ID_REDO, "&Redo\tCtrl+Shift+Z", "")
+        .append_separator()
+        .append_item(ID_CUT, "Cu&t\tCtrl+X", "")
+        .append_item(ID_COPY, "&Copy\tCtrl+C", "")
+        .append_item(ID_PASTE, "&Paste\tCtrl+V", "")
+        .append_item(ID_SELECTALL, "Select &All\tCtrl+A", "")
+        .build();
+    let view = Menu::builder()
+        .append_item(ID_TOGGLE_NAV, "&Connections\tCtrl+Shift+L", "Show or hide the Connections navigator")
+        .append_separator()
+        .append_radio_item(ID_THEME_LIGHT, "&Light Appearance", "SQL Developer's default look")
+        .append_radio_item(ID_THEME_DARK, "&Dark Appearance", "")
+        .append_radio_item(ID_THEME_SYSTEM, "&Follow System Appearance", "")
+        .build();
+    let run = Menu::builder()
+        .append_item(ID_RUN, "Run &Statement\tCtrl+Enter", "")
+        .append_item(ID_SCRIPT, "Run S&cript\tF5", "")
+        .append_item(ID_EXPLAIN, "&Explain Plan\tF10", "")
+        .append_separator()
+        .append_item(ID_COMMIT, "C&ommit\tF11", "")
+        .append_item(ID_ROLLBACK, "&Rollback\tF12", "")
+        .append_item(ID_CANCEL_STMT, "Ca&ncel\tCtrl+.", "")
+        .append_separator()
+        .append_item(ID_HISTORY, "SQL &History\tF8", "")
+        .append_item(ID_CLEAR, "C&lear\tCtrl+D", "")
+        .build();
+    let tools = Menu::builder()
+        .append_item(ID_WORKSHEET, "SQL &Worksheet\tAlt+F10", "")
+        .append_item(ID_UNSHARED, "&Unshared SQL Worksheet\tCtrl+Shift+N", "")
+        .append_separator()
+        .append_item(ID_DRIVERS, "&Drivers…", "Download or locate native client drivers")
+        .append_item(ID_PREFERENCES, "&Preferences…", "")
+        .build();
+    let help = Menu::builder()
+        .append_item(ID_START, "&Start Page", "")
+        .append_item(ID_KEYS, "&Keyboard Shortcuts", "")
+        .append_separator()
+        .append_item(ID_ABOUT, "&About rsqldev", "")
+        .build();
+    let bar = MenuBar::builder()
+        .append(file, "&File")
+        .append(edit, "&Edit")
+        .append(view, "&View")
+        .append(run, "&Run")
+        .append(tools, "&Tools")
+        .append(help, "&Help")
+        .build();
+    frame.set_menu_bar(bar);
+    let current = match config::load_prefs().theme.as_str() {
+        "dark" => ID_THEME_DARK,
+        "system" => ID_THEME_SYSTEM,
+        _ => ID_THEME_LIGHT,
+    };
+    if let Some(mb) = frame.get_menu_bar() {
+        mb.check_item(current, true);
+    }
+}
+
+fn toolbar(frame: &Frame) {
+    let Some(tb) = frame.create_tool_bar(Some(ToolBarStyle::Default | ToolBarStyle::Flat), ID_ANY as i32) else { return };
+    let add = |id: i32, icon: &str, label: &str, tip: &str| {
+        if let Some(b) = icons::bitmap(icon, 16) {
+            tb.add_tool(id, label, &b, tip);
+        }
+    };
+    add(ID_NEW_CONN, "new", "New", "New Connection (Ctrl+Shift+C)");
+    add(ID_OPEN, "open", "Open", "Open (Ctrl+O)");
+    add(ID_SAVE, "save", "Save", "Save (Ctrl+S)");
+    add(ID_SAVEALL, "saveall", "Save All", "Save All (Ctrl+Shift+S)");
+    tb.add_separator();
+    add(ID_BACK, "back", "Back", "Back (previous tab)");
+    add(ID_FORWARD, "forward", "Forward", "Forward (next tab)");
+    tb.add_separator();
+    add(ID_WORKSHEET, "worksheet", "SQL Worksheet", "Open SQL Worksheet (Alt+F10)");
+    add(ID_DRIVERS, "drivers", "Drivers", "Drivers…");
+    tb.realize();
+}
+
+const SHORTCUTS: &str = "Worksheet
+  Run Statement            Ctrl/Cmd+Enter
+  Run Script               F5
+  Explain Plan             F10
+  Commit / Rollback        F11 / F12
+  Cancel                   Ctrl/Cmd+.
+  SQL History              F8
+  Clear                    Ctrl/Cmd+D
+  Unshared Worksheet       Ctrl/Cmd+Shift+N
+
+Files and tabs
+  New Connection           Ctrl/Cmd+Shift+C
+  Open / Save / Save All   Ctrl/Cmd+O / S / Shift+S
+  Close Tab                Ctrl/Cmd+W
+  Recover Worksheet        Ctrl/Cmd+Shift+T
+  SQL Worksheet            Alt+F10
+
+Grid
+  Copy / Copy with Headers  right-click a cell
+  Sort                      click a column header";
+
+/// SQL Developer greets with a Start Page; this one offers first steps and recovery.
+fn start_page(parent: &AuiNotebook, recover: &[autosave::Slot]) -> Panel {
+    let p = Panel::builder(parent).build();
+    let pal = theme::p();
+    p.set_background_color(theme::c(pal.bg));
+    let s = BoxSizer::builder(Orientation::Vertical).build();
+    let font = |size: i32, weight: i32| Font::new_with_details(size, FontFamily::Swiss as i32, 0, weight, false, "");
+    let title = StaticText::builder(&p).with_label("rsqldev").build();
+    if let Some(f) = font(26, 700) {
+        title.set_font(&f);
+    }
+    title.set_foreground_color(theme::c(pal.accent));
+    let sub = StaticText::builder(&p)
+        .with_label("Native SQL Developer for macOS and Windows. Oracle, PostgreSQL, MySQL, SQL Server, SQLite, DuckDB, ClickHouse and compatible databases.")
+        .build();
+    sub.set_foreground_color(theme::c(pal.muted));
+    sub.wrap(620);
+    s.add_spacer(36);
+    s.add(&title, 0, SizerFlag::Left, 40);
+    s.add_spacer(6);
+    s.add(&sub, 0, SizerFlag::Left, 40);
+    let section = |label: &str| {
+        let h = StaticText::builder(&p).with_label(label).build();
+        h.set_foreground_color(theme::c(pal.text));
+        if let Some(f) = font(14, 700) {
+            h.set_font(&f);
+        }
+        s.add_spacer(24);
+        s.add(&h, 0, SizerFlag::Left, 40);
+        s.add_spacer(6);
+    };
+    let link = |icon: &str, label: &str, on: Box<dyn Fn()>| {
+        let row = BoxSizer::builder(Orientation::Horizontal).build();
+        let ic = icons::tool(&p, icon, label);
+        let l = HyperlinkCtrl::builder(&p).with_label(label).with_url("").build();
+        l.set_normal_colour(theme::c(pal.link));
+        l.set_visited_colour(theme::c(pal.link));
+        l.set_hover_colour(theme::c(pal.accent));
+        let on = std::rc::Rc::new(on);
+        let o2 = on.clone();
+        ic.on_click(move |_| o2());
+        l.on_clicked(move |_| on());
+        row.add(&ic, 0, SizerFlag::AlignCenterVertical, 0);
+        row.add(&l, 0, SizerFlag::AlignCenterVertical | SizerFlag::Left, 6);
+        s.add_sizer(&row, 0, SizerFlag::Left, 40);
+        s.add_spacer(4);
+        (row, l, ic)
+    };
+    section("Get Started");
+    for (id, icon, label) in [
+        (ID_NEW_CONN, "new", "Create a Connection"),
+        (ID_WORKSHEET, "worksheet", "Open SQL Worksheet"),
+        (ID_OPEN, "open", "Open SQL File…"),
+        (ID_DRIVERS, "drivers", "Manage Drivers…"),
+        (ID_KEYS, "history", "Keyboard Shortcuts"),
+    ] {
+        link(icon, label, Box::new(move || {
+            app().menu(id);
+        }));
+    }
+    if !recover.is_empty() {
+        section("Recover Unsaved Worksheets");
+        for slot in recover.iter().take(8).cloned() {
+            let label = autosave::label(&slot);
+            let cell: std::rc::Rc<std::cell::Cell<Option<(HyperlinkCtrl, BitmapButton)>>> = Default::default();
+            let c2 = cell.clone();
+            let (_, l, ic) = link("worksheet", &label, Box::new(move || {
+                if let Some((l, ic)) = c2.take() {
+                    l.show(false);
+                    ic.show(false);
+                }
+                app().recover(slot.clone());
+            }));
+            cell.set(Some((l, ic)));
+        }
+    }
+    p.set_sizer(s, true);
+    p
+}
+
+fn main() {
+    SystemOptions::set_option_by_int("msw.no-manifest-check", 1);
+    let prefs0 = config::load_prefs();
+    let _ = wxdragon::main(move |_| {
+        if let Some(a) = wxdragon::app::get_app() {
+            a.set_appearance(match prefs0.theme.as_str() {
+                "dark" => wxdragon::appearance::Appearance::Dark,
+                "system" => wxdragon::appearance::Appearance::System,
+                _ => wxdragon::appearance::Appearance::Light,
+            });
+        }
+        // Fit the usable screen area (menu bar / Dock / taskbar excluded), never off-screen.
+        let (pos, size) = match wxdragon::display::Display::new(0).map(|d| d.client_area()) {
+            Some(r) if r.width > 0 && r.height > 0 => {
+                let (w, h) = ((r.width * 92 / 100).min(1600), (r.height * 92 / 100).min(1000));
+                (Point::new(r.x + (r.width - w) / 2, r.y + (r.height - h) / 2), Size::new(w, h))
+            }
+            _ => (Point::new(40, 40), Size::new(1200, 760)),
+        };
+        let frame = Frame::builder().with_title("rsqldev").with_position(pos).with_size(size).build();
+        menus(&frame);
+        toolbar(&frame);
+        // Window / taskbar icon (the .app bundle and .exe carry their own icon files too).
+        if let Some(b) = BitmapBundle::from_svg_text(include_str!("../assets/icon.svg"), Size::new(256, 256)).and_then(|b| b.get_bitmap(Size::new(256, 256))) {
+            frame.set_icon(&b);
+        }
+        let sb = frame.create_status_bar(4, 0, ID_ANY as i32, "statusbar");
+        sb.set_status_widths(&[-1, 150, 70, 90]);
+        let split = SplitterWindow::builder(&frame).build();
+        // ponytail: AUI flags not exposed by wxDragon; values from wx/aui/auibook.h.
+        let nb_flags = |close: bool| AuiNotebookStyle::from_bits_retain(0x1 | 0x20 | 0x100 | if close { 0x800 | 0x2000 } else { 0 });
+        let left = AuiNotebook::builder(&split).with_style(nb_flags(false)).build();
+        let nav = Navigator::new(&left);
+        left.add_page(&nav.panel, "Connections", true);
+        let nb = AuiNotebook::builder(&split).with_style(nb_flags(true)).build();
+        let recover = autosave::list();
+        let start = start_page(&nb, &recover);
+        nb.add_page(&start, "Start Page", true);
+        split.split_vertically(&left, &nb, 300);
+        split.set_minimum_pane_size(140);
+        let s = BoxSizer::builder(Orientation::Vertical).build();
+        s.add(&split, 1, SizerFlag::Expand, 0);
+        frame.set_sizer(s, true);
+
+        let timer = Timer::new(&frame);
+        timer.on_tick(|_| hub::tick());
+        timer.start(25, false);
+        let history: History = std::fs::read_to_string(config::config_root().join("history.toml")).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default();
+        let a = Rc::new(App {
+            frame,
+            nb,
+            _left: left,
+            start: std::cell::Cell::new(start),
+            nav,
+            split,
+            nav_shown: std::cell::Cell::new(true),
+            prefs: RefCell::new(prefs0.clone()),
+            conns: RefCell::new(config::load_connections()),
+            open: RefCell::default(),
+            pages: RefCell::default(),
+            history: RefCell::new(history.entries),
+            _timer: timer,
+        });
+        APP.with(|g| *g.borrow_mut() = Some(a.clone()));
+        nav.reload(&a.conns.borrow());
+        let mut ticks = 0u32;
+        hub::every_tick(move || {
+            let a = app();
+            a.sync_tabs();
+            ticks += 1;
+            if ticks % 80 == 0 {
+                a.autosave_tick();
+            }
+            true
+        });
+        frame.on_menu(move |e| {
+            if !app().menu(e.get_id()) {
+                e.skip(true);
+            }
+        });
+        frame.on_close(move |e| {
+            let app = app();
+            app.save_history();
+            app.autosave_tick();
+            app.open.borrow_mut().clear();
+            e.skip(true);
+        });
+        frame.show(true);
+        frame.set_status_text(if a.conns.borrow().is_empty() { "No connections yet: File ▸ New Connection…" } else { "Ready" }, 0);
+        if let Ok(name) = std::env::var("RSQLDEV_SELFTEST") {
+            selftest(name);
+        }
+    });
+}
+
+/// RSQLDEV_SELFTEST=<connection> RSQLDEV_SELFTEST_PW=<pw>: drive the UI end to end, log, exit.
+/// ponytail: one scripted scenario; grow into a UI test harness when the UI grows.
+fn selftest(name: String) {
+    let pw = std::env::var("RSQLDEV_SELFTEST_PW").ok();
+    app().connect_with(&name, pw, |c| {
+        let kind = c.borrow().kind;
+        let schema = c.borrow().schema.clone();
+        eprintln!("SELFTEST connected kind={kind:?} schema={schema}");
+        let a = app();
+        a.open_worksheet(c.clone());
+        let ws = a.current_sheet().unwrap();
+        let q = match kind {
+            Kind::Oracle => "select level n from dual connect by level <= 500",
+            Kind::Postgres => "select generate_series(1, 500) n",
+            Kind::Mssql => "select top 500 row_number() over (order by (select null)) n from sys.all_objects a cross join sys.all_objects b",
+            _ => "with recursive t(n) as (select 1 union all select n + 1 from t where n < 500) select n from t",
+        };
+        ws.editor.set_text(q);
+        ws.run_statement();
+        let mut step = 0;
+        let start = std::time::Instant::now();
+        hub::every_tick(move || {
+            let el = start.elapsed().as_secs_f32();
+            let (rows, done, out) = ws.probe();
+            match step {
+                0 if rows > 0 || el > 15.0 => {
+                    eprintln!("SELFTEST run_statement rows={rows} done={done}");
+                    ws.editor.set_text("create table rsq_ui (id int, name varchar(20));\ninsert into rsq_ui values (1, 'a');\nselect * from rsq_ui;\ndrop table rsq_ui;\n");
+                    ws.run_script();
+                    step = 1;
+                }
+                1 if out.contains("dropped") || out.contains("Error") || el > 30.0 => {
+                    eprintln!("SELFTEST run_script output:\n{out}");
+                    step = 2;
+                }
+                2 => {
+                    let a = app();
+                    eprintln!("SELFTEST pages={} history={}", a.pages.borrow().len(), a.history().len());
+                    if std::env::var("RSQLDEV_SELFTEST_KEEP").is_ok() {
+                        // Leave a representative screen for screenshots: sample table, query, object viewer.
+                        ws.editor.set_text("create table employees (employee_id int primary key, first_name varchar(30), last_name varchar(30), salary numeric(10,2), hire_date date);\ninsert into employees values (100, 'Steven', 'King', 24000, DATE '2003-06-17');\ninsert into employees values (101, 'Neena', 'Kochhar', 17000, DATE '2005-09-21');\ninsert into employees values (102, 'Lex', null, 17000, DATE '2001-01-13');\ncommit;\n");
+                        ws.run_script();
+                        step = 3;
+                        return true;
+                    }
+                    a.frame.close(true);
+                    return false;
+                }
+                3 if out.contains("Commit") || el > 40.0 => {
+                    let a = app();
+                    ws.editor.set_text("select e.employee_id, e.first_name, e.last_name, e.salary, e.hire_date\nfrom employees e\nwhere e.salary > 10000\norder by e.salary desc;");
+                    ws.run_statement();
+                    a.nav.expand_first();
+                    let conn = ws.conn().borrow().cfg.name.clone();
+                    let (schema, name) = (ws.conn().borrow().schema.clone(), rsqldev_core::dialect::fold(kind, "employees"));
+                    a.open_object(&conn, &schema, rsqldev_core::dialect::TABLE, &name);
+                    // Which screen to leave up for screenshots.
+                    match std::env::var("RSQLDEV_SELFTEST_SHOW").as_deref() {
+                        Ok("start") => {
+                            a.nb.set_selection(0);
+                        }
+                        Ok("worksheet") => {
+                            a.nb.set_selection(1);
+                        }
+                        Ok("data") => {
+                            let v = a.pages.borrow().iter().find_map(|p| if let Page::Obj(o) = p { Some(o.clone()) } else { None });
+                            if let Some(v) = v {
+                                v.select_tab("Data");
+                            }
+                        }
+                        Ok("dialog") => a.edit_connection(&conn),
+                        Ok("drivers") => driver_manager::show(&a.frame),
+                        _ => {}
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+            true
+        });
+    });
+}

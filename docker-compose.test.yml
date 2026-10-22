@@ -1,0 +1,23 @@
+# Test databases for core/tests/backends.rs:  docker compose -f docker-compose.test.yml up -d
+services:
+  oracle:
+    image: gvenzl/oracle-free:23-slim
+    environment: { ORACLE_PASSWORD: rsqldev, APP_USER: rsq, APP_USER_PASSWORD: rsqldev }
+    ports: ["15210:1521"]
+  postgres:
+    image: postgres:17
+    environment: { POSTGRES_PASSWORD: rsqldev }
+    ports: ["15432:5432"]
+  mysql:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: rsqldev, MYSQL_DATABASE: rsq }
+    ports: ["13306:3306"]
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    environment: { ACCEPT_EULA: "Y", MSSQL_SA_PASSWORD: "Rsqldev#2026" }
+    ports: ["11433:1433"]
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment: { CLICKHOUSE_PASSWORD: rsqldev }
+    ports: ["18123:8123"]

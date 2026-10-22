@@ -1,0 +1,682 @@
+//! SQL Worksheet: editor, Run Statement / Run Script / Explain Plan, result panes,
+//! SQL*Plus command subset, DBMS output, history.
+
+use crate::conn::{Conn, ConnRef, Done};
+use std::rc::Weak;
+use crate::{editor, icons};
+use crate::grid::ResultGrid;
+use rsqldev_core::dialect;
+use rsqldev_core::registry::Kind;
+use rsqldev_core::script::{self, Action, Defines, Item};
+use rsqldev_core::worker::Cmd;
+use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::Instant;
+use wxdragon::prelude::*;
+
+pub struct Worksheet {
+    pub panel: Panel,
+    pub editor: StyledTextCtrl,
+    conn: RefCell<ConnRef>,
+    conn_choice: Choice,
+    bottom: AuiNotebook,
+    results: ResultGrid,
+    script_out: TextCtrl,
+    explain: ResultGrid,
+    dbms: TextCtrl,
+    /// Query Result pane message ("All Rows Fetched: 14 in 0.003 seconds").
+    status: StaticText,
+    /// Script Output pane message ("Task completed in 0.04 seconds").
+    task: StaticText,
+    elapsed: StaticText,
+    defines: RefCell<Defines>,
+    pub path: RefCell<Option<PathBuf>>,
+    last: RefCell<Option<String>>,
+    spool: RefCell<Option<PathBuf>>,
+    running: Cell<bool>,
+    started: Cell<Option<Instant>>,
+    me: Weak<Worksheet>,
+    b_cancel: BitmapButton,
+    busy: Cell<bool>,
+    /// Autosave slot (`<config>/worksheets/<id>.toml`).
+    pub autosave_id: u64,
+    pub autosaved: RefCell<String>,
+}
+
+const P_RESULT: usize = 0;
+const P_SCRIPT: usize = 1;
+const P_EXPLAIN: usize = 2;
+const P_DBMS: usize = 3;
+
+pub type SheetRef = Rc<Worksheet>;
+
+/// A pane with a small icon toolbar and a message label on top, like SQL Developer's result panes.
+fn pane(parent: &AuiNotebook, tools: &[(&str, &str)]) -> (Panel, BoxSizer, Vec<BitmapButton>, StaticText) {
+    let p = Panel::builder(parent).build();
+    let bar = BoxSizer::builder(Orientation::Horizontal).build();
+    let btns: Vec<BitmapButton> = tools
+        .iter()
+        .map(|(icon, tip)| {
+            let b = icons::tool(&p, icon, tip);
+            bar.add(&b, 0, SizerFlag::All, 2);
+            b
+        })
+        .collect();
+    let label = StaticText::builder(&p).with_label("").build();
+    bar.add(&label, 1, SizerFlag::AlignCenterVertical | SizerFlag::Left, 8);
+    let s = BoxSizer::builder(Orientation::Vertical).build();
+    s.add_sizer(&bar, 0, SizerFlag::Expand, 0);
+    (p, s, btns, label)
+}
+
+impl Worksheet {
+    pub fn new(parent: &dyn WxWidget, conn: ConnRef) -> SheetRef {
+        let prefs = crate::app().prefs();
+        let panel = Panel::builder(parent).build();
+        let bar = BoxSizer::builder(Orientation::Horizontal).build();
+        let mk = |icon: &str, tip: &str| {
+            let b = icons::tool(&panel, icon, tip);
+            bar.add(&b, 0, SizerFlag::All, 3);
+            b
+        };
+        let sep = || {
+            let l = StaticLine::builder(&panel).with_style(StaticLineStyle::Vertical).with_size(Size::new(1, 18)).build();
+            bar.add(&l, 0, SizerFlag::AlignCenterVertical | SizerFlag::Left | SizerFlag::Right, 4);
+        };
+        // SQL Developer worksheet toolbar order.
+        let b_run = mk("run", "Run Statement (Ctrl+Enter)");
+        let b_script = mk("script", "Run Script (F5)");
+        sep();
+        let b_explain = mk("explain", "Explain Plan (F10)");
+        sep();
+        let b_commit = mk("commit", "Commit (F11)");
+        let b_rollback = mk("rollback", "Rollback (F12)");
+        sep();
+        let b_unshared = mk("unshared", "Unshared SQL Worksheet (Ctrl+Shift+N)");
+        let b_case = mk("case", "To Upper/Lower/Initcap (Ctrl+')");
+        let b_clear = mk("clear", "Clear (Ctrl+D)");
+        sep();
+        let b_hist = mk("history", "SQL History (F8)");
+        let b_cancel = mk("cancel", "Cancel");
+        bar.add_stretch_spacer(1);
+        let elapsed = StaticText::builder(&panel).with_label("").with_style(StaticTextStyle::AlignRight).build();
+        elapsed.set_min_size(Size::new(110, -1));
+        bar.add(&elapsed, 0, SizerFlag::AlignCenterVertical | SizerFlag::Right, 10);
+        let names: Vec<String> = crate::app().connection_names();
+        let conn_choice = Choice::builder(&panel).with_choices(names.clone()).build();
+        if let Some(i) = names.iter().position(|n| *n == conn.borrow().cfg.name) {
+            conn_choice.set_selection(i as u32);
+        }
+        bar.add(&conn_choice, 0, SizerFlag::AlignCenterVertical | SizerFlag::Right, 6);
+
+        let split = SplitterWindow::builder(&panel).build();
+        let editor = editor::new_editor(&split, &prefs.editor_font, prefs.editor_font_size);
+        let bottom = AuiNotebook::builder(&split).with_style(AuiNotebookStyle::from_bits_retain(0x1 | 0x20 | 0x100)).build();
+        let mono = |p: &Panel| {
+            let t = TextCtrl::builder(p).with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::DontWrap).build();
+            if let Some(f) = Font::new_with_details(prefs.editor_font_size, FontFamily::Teletype as i32, 0, 400, false, &prefs.editor_font) {
+                t.set_font(&f);
+            }
+            t
+        };
+        let (qp, qs, qb, status) = pane(&bottom, &[("refresh", "Refresh (re-run)"), ("export", "Export…")]);
+        let results = ResultGrid::new(&qp);
+        results.st.borrow_mut().db = Some(conn.borrow().kind);
+        qs.add(&results.grid, 1, SizerFlag::Expand, 0);
+        qp.set_sizer(qs, true);
+        let (sp, ss, sb, task) = pane(&bottom, &[("clear", "Clear"), ("save", "Save Output…")]);
+        let script_out = mono(&sp);
+        ss.add(&script_out, 1, SizerFlag::Expand, 0);
+        sp.set_sizer(ss, true);
+        let (ep, es, _, _) = pane(&bottom, &[]);
+        let explain = ResultGrid::new(&ep);
+        es.add(&explain.grid, 1, SizerFlag::Expand, 0);
+        ep.set_sizer(es, true);
+        let (dp, ds, db, _) = pane(&bottom, &[("new", "Enable DBMS Output for this connection"), ("clear", "Clear"), ("save", "Save…")]);
+        let dbms = mono(&dp);
+        ds.add(&dbms, 1, SizerFlag::Expand, 0);
+        dp.set_sizer(ds, true);
+        bottom.add_page(&qp, "Query Result", true);
+        bottom.add_page(&sp, "Script Output", false);
+        bottom.add_page(&ep, "Explain Plan", false);
+        bottom.add_page(&dp, "DBMS Output", false);
+        split.split_horizontally(&editor, &bottom, 300);
+        split.set_minimum_pane_size(60);
+
+        let s = BoxSizer::builder(Orientation::Vertical).build();
+        s.add_sizer(&bar, 0, SizerFlag::Expand, 0);
+        s.add(&split, 1, SizerFlag::Expand, 0);
+        panel.set_sizer(s, true);
+
+        let autocommit = prefs.autocommit;
+        b_commit.enable(!autocommit);
+        b_rollback.enable(!autocommit);
+        b_cancel.enable(false);
+        let ws = Rc::new_cyclic(|me| Worksheet {
+            panel,
+            editor,
+            conn: RefCell::new(conn),
+            conn_choice,
+            bottom,
+            results,
+            script_out,
+            explain,
+            dbms,
+            status,
+            task,
+            elapsed,
+            defines: RefCell::default(),
+            path: RefCell::default(),
+            last: RefCell::default(),
+            spool: RefCell::default(),
+            running: Cell::new(false),
+            started: Cell::new(None),
+            me: me.clone(),
+            b_cancel,
+            busy: Cell::new(false),
+            autosave_id: crate::autosave::next_id(),
+            autosaved: RefCell::default(),
+        });
+        let acts: Vec<(BitmapButton, fn(&Worksheet))> = vec![
+            (b_run, Worksheet::run_statement),
+            (b_script, Worksheet::run_script),
+            (b_explain, Worksheet::explain_plan),
+            (b_commit, Worksheet::commit),
+            (b_rollback, Worksheet::rollback),
+            (b_unshared, |_| {
+                crate::app().menu(crate::ID_UNSHARED);
+            }),
+            (b_case, Worksheet::toggle_case),
+            (b_clear, Worksheet::clear),
+            (b_hist, Worksheet::history),
+            (b_cancel, Worksheet::cancel),
+            (qb[0], Worksheet::rerun),
+            (qb[1], |w| w.results.export_dialog()),
+            (sb[0], |w| w.script_out.clear()),
+            (sb[1], |w| save_text(&w.panel, &w.script_out.get_value())),
+            (db[0], |w| w.set_output(true)),
+            (db[1], |w| w.dbms.clear()),
+            (db[2], |w| save_text(&w.panel, &w.dbms.get_value())),
+        ];
+        for (b, f) in acts {
+            let w = Rc::downgrade(&ws);
+            b.on_click(move |_| {
+                if let Some(w) = w.upgrade() {
+                    f(&w)
+                }
+            });
+        }
+        let w = Rc::downgrade(&ws);
+        conn_choice.on_selection_changed(move |_| {
+            let Some(ws) = w.upgrade() else { return };
+            let Some(name) = ws.conn_choice.get_string_selection() else { return };
+            let w2 = ws.me.clone();
+            crate::app().connect(&name.clone(), move |c| {
+                if let Some(ws) = w2.upgrade() {
+                    ws.results.st.borrow_mut().db = Some(c.borrow().kind);
+                    *ws.conn.borrow_mut() = c;
+                    crate::app().retitle(&ws.panel, &name);
+                }
+            });
+        });
+        let w = Rc::downgrade(&ws);
+        ws.editor.on_stc_update_ui(move |_| {
+            if let Some(w) = w.upgrade() {
+                let e = w.editor;
+                let pos = e.get_current_pos();
+                let line = e.line_from_position(pos);
+                let col = pos - e.position_from_line(line) + 1;
+                let app = crate::app();
+                app.status(1, &format!("Line {} Column {col}", line + 1));
+                app.status(2, "Insert");
+                app.status(3, if e.is_modified() { "Modified" } else { "" });
+            }
+        });
+        let w3 = Rc::downgrade(&ws);
+        ws.results.st.borrow_mut().on_change = Some(Rc::new(move |st| {
+            if let Some(w) = w3.upgrade() {
+                let secs = w.started.get().map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
+                let n = st.rows.len();
+                let msg = if st.done { format!("All Rows Fetched: {n} in {secs:.3} seconds") } else { format!("Fetched {n} rows in {secs:.3} seconds") };
+                w.status.set_label(&msg);
+                w.elapsed.set_label(&format!("{secs:.3} seconds"));
+                // Rows are on screen: the statement has executed (the cursor may stay open).
+                if !w.running.get() {
+                    w.set_busy(false);
+                }
+            }
+        }));
+        ws.editor.set_focus();
+        ws
+    }
+
+    /// Statement in flight: Cancel enabled, tab marked.
+    fn set_busy(&self, on: bool) {
+        if self.busy.replace(on) == on {
+            return;
+        }
+        self.b_cancel.enable(on);
+        let name = self.conn().borrow().cfg.name.clone();
+        crate::app().retitle(&self.panel, &if on { format!("⏳ {name}") } else { name });
+    }
+
+    fn weak(&self) -> Weak<Worksheet> {
+        self.me.clone()
+    }
+
+    pub fn conn(&self) -> ConnRef {
+        self.conn.borrow().clone()
+    }
+
+    fn kind(&self) -> Kind {
+        self.conn.borrow().borrow().kind
+    }
+
+    fn rerun(&self) {
+        if let Some(sql) = self.last.borrow().clone() {
+            self.run_sql_grid(sql, 0);
+        }
+    }
+
+    /// To Upper → To Lower → Initcap on the selection (or the word at the caret).
+    fn toggle_case(&self) {
+        let e = self.editor;
+        let mut sel = e.get_selected_text();
+        if sel.is_empty() {
+            let p = e.get_current_pos();
+            e.set_selection(e.word_start_position(p, true), e.word_end_position(p, true));
+            sel = e.get_selected_text();
+        }
+        let start = e.get_selection_start();
+        let next = if sel == sel.to_uppercase() && sel != sel.to_lowercase() {
+            sel.to_lowercase()
+        } else if sel == sel.to_lowercase() {
+            let mut cap = true;
+            sel.chars()
+                .map(|c| {
+                    let o = if cap { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() };
+                    cap = !c.is_alphanumeric();
+                    o
+                })
+                .collect()
+        } else {
+            sel.to_uppercase()
+        };
+        e.replace_selection(&next);
+        e.set_selection(start, start + next.len() as i32);
+    }
+
+    fn out(&self, text: &str) {
+        self.script_out.append_text(text);
+        if !text.ends_with('\n') {
+            self.script_out.append_text("\n");
+        }
+        if let Some(p) = self.spool.borrow().as_ref() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(p) {
+                let _ = writeln!(f, "{}", text.trim_end_matches('\n'));
+            }
+        }
+    }
+
+    fn dbms_lines(&self, lines: &[String]) {
+        for l in lines {
+            self.dbms.append_text(&format!("{l}\n"));
+        }
+        if !lines.is_empty() {
+            self.bottom.set_selection(P_DBMS);
+        }
+    }
+
+    fn set_output(&self, on: bool) {
+        let w = self.task;
+        Conn::tx(&self.conn(), Cmd::Output(on), move |r| w.set_label(&r.map(str::to_string).unwrap_or_else(|e| e)));
+        self.bottom.set_selection(P_DBMS);
+    }
+
+    /// Text to run: the selection, or everything.
+    fn source(&self) -> (String, usize) {
+        let sel = self.editor.get_selected_text();
+        if sel.trim().is_empty() { (self.editor.get_text(), 0) } else { (sel, self.editor.get_selection_start() as usize) }
+    }
+
+    fn substitute(&self, sql: &str) -> Option<String> {
+        let p = self.panel;
+        self.defines.borrow_mut().substitute(sql, &mut |name| crate::ui::ask(&p, &format!("Enter value for {name}:"), "Enter Substitution Variable", ""))
+    }
+
+    fn line_of(&self, pos: usize) -> i32 {
+        self.editor.line_from_position(pos as i32) + 1
+    }
+
+    pub fn run_statement(&self) {
+        let sel = self.editor.get_selected_text();
+        let item = if !sel.trim().is_empty() {
+            script::split(&sel, self.kind()).into_iter().next()
+        } else {
+            let text = self.editor.get_text();
+            let items = script::split(&text, self.kind());
+            script::statement_at(&items, self.editor.get_current_pos() as usize).cloned()
+        };
+        let Some(item) = item else { return };
+        if item.kind == script::Kind::Command {
+            self.script_out.clear();
+            self.run_items(vec![item], 0);
+            return;
+        }
+        let Some(sql) = self.substitute(&item.text) else { return };
+        crate::app().add_history(&sql);
+        let line = self.line_of(item.start);
+        let sql = if item.kind == script::Kind::Block { format!("\u{1}{sql}") } else { sql };
+        self.run_sql_grid(sql, line);
+    }
+
+    /// Execute one statement; queries go to the Query Result grid, the rest to Script Output.
+    /// A leading U+0001 marks a PL/SQL block (never a query).
+    fn run_sql_grid(&self, sql: String, line: i32) {
+        let (block, sql) = match sql.strip_prefix('\u{1}') {
+            Some(s) => (true, s.to_string()),
+            None => (false, sql),
+        };
+        *self.last.borrow_mut() = Some(if block { format!("\u{1}{sql}") } else { sql.clone() });
+        self.started.set(Some(Instant::now()));
+        self.status.set_label("Executing…");
+        self.elapsed.set_label("");
+        self.set_busy(true);
+        let (w, el, task) = (self.status, self.elapsed, self.task);
+        let me = self.weak();
+        let query = rsqldev_core::is_query(&sql) && !block;
+        let sql2 = sql.clone();
+        let rows = Conn::exec(&self.conn(), &sql, move |d: Done| {
+            let Some(me) = me.upgrade() else { return };
+            me.set_busy(false);
+            me.dbms_lines(&d.output);
+            let secs = format!("{:.3} seconds", d.elapsed.as_secs_f32());
+            match d.result {
+                Err(e) => {
+                    me.script_out.clear();
+                    me.out(&format!("Error starting at line : {line} in command -\n{sql2}\nError report -\n{e}"));
+                    me.bottom.set_selection(P_SCRIPT);
+                    w.set_label("");
+                    task.set_label(&format!("Task completed in {secs}"));
+                    el.set_label(&secs);
+                }
+                Ok(aff) if !query => {
+                    me.script_out.clear();
+                    me.out(&script::feedback(&sql2, aff));
+                    me.bottom.set_selection(P_SCRIPT);
+                    task.set_label(&format!("Task completed in {secs}"));
+                    el.set_label(&secs);
+                }
+                Ok(_) => {}
+            }
+        });
+        if query {
+            self.results.load(rows, 0, false);
+            self.bottom.set_selection(P_RESULT);
+        }
+    }
+
+    pub fn run_script(&self) {
+        let (text, base) = self.source();
+        let items: Vec<Item> = script::split(&text, self.kind())
+            .into_iter()
+            .map(|mut i| {
+                i.start += base;
+                i.end += base;
+                i
+            })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        self.script_out.clear();
+        self.bottom.set_selection(P_SCRIPT);
+        self.started.set(Some(Instant::now()));
+        self.running.set(true);
+        self.set_busy(true);
+        crate::app().add_history(&text);
+        self.run_items(items, 0);
+    }
+
+    /// Run script items one after another (each waits for the previous reply).
+    fn run_items(&self, items: Vec<Item>, i: usize) {
+        if i >= items.len() || !self.running.get() && i > 0 {
+            self.running.set(false);
+            self.set_busy(false);
+            let secs = self.started.get().map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
+            self.task.set_label(&format!("Task completed in {secs:.3} seconds"));
+            self.elapsed.set_label(&format!("{secs:.3} seconds"));
+            return;
+        }
+        let me = self.weak();
+        let next = move |items: Vec<Item>| {
+            if let Some(me) = me.upgrade() {
+                me.run_items(items, i + 1)
+            }
+        };
+        let item = items[i].clone();
+        if item.kind == script::Kind::Command {
+            let action = script::command(&item.text, &mut self.defines.borrow_mut());
+            match action {
+                Action::Run(sql) => return self.script_sql(sql, item.start, items, i, Box::new(next)),
+                Action::Print(t) => self.out(&t),
+                Action::Output(on) => self.set_output(on),
+                Action::Clear => self.script_out.clear(),
+                Action::Nothing => {}
+                Action::Spool(p) => *self.spool.borrow_mut() = p.map(PathBuf::from),
+                Action::Rerun => {
+                    if let Some(sql) = self.last.borrow().clone() {
+                        return self.script_sql(sql.trim_start_matches('\u{1}').to_string(), item.start, items, i, Box::new(next));
+                    }
+                }
+                Action::Describe(obj) => {
+                    let (owner, name) = match obj.split_once('.') {
+                        Some((o, n)) => (dialect::fold(self.kind(), o), dialect::fold(self.kind(), n)),
+                        None => (self.conn().borrow().schema.clone(), dialect::fold(self.kind(), &obj)),
+                    };
+                    if let Some(sql) = dialect::describe_sql(self.kind(), &owner, &name) {
+                        return self.script_sql(sql, item.start, items, i, Box::new(next));
+                    }
+                }
+                Action::Include(path) => {
+                    let base = self.path.borrow().as_ref().and_then(|p| p.parent().map(|p| p.to_path_buf()));
+                    let mut p = PathBuf::from(path.trim_matches('"'));
+                    if p.extension().is_none() {
+                        p.set_extension("sql");
+                    }
+                    if p.is_relative() {
+                        if let Some(b) = base {
+                            p = b.join(p);
+                        }
+                    }
+                    match std::fs::read_to_string(&p) {
+                        Ok(s) => {
+                            let mut items = items;
+                            let inc = script::split(&s, self.kind()).into_iter().map(|mut it| {
+                                it.start = item.start;
+                                it.end = item.end;
+                                it
+                            });
+                            items.splice(i + 1..i + 1, inc);
+                            return next(items);
+                        }
+                        Err(e) => self.out(&format!("SP2-0310: unable to open file \"{}\": {e}", p.display())),
+                    }
+                }
+                Action::Unsupported(t) => self.out(&format!("Command skipped (not supported): {t}")),
+            }
+            return next(items);
+        }
+        let Some(sql) = self.substitute(&item.text) else {
+            self.running.set(false);
+            return;
+        };
+        self.script_sql(sql, item.start, items, i, Box::new(next));
+    }
+
+    fn script_sql(&self, sql: String, start: usize, items: Vec<Item>, _i: usize, next: Box<dyn FnOnce(Vec<Item>)>) {
+        *self.last.borrow_mut() = Some(sql.clone());
+        let me = self.weak();
+        let line = self.line_of(start);
+        Conn::work_query(&self.conn(), &sql.clone(), move |r| {
+            let Some(me) = me.upgrade() else { return };
+            match r {
+                Ok(r) => {
+                    if r.cols.is_empty() {
+                        me.out(&format!("\n{}\n", script::feedback(&sql, r.affected)));
+                    } else {
+                        me.out(&script::format_table(&r.cols, &r.rows));
+                    }
+                    me.dbms_lines(&r.output);
+                }
+                Err(e) => me.out(&format!("\nError starting at line : {line} in command -\n{sql}\nError report -\n{e}\n")),
+            }
+            next(items);
+        });
+    }
+
+    pub fn explain_plan(&self) {
+        let sel = self.editor.get_selected_text();
+        let sql = if sel.trim().is_empty() {
+            let text = self.editor.get_text();
+            let items = script::split(&text, self.kind());
+            match script::statement_at(&items, self.editor.get_current_pos() as usize) {
+                Some(i) => i.text.clone(),
+                None => return,
+            }
+        } else {
+            sel
+        };
+        let Some(sql) = self.substitute(&sql) else { return };
+        let ex = dialect::explain(self.kind(), &sql);
+        self.bottom.set_selection(P_EXPLAIN);
+        self.explain.reset();
+        self.set_busy(true);
+        self.explain_step(ex.stmts, ex.show, 0);
+    }
+
+    fn explain_step(&self, stmts: Vec<String>, show: usize, i: usize) {
+        if i >= stmts.len() {
+            return self.set_busy(false);
+        }
+        let me = self.weak();
+        let sql = stmts[i].clone();
+        Conn::work_query(&self.conn(), &sql, move |r| {
+            let Some(me) = me.upgrade() else { return };
+            match r {
+                Ok(r) if i == show => me.explain.set(r.cols, r.rows),
+                Ok(_) => {}
+                Err(e) => {
+                    me.out(&format!("Explain failed:\n{e}"));
+                    me.bottom.set_selection(P_SCRIPT);
+                    if i < show {
+                        return me.set_busy(false);
+                    }
+                }
+            }
+            me.explain_step(stmts, show, i + 1);
+        });
+    }
+
+    pub fn commit(&self) {
+        let me = self.weak();
+        Conn::tx(&self.conn(), Cmd::Commit, move |r| {
+            if let Some(me) = me.upgrade() {
+                me.out(&r.map(str::to_string).unwrap_or_else(|e| e));
+            }
+        });
+    }
+
+    pub fn rollback(&self) {
+        let me = self.weak();
+        Conn::tx(&self.conn(), Cmd::Rollback, move |r| {
+            if let Some(me) = me.upgrade() {
+                me.out(&r.map(str::to_string).unwrap_or_else(|e| e));
+            }
+        });
+    }
+
+    pub fn cancel(&self) {
+        self.running.set(false);
+        self.set_busy(false);
+        self.conn().borrow().cancel();
+        self.status.set_label("Cancel requested");
+    }
+
+    pub fn clear(&self) {
+        self.editor.clear_all();
+    }
+
+    pub fn history(&self) {
+        let h = crate::app().history();
+        if h.is_empty() {
+            return;
+        }
+        let labels: Vec<String> = h.iter().rev().map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(120).collect()).collect();
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let d = SingleChoiceDialog::builder(&self.panel, "Select a statement to insert:", "SQL History", &refs).build();
+        if d.show_modal() == ID_OK {
+            let i = d.get_selection();
+            if i >= 0 {
+                let sql = &h[h.len() - 1 - i as usize];
+                self.editor.insert_text(self.editor.get_current_pos(), &format!("{sql}\n"));
+            }
+        }
+    }
+
+    /// (fetched rows, all fetched, script output) for the self-test.
+    pub fn probe(&self) -> (usize, bool, String) {
+        let st = self.results.st.borrow();
+        (st.rows.len(), st.done, self.script_out.get_value())
+    }
+
+    pub fn open_file(&self, p: PathBuf) -> std::io::Result<()> {
+        let s = std::fs::read_to_string(&p)?;
+        self.editor.set_text(&s);
+        self.editor.empty_undo_buffer();
+        *self.path.borrow_mut() = Some(p);
+        Ok(())
+    }
+
+    pub fn save(&self, as_new: bool) {
+        let path = self.path.borrow().clone();
+        let path = match path {
+            Some(p) if !as_new => p,
+            _ => {
+                let d = FileDialog::builder(&self.panel)
+                    .with_message("Save SQL")
+                    .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+                    .with_wildcard("SQL files (*.sql)|*.sql|All files (*)|*")
+                    .build();
+                if d.show_modal() != ID_OK {
+                    return;
+                }
+                match d.get_path() {
+                    Some(p) => PathBuf::from(p),
+                    None => return,
+                }
+            }
+        };
+        match std::fs::write(&path, self.editor.get_text()) {
+            Ok(()) => {
+                self.editor.set_save_point();
+                self.status.set_label(&format!("Saved {}", path.display()));
+                *self.path.borrow_mut() = Some(path);
+            }
+            Err(e) => crate::ui::error(&self.panel, &format!("Save failed: {e}")),
+        }
+    }
+}
+
+fn save_text(parent: &Panel, text: &str) {
+    let d = FileDialog::builder(parent).with_message("Save").with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt).with_wildcard("Text (*.txt)|*.txt|All files (*)|*").build();
+    if d.show_modal() == ID_OK {
+        if let Some(p) = d.get_path() {
+            if let Err(e) = std::fs::write(p, text) {
+                crate::ui::error(parent, &e.to_string());
+            }
+        }
+    }
+}
