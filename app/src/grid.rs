@@ -64,6 +64,7 @@ const ID_FETCH_ALL: i32 = 7006;
 const ID_SAVE_VALUE: i32 = 7007;
 const ID_LOAD_VALUE: i32 = 7008;
 const ID_VIEW_VALUE: i32 = 7009;
+const ID_XLSX: i32 = 7010;
 
 impl ResultGrid {
     pub fn new(parent: &dyn WxWidget) -> ResultGrid {
@@ -341,6 +342,18 @@ impl ResultGrid {
         self.grid.go_to_cell(n as i32, self.st.borrow().hidden as i32);
     }
 
+    /// Add rows as pending inserts (import); Commit posts them.
+    pub fn append_new_rows(&self, rows: Vec<Vec<Cell>>) {
+        let start = {
+            let mut st = self.st.borrow_mut();
+            let start = st.rows.len();
+            st.rows.extend(rows.into_iter().map(|cur| Row { cur, ..Row::default() }));
+            start
+        };
+        self.append_rows(start);
+        self.grid.go_to_cell(start as i32, self.st.borrow().hidden as i32);
+    }
+
     pub fn delete_selected_rows(&self) {
         let mut rows: Vec<i32> = self.grid.get_selected_rows();
         if rows.is_empty() {
@@ -422,6 +435,7 @@ impl ResultGrid {
         let mut m = b
             .append_item(ID_FETCH_ALL, "Fetch All Rows", "Fetch every remaining row")
             .append_item(ID_CSV, "Export CSV…", "")
+            .append_item(ID_XLSX, "Export Excel…", "")
             .append_item(ID_JSON, "Export JSON…", "")
             .append_item(ID_INSERT, "Export INSERT…", "")
             .build();
@@ -540,12 +554,13 @@ impl ResultGrid {
 
     /// Export… button: pick a format, then save.
     pub fn export_dialog(&self) {
-        let d = SingleChoiceDialog::builder(&self.grid, "Format:", "Export", &["CSV", "JSON", "INSERT statements"]).build();
+        let d = SingleChoiceDialog::builder(&self.grid, "Format:", "Export", &["CSV", "Excel (xlsx)", "JSON", "INSERT statements"]).build();
         if d.show_modal() == ID_OK {
             match d.get_selection() {
                 0 => self.menu(ID_CSV),
-                1 => self.menu(ID_JSON),
-                2 => self.menu(ID_INSERT),
+                1 => self.menu(ID_XLSX),
+                2 => self.menu(ID_JSON),
+                3 => self.menu(ID_INSERT),
                 _ => {}
             }
         }
@@ -558,9 +573,10 @@ impl ResultGrid {
                 Clipboard::get().set_text(&export::tsv((id == ID_COPY_HDR).then_some(&c[..]), &r));
             }
             ID_FETCH_ALL => self.fetch_all(|| {}),
-            ID_CSV | ID_JSON | ID_INSERT => {
+            ID_CSV | ID_XLSX | ID_JSON | ID_INSERT => {
                 let (ext, wild) = match id {
                     ID_CSV => ("csv", "CSV (*.csv)|*.csv"),
+                    ID_XLSX => ("xlsx", "Excel (*.xlsx)|*.xlsx"),
                     ID_JSON => ("json", "JSON (*.json)|*.json"),
                     _ => ("sql", "SQL (*.sql)|*.sql"),
                 };
@@ -578,12 +594,13 @@ impl ResultGrid {
                 self.fetch_all(move || {
                     let (c, r) = me.selection(true);
                     let db = me.st.borrow().db.unwrap_or(Kind::Oracle);
-                    let text = match id {
-                        ID_CSV => export::csv(&c, &r),
-                        ID_JSON => export::json(&c, &r),
-                        _ => export::inserts(db, "EXPORT_TABLE", &c, &r),
+                    let data = match id {
+                        ID_CSV => Ok(export::csv(&c, &r).into_bytes()),
+                        ID_XLSX => export::xlsx(&c, &r),
+                        ID_JSON => Ok(export::json(&c, &r).into_bytes()),
+                        _ => Ok(export::inserts(db, "EXPORT_TABLE", &c, &r).into_bytes()),
                     };
-                    if let Err(e) = std::fs::write(&path, text) {
+                    if let Err(e) = data.and_then(|d| Ok(std::fs::write(&path, d)?)) {
                         crate::ui::error(&me.grid, &format!("Export failed: {e}"));
                     }
                 });

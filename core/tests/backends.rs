@@ -126,6 +126,15 @@ fn exercise(c: ConnConfig, pw: &str, owner: &str) {
         if let Some(ti) = cols.iter().position(|c| c.name.eq_ignore_ascii_case("tz")) {
             row[ti] = rows[0][ti].clone();
         }
+        // Imported ISO dates insert on every engine (Oracle via TO_TIMESTAMP, not NLS).
+        let mut iso = vec![None; cols.len()];
+        iso[cols.iter().position(|c| c.name.eq_ignore_ascii_case("id")).unwrap()] = Some("501".into());
+        iso[di] = Some("2026-03-04".into());
+        let ins = dml::insert(db, &table, &cols, skip, &iso, &[]);
+        run(b, &ins);
+        let got = query_all(b, "SELECT d FROM rsq_t WHERE id = 501").unwrap().1;
+        assert!(got[0][0].as_deref().is_some_and(|d| d.contains("26") && (d.contains("03") || d.contains("MAR"))), "{ins} => {got:?}");
+        run(b, "DELETE FROM rsq_t WHERE id = 501");
         // BLOB upload through binds: > 2000 bytes takes Oracle's temporary-LOB path.
         let bi = cols.iter().position(|c| c.name.eq_ignore_ascii_case("b")).unwrap();
         assert!(is_binary(&cols[bi].type_name), "{:?}", cols[bi]);

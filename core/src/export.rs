@@ -74,6 +74,31 @@ pub fn inserts(db: Db, table: &str, cols: &[Column], rows: &[Vec<Cell>]) -> Stri
     rows.iter().map(|r| crate::dml::insert(db, table, cols, None, r, &[]) + ";\n").collect()
 }
 
+/// Excel workbook: bold frozen header row, numeric columns written as numbers.
+pub fn xlsx(cols: &[Column], rows: &[Vec<Cell>]) -> crate::Result<Vec<u8>> {
+    use rust_xlsxwriter::{Format, Workbook};
+    let mut wb = Workbook::new();
+    let ws = wb.add_worksheet();
+    let bold = Format::new().set_bold();
+    for (c, col) in cols.iter().enumerate() {
+        ws.write_string_with_format(0, c as u16, &col.name, &bold)?;
+    }
+    for (r, row) in rows.iter().enumerate() {
+        let r = r as u32 + 1;
+        for (c, v) in row.iter().enumerate() {
+            let Some(s) = v else { continue };
+            match s.parse::<f64>() {
+                Ok(n) if cols[c].numeric && n.is_finite() => ws.write_number(r, c as u16, n)?,
+                // Excel caps a cell at 32767 characters.
+                _ => ws.write_string(r, c as u16, s.chars().take(32767).collect::<String>())?,
+            };
+        }
+    }
+    ws.set_freeze_panes(1, 0)?;
+    ws.autofit();
+    Ok(wb.save_to_buffer()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +111,10 @@ mod tests {
         assert!(json(&cols, &rows).contains("{\"ID\":1,\"N\":\"a,\\\"b\\\"\"},\n{\"ID\":null,\"N\":null}"));
         assert_eq!(tsv(None, &rows), "1\ta,\"b\"\n\t");
         assert_eq!(inserts(Db::Postgres, "t", &cols, &rows[..1]), "INSERT INTO t (\"ID\", \"N\") VALUES (1, 'a,\"b\"');\n");
+        let x = xlsx(&cols, &rows).unwrap();
+        assert!(x.starts_with(b"PK"), "xlsx is a zip");
+        let (h, r) = crate::import::read_xlsx(std::io::Cursor::new(x)).unwrap();
+        assert_eq!(h, ["ID", "N"]);
+        assert_eq!(r, vec![vec![Some("1".into()), Some("a,\"b\"".into())]], "an all-NULL row writes no cells, so it is not read back");
     }
 }

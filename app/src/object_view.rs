@@ -43,6 +43,7 @@ struct DataTab {
     editable: bool,
     busy: Cell<bool>,
     buttons: [BitmapButton; 5],
+    import: BitmapButton,
 }
 
 impl ObjectView {
@@ -215,6 +216,12 @@ impl ObjectView {
             });
         }
         let me = self.me.clone();
+        d.import.on_click(move |_| {
+            if let Some(me) = me.upgrade() {
+                me.import()
+            }
+        });
+        let me = self.me.clone();
         d.filter.on_text_enter(move |_| {
             if let Some(me) = me.upgrade() {
                 me.load_data()
@@ -338,6 +345,66 @@ impl ObjectView {
         });
     }
 
+    /// Import CSV / Excel rows as pending inserts: headers matched to columns by name, review
+    /// in the grid, Commit inserts them all or rolls back on the first error.
+    pub fn import(&self) {
+        let Some(d) = &self.data else { return };
+        let cols = d.grid.st.borrow().cols.clone();
+        if cols.is_empty() {
+            return crate::ui::error(&self.panel, "Load the table data first (Refresh).");
+        }
+        let f = FileDialog::builder(&self.panel)
+            .with_message("Import Data")
+            .with_style(FileDialogStyle::Open)
+            .with_wildcard("Data files (*.csv;*.xlsx;*.xls;*.ods)|*.csv;*.xlsx;*.xls;*.ods|All files (*)|*")
+            .build();
+        if f.show_modal() != ID_OK {
+            return;
+        }
+        let Some(path) = f.get_path() else { return };
+        let (headers, rows) = match rsqldev_core::import::read(std::path::Path::new(&path)) {
+            Ok(x) => x,
+            Err(e) => return crate::ui::error(&self.panel, &format!("Import failed: {e:#}")),
+        };
+        let hidden = d.hidden.map(|_| 0);
+        let map: Vec<Option<usize>> = rsqldev_core::import::map_columns(&headers, &cols).into_iter().map(|m| m.filter(|&i| Some(i) != hidden)).collect();
+        let used: Vec<&str> = headers.iter().zip(&map).filter(|(_, m)| m.is_some()).map(|(h, _)| h.as_str()).collect();
+        let ignored: Vec<&str> = headers.iter().zip(&map).filter(|(_, m)| m.is_none()).map(|(h, _)| h.as_str()).collect();
+        if used.is_empty() {
+            return crate::ui::error(&self.panel, &format!("No file column matches a column of {}.
+File columns: {}", self.name, headers.join(", ")));
+        }
+        let msg = format!(
+            "Add {} row(s) as new rows?
+
+Columns: {}
+Ignored: {}
+
+Review them in the grid, then Commit (F11) to insert.",
+            rows.len(),
+            used.join(", "),
+            if ignored.is_empty() { "none".into() } else { ignored.join(", ") }
+        );
+        if !crate::ui::confirm(&self.panel, &msg) {
+            return;
+        }
+        let out: Vec<Vec<rsqldev_core::Cell>> = rows
+            .into_iter()
+            .map(|r| {
+                let mut row = vec![None; cols.len()];
+                for (fi, ti) in map.iter().enumerate() {
+                    if let Some(ti) = ti {
+                        row[*ti] = r.get(fi).cloned().flatten();
+                    }
+                }
+                row
+            })
+            .collect();
+        // Fetch the rest first so imported rows stay after every fetched row.
+        let g = d.grid.clone();
+        d.grid.fetch_all(move || g.append_new_rows(out));
+    }
+
     pub fn insert_row(&self) {
         if let Some(d) = &self.data {
             d.grid.insert_row();
@@ -377,6 +444,7 @@ impl DataTab {
             mk("rollback", "Rollback Changes (F12)"),
             refresh,
         ];
+        let import = mk("open", "Import Data from CSV / Excel…");
         let fl = StaticText::builder(&p).with_label("Filter:").build();
         let filter = TextCtrl::builder(&p).with_style(TextCtrlStyle::ProcessEnter).build();
         filter.set_tooltip("WHERE clause, press Enter");
@@ -390,6 +458,6 @@ impl DataTab {
         s.add(&grid.grid, 1, SizerFlag::Expand, 0);
         s.add(&status, 0, SizerFlag::Expand | SizerFlag::All, 3);
         p.set_sizer(s, true);
-        (p, DataTab { grid, filter, status, pk: RefCell::default(), hidden: dq.hidden, editable: dq.editable, busy: Cell::new(false), buttons })
+        (p, DataTab { grid, filter, status, pk: RefCell::default(), hidden: dq.hidden, editable: dq.editable, busy: Cell::new(false), buttons, import })
     }
 }

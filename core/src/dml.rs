@@ -24,8 +24,14 @@ pub fn literal(db: Db, col: &Column, v: &Cell) -> String {
             Db::Mysql | Db::Sqlite => format!("X'{h}'"),
         };
     }
-    let q = format!("'{}'", s.replace('\'', "''"));
     let t = col.type_name.to_uppercase();
+    // ISO dates (imports, typed values) convert explicitly: they rarely match NLS_DATE_FORMAT.
+    if db == Db::Oracle && (t == "DATE" || t.starts_with("TIMESTAMP")) && !t.contains("TIME ZONE") {
+        if let Some((v, fmt)) = iso_datetime(s) {
+            return format!("TO_TIMESTAMP('{v}', '{fmt}')");
+        }
+    }
+    let q = format!("'{}'", s.replace('\'', "''"));
     match db {
         Db::Mssql if t.contains("NVARCHAR") || t.contains("NCHAR") || t.contains("NTEXT") => format!("N{q}"),
         _ => q,
@@ -36,6 +42,34 @@ pub fn literal(db: Db, col: &Column, v: &Cell) -> String {
 /// bound. Other engines take long literals fine.
 pub fn text_needs_bind(db: Db, col: &Column, v: &Cell) -> bool {
     db == Db::Oracle && !crate::is_binary(&col.type_name) && v.as_ref().is_some_and(|s| s.len() > 4000)
+}
+
+/// `YYYY-MM-DD[( |T)HH:MM[:SS[.fff]]]` → normalized value and its Oracle format model.
+fn iso_datetime(s: &str) -> Option<(String, &'static str)> {
+    let digits = |p: &str, n: usize| p.len() == n && p.bytes().all(|b| b.is_ascii_digit());
+    let (date, time) = match s.split_once([' ', 'T']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let d: Vec<&str> = date.split('-').collect();
+    if !(d.len() == 3 && digits(d[0], 4) && digits(d[1], 2) && digits(d[2], 2)) {
+        return None;
+    }
+    let Some(time) = time else { return Some((date.to_string(), "YYYY-MM-DD")) };
+    let (hms, frac) = match time.split_once('.') {
+        Some((a, f)) if (1..=9).contains(&f.len()) && f.bytes().all(|b| b.is_ascii_digit()) => (a, Some(f)),
+        Some(_) => return None,
+        None => (time, None),
+    };
+    let t: Vec<&str> = hms.split(':').collect();
+    if !((t.len() == 2 || t.len() == 3) && t.iter().all(|p| digits(p, 2))) {
+        return None;
+    }
+    let sec = t.get(2).copied().unwrap_or("00");
+    Some(match frac {
+        Some(f) => (format!("{date} {}:{}:{sec}.{f}", t[0], t[1]), "YYYY-MM-DD HH24:MI:SS.FF"),
+        None => (format!("{date} {}:{}:{sec}", t[0], t[1]), "YYYY-MM-DD HH24:MI:SS"),
+    })
 }
 
 /// How rows are identified for UPDATE/DELETE.
@@ -163,6 +197,12 @@ mod tests {
         let key = Key::new(&cols, None, &["A".into()]);
         assert_eq!(delete(Db::Mssql, "[t]", &cols, &key, &[Some("1".into()), None]), "DELETE FROM [t] WHERE [a] = 1");
         assert_eq!(insert(Db::Mssql, "[t]", &cols, None, &[Some("1".into()), None], &[1]), "INSERT INTO [t] ([a], [b]) VALUES (1, @P1)");
+        let d = col("D", "DATE", false);
+        assert_eq!(literal(Db::Oracle, &d, &Some("2026-01-02".into())), "TO_TIMESTAMP('2026-01-02', 'YYYY-MM-DD')");
+        assert_eq!(literal(Db::Oracle, &d, &Some("2026-01-02T03:04".into())), "TO_TIMESTAMP('2026-01-02 03:04:00', 'YYYY-MM-DD HH24:MI:SS')");
+        assert_eq!(literal(Db::Oracle, &col("T", "TIMESTAMP(6)", false), &Some("2026-01-02 03:04:05.5".into())), "TO_TIMESTAMP('2026-01-02 03:04:05.5', 'YYYY-MM-DD HH24:MI:SS.FF')");
+        assert_eq!(literal(Db::Oracle, &d, &Some("02-JAN-26".into())), "'02-JAN-26'", "NLS-formatted grid text stays implicit");
+        assert_eq!(literal(Db::Postgres, &col("d", "date", false), &Some("2026-01-02".into())), "'2026-01-02'");
         let clob = col("c", "CLOB", false);
         assert!(text_needs_bind(Db::Oracle, &clob, &Some("é".repeat(2001))));
         assert!(!text_needs_bind(Db::Oracle, &clob, &Some("x".repeat(4000))));

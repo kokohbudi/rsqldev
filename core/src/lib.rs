@@ -8,6 +8,7 @@ pub mod dml;
 pub mod download;
 pub mod export;
 pub mod format;
+pub mod import;
 pub mod registry;
 pub mod script;
 pub mod worker;
