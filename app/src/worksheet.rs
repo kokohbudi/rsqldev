@@ -18,6 +18,7 @@ use wxdragon::prelude::*;
 pub struct Worksheet {
     pub panel: Panel,
     pub editor: StyledTextCtrl,
+    pub find: Rc<crate::find::FindBar>,
     conn: RefCell<ConnRef>,
     conn_choice: Choice,
     bottom: AuiNotebook,
@@ -144,8 +145,10 @@ impl Worksheet {
         split.split_horizontally(&editor, &bottom, 300);
         split.set_minimum_pane_size(60);
 
+        let find = crate::find::FindBar::new(&panel, editor);
         let s = BoxSizer::builder(Orientation::Vertical).build();
         s.add_sizer(&bar, 0, SizerFlag::Expand, 0);
+        s.add(&find.panel, 0, SizerFlag::Expand, 0);
         s.add(&split, 1, SizerFlag::Expand, 0);
         panel.set_sizer(s, true);
 
@@ -156,6 +159,7 @@ impl Worksheet {
         let ws = Rc::new_cyclic(|me| Worksheet {
             panel,
             editor,
+            find,
             conn: RefCell::new(conn),
             conn_choice,
             bottom,

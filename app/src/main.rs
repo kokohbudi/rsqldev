@@ -7,6 +7,7 @@ mod conn;
 mod connections;
 mod driver_manager;
 mod editor;
+mod find;
 mod grid;
 mod hub;
 mod icons;
@@ -65,6 +66,10 @@ const ID_THEME_LIGHT: i32 = ID_HIGHEST + 20;
 const ID_THEME_DARK: i32 = ID_HIGHEST + 21;
 const ID_THEME_SYSTEM: i32 = ID_HIGHEST + 22;
 const ID_COMPLETE: i32 = ID_HIGHEST + 23;
+const ID_FIND: i32 = ID_HIGHEST + 24;
+const ID_REPLACE: i32 = ID_HIGHEST + 25;
+const ID_FIND_NEXT: i32 = ID_HIGHEST + 26;
+const ID_FIND_PREV: i32 = ID_HIGHEST + 27;
 
 enum Page {
     Sheet(SheetRef),
@@ -563,6 +568,14 @@ impl App {
                     _ => e.select_all(),
                 }
             }
+            ID_FIND | ID_REPLACE | ID_FIND_NEXT | ID_FIND_PREV => {
+                if let Some(s) = sheet {
+                    match id {
+                        ID_FIND | ID_REPLACE => s.find.open(id == ID_REPLACE),
+                        _ => s.find.next(id == ID_FIND_PREV),
+                    }
+                }
+            }
             ID_COMPLETE => {
                 if let Some(s) = sheet {
                     complete::show(s.editor, &s.conn(), true);
@@ -673,6 +686,11 @@ fn menus(frame: &Frame) {
         .append_item(ID_SELECTALL, "Select &All\tCtrl+A", "")
         .append_separator()
         .append_item(ID_COMPLETE, "Completion &Insight\tRawCtrl+Space", "Complete keywords, tables and columns")
+        .append_separator()
+        .append_item(ID_FIND, "&Find…\tCtrl+F", "")
+        .append_item(ID_REPLACE, "R&eplace…\tCtrl+R", "")
+        .append_item(ID_FIND_NEXT, "Find &Next\tF3", "")
+        .append_item(ID_FIND_PREV, "Find Pre&vious\tShift+F3", "")
         .build();
     let view = Menu::builder()
         .append_item(ID_TOGGLE_NAV, "&Connections\tCtrl+Shift+L", "Show or hide the Connections navigator")

@@ -22,16 +22,22 @@ pub fn show(editor: StyledTextCtrl, conn: &ConnRef, explicit: bool) {
     let items = script::split(&text, db);
     let refs = tables(&script::statement_at(&items, pos).map(|i| i.text.clone()).unwrap_or_default());
     let target = |owner: Option<&str>, name: &str| (owner.map_or(schema.clone(), |o| stored(db, o)), stored(db, name));
+    // Names go into metadata queries as string literals: skip ones that could break the literal.
+    let safe = |s: &str| !s.contains(['\'', '\\']);
     match ctx.qualifier {
+        Some(q) if !safe(&q) => {}
         Some(q) => match resolve(&refs, &q) {
             Some(r) => {
                 let (o, n) = target(r.owner.as_deref(), &r.name);
+                if !safe(&o) || !safe(&n) {
+                    return;
+                }
                 Conn::columns(conn, &o, &n, move |cols| popup(editor, db, cols, false));
             }
             None => Conn::names(conn, &stored(db, &q), move |names| popup(editor, db, names, false)),
         },
         None => {
-            let todo: Vec<(String, String)> = refs.iter().map(|r| target(r.owner.as_deref(), &r.name)).collect();
+            let todo: Vec<(String, String)> = refs.iter().map(|r| target(r.owner.as_deref(), &r.name)).filter(|(o, n)| safe(o) && safe(n)).collect();
             let c = conn.clone();
             gather(conn, todo, vec![], move |cols| {
                 Conn::names(&c, &schema, move |mut names| {
