@@ -233,6 +233,14 @@ impl Worksheet {
                 app.status(3, if e.is_modified() { "Modified" } else { "" });
             }
         });
+        let w = Rc::downgrade(&ws);
+        ws.editor.on_stc_char_added(move |e| {
+            if let (Some(w), Some(k)) = (w.upgrade(), e.get_key()) {
+                if k == '.' as i32 {
+                    crate::complete::show(w.editor, &w.conn(), false);
+                }
+            }
+        });
         let w3 = Rc::downgrade(&ws);
         ws.results.st.borrow_mut().on_change = Some(Rc::new(move |st| {
             if let Some(w) = w3.upgrade() {

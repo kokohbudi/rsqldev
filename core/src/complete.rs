@@ -1,0 +1,234 @@
+//! Code completion helpers: the word being typed at the cursor, and the tables a statement
+//! names (with aliases), so the editor can offer keywords, tables and columns.
+
+use crate::registry::Kind as Db;
+
+#[derive(Debug, PartialEq)]
+pub struct Ctx {
+    /// Partial word before the cursor (may be empty).
+    pub prefix: String,
+    /// `x` in `x.pre|`: an alias, table or schema name.
+    pub qualifier: Option<String>,
+}
+
+fn ident_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '$' | '#' | '"' | '`' | '[' | ']')
+}
+
+/// Start of the identifier ending at byte `end`.
+fn word_start(text: &str, end: usize) -> usize {
+    text[..end].char_indices().rev().take_while(|(_, c)| ident_char(*c)).last().map_or(end, |(i, _)| i)
+}
+
+/// Word before byte offset `pos` and its `x.` qualifier.
+pub fn context(text: &str, pos: usize) -> Ctx {
+    let pos = pos.min(text.len());
+    let start = word_start(text, pos);
+    let prefix = text[start..pos].to_string();
+    let qualifier = text[..start].strip_suffix('.').map(|before| before[word_start(before, before.len())..].to_string()).filter(|q| !q.is_empty());
+    Ctx { prefix, qualifier }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct TableRef {
+    pub owner: Option<String>,
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+/// Words that end a table reference instead of being its alias.
+const STOP: &[&str] = &[
+    "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "OUTER", "NATURAL", "ON", "USING", "GROUP", "ORDER", "HAVING", "UNION",
+    "INTERSECT", "MINUS", "EXCEPT", "SET", "VALUES", "LIMIT", "OFFSET", "FETCH", "FOR", "START", "CONNECT", "WINDOW", "QUALIFY",
+    "PIVOT", "UNPIVOT", "SAMPLE", "PARTITION", "SELECT", "RETURNING", "LATERAL", "APPLY", "WITH", "DEFAULT",
+];
+
+#[derive(Debug, PartialEq)]
+enum Tok {
+    Word(String),
+    Punct(char),
+}
+
+fn tokens(sql: &str) -> Vec<Tok> {
+    let b: Vec<char> = sql.chars().collect();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == '-' && b.get(i + 1) == Some(&'-') {
+            while i < b.len() && b[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && b.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < b.len() && !(b[i] == '*' && b.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i += 2;
+        } else if c == '\'' {
+            i += 1;
+            while i < b.len() && b[i] != '\'' {
+                i += 1;
+            }
+            i += 1;
+        } else if matches!(c, '"' | '`' | '[') {
+            let close = if c == '[' { ']' } else { c };
+            let s = i;
+            i += 1;
+            while i < b.len() && b[i] != close {
+                i += 1;
+            }
+            i += 1;
+            out.push(Tok::Word(b[s..i.min(b.len())].iter().collect()));
+        } else if c.is_alphanumeric() || matches!(c, '_' | '$' | '#') {
+            let s = i;
+            while i < b.len() && (b[i].is_alphanumeric() || matches!(b[i], '_' | '$' | '#')) {
+                i += 1;
+            }
+            out.push(Tok::Word(b[s..i].iter().collect()));
+        } else {
+            if !c.is_whitespace() {
+                out.push(Tok::Punct(c));
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Tables named after FROM / JOIN / UPDATE / INTO (and comma lists after FROM), with aliases.
+/// ponytail: token scan, not a parser; subquery sources `(...) x` are skipped.
+pub fn tables(sql: &str) -> Vec<TableRef> {
+    let t = tokens(sql);
+    let word = |i: usize| match t.get(i) {
+        Some(Tok::Word(w)) => Some(w.as_str()),
+        _ => None,
+    };
+    let kw = |i: usize, k: &str| word(i).is_some_and(|w| w.eq_ignore_ascii_case(k));
+    let mut out = vec![];
+    let mut i = 0;
+    while i < t.len() {
+        let starts = ["FROM", "JOIN", "UPDATE", "INTO"].iter().any(|k| kw(i, k));
+        i += 1;
+        if !starts {
+            continue;
+        }
+        // One reference, then more while a comma follows (FROM a, b).
+        loop {
+            let Some(first) = word(i).filter(|w| !STOP.iter().any(|s| w.eq_ignore_ascii_case(s))) else { break };
+            let (owner, name) = if t.get(i + 1) == Some(&Tok::Punct('.')) && word(i + 2).is_some() {
+                i += 3;
+                (Some(first.to_string()), word(i - 1).unwrap().to_string())
+            } else {
+                i += 1;
+                (None, first.to_string())
+            };
+            if kw(i, "AS") {
+                i += 1;
+            }
+            let alias = word(i).filter(|w| !STOP.iter().any(|s| w.eq_ignore_ascii_case(s))).map(str::to_string);
+            if alias.is_some() {
+                i += 1;
+            }
+            out.push(TableRef { owner, name, alias });
+            if t.get(i) == Some(&Tok::Punct(',')) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The table a qualifier (`e` in `e.`) points at: alias first, then table name.
+pub fn resolve<'a>(refs: &'a [TableRef], q: &str) -> Option<&'a TableRef> {
+    let q = unquote(q);
+    refs.iter()
+        .find(|r| r.alias.as_deref().is_some_and(|a| unquote(a).eq_ignore_ascii_case(&q)))
+        .or_else(|| refs.iter().find(|r| unquote(&r.name).eq_ignore_ascii_case(&q)))
+}
+
+fn unquote(s: &str) -> String {
+    s.trim_matches(['"', '`', '[', ']']).to_string()
+}
+
+/// Identifier as the dictionary stores it: quoted names verbatim, others folded.
+pub fn stored(db: Db, raw: &str) -> String {
+    if raw.starts_with(['"', '`', '[']) { unquote(raw) } else { crate::dialect::fold(db, raw) }
+}
+
+/// Text to insert for a candidate: in the case the user is typing, quoted when needed. Keywords always follow the prefix; names
+/// only on engines that fold unquoted identifiers (Oracle, PostgreSQL) and only when the stored
+/// name is the folded form, so the inserted text still means the same object.
+pub fn match_case(db: Db, prefix: &str, word: &str, keyword: bool) -> String {
+    let lower = prefix.chars().any(char::is_lowercase) || (prefix.is_empty() && !keyword && db == Db::Oracle);
+    let plain = word.chars().all(|c| c.is_alphanumeric() || c == '_') && crate::dialect::fold(db, word) == word;
+    if !keyword && !plain && (matches!(db, Db::Oracle | Db::Postgres) || !word.chars().all(|c| c.is_alphanumeric() || c == '_')) {
+        return crate::dialect::quote(db, word); // mixed case / special characters need quotes
+    }
+    if !(keyword || (matches!(db, Db::Oracle | Db::Postgres) && plain)) {
+        return word.to_string();
+    }
+    if lower {
+        word.to_lowercase()
+    } else if prefix.is_empty() && !keyword {
+        word.to_string()
+    } else {
+        word.to_uppercase()
+    }
+}
+
+/// Candidates starting with `prefix` (case-insensitive), sorted, without duplicates.
+pub fn filter(prefix: &str, words: impl IntoIterator<Item = String>) -> Vec<String> {
+    let p = prefix.to_lowercase();
+    let mut v: Vec<String> = words.into_iter().filter(|w| w.to_lowercase().starts_with(&p)).collect();
+    v.sort_by_key(|w| w.to_lowercase());
+    v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_context() {
+        assert_eq!(context("select e.na", 11), Ctx { prefix: "na".into(), qualifier: Some("e".into()) });
+        assert_eq!(context("select e.", 9), Ctx { prefix: "".into(), qualifier: Some("e".into()) });
+        assert_eq!(context("select * from em", 16), Ctx { prefix: "em".into(), qualifier: None });
+        assert_eq!(context("select \"Emp\".", 13).qualifier.as_deref(), Some("\"Emp\""));
+    }
+
+    #[test]
+    fn table_refs() {
+        let r = tables("select * from hr.emp e, jobs join dept d on d.id = e.dept_id where x in (select 1 from dual)");
+        assert_eq!(r[0], TableRef { owner: Some("hr".into()), name: "emp".into(), alias: Some("e".into()) });
+        assert_eq!(r[1], TableRef { owner: None, name: "jobs".into(), alias: None });
+        assert_eq!(r[2], TableRef { owner: None, name: "dept".into(), alias: Some("d".into()) });
+        assert_eq!(r[3].name, "dual");
+        let r = tables("update \"Emp\" as x set a = 1 where -- from fake\n b = 'from y'");
+        assert_eq!(r, vec![TableRef { owner: None, name: "\"Emp\"".into(), alias: Some("x".into()) }]);
+        assert_eq!(resolve(&r, "X").unwrap().name, "\"Emp\"");
+        assert_eq!(stored(Db::Oracle, "emp"), "EMP");
+        assert_eq!(stored(Db::Oracle, "\"Emp\""), "Emp");
+    }
+
+    #[test]
+    fn typed_case() {
+        assert_eq!(match_case(Db::Oracle, "em", "EMP", false), "emp");
+        assert_eq!(match_case(Db::Oracle, "Em", "EMP", false), "emp");
+        assert_eq!(match_case(Db::Oracle, "EM", "EMP", false), "EMP");
+        assert_eq!(match_case(Db::Oracle, "my", "MyTable", false), "\"MyTable\"", "mixed-case name needs quotes");
+        assert_eq!(match_case(Db::Mysql, "my", "my table", false), "`my table`");
+        assert_eq!(match_case(Db::Postgres, "EM", "emp", false), "EMP");
+        assert_eq!(match_case(Db::Mysql, "em", "Emp", false), "Emp");
+        assert_eq!(match_case(Db::Mysql, "sel", "SELECT", true), "select");
+        assert_eq!(match_case(Db::Mysql, "", "SELECT", true), "SELECT");
+    }
+
+    #[test]
+    fn filtering() {
+        assert_eq!(filter("em", ["EMP".into(), "dept".into(), "Employees".into(), "emp".into()]), vec!["EMP", "Employees"]);
+    }
+}

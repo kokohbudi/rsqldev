@@ -1,6 +1,7 @@
 //! rsqldev core: database backends, driver registry/downloader, dialect metadata, script runner.
 
 pub mod backend;
+pub mod complete;
 pub mod config;
 pub mod dialect;
 pub mod dml;

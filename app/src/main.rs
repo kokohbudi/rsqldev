@@ -2,6 +2,7 @@
 //! rsqldev: a native SQL Developer. wxWidgets gives Cocoa widgets on macOS and Win32 on Windows.
 
 mod autosave;
+mod complete;
 mod conn;
 mod connections;
 mod driver_manager;
@@ -63,6 +64,7 @@ const ID_KEYS: i32 = ID_HIGHEST + 19;
 const ID_THEME_LIGHT: i32 = ID_HIGHEST + 20;
 const ID_THEME_DARK: i32 = ID_HIGHEST + 21;
 const ID_THEME_SYSTEM: i32 = ID_HIGHEST + 22;
+const ID_COMPLETE: i32 = ID_HIGHEST + 23;
 
 enum Page {
     Sheet(SheetRef),
@@ -561,6 +563,11 @@ impl App {
                     _ => e.select_all(),
                 }
             }
+            ID_COMPLETE => {
+                if let Some(s) = sheet {
+                    complete::show(s.editor, &s.conn(), true);
+                }
+            }
             ID_RUN | ID_SCRIPT | ID_EXPLAIN | ID_COMMIT | ID_ROLLBACK | ID_CANCEL_STMT | ID_HISTORY | ID_CLEAR => {
                 let Some(s) = sheet else { return true };
                 match id {
@@ -664,6 +671,8 @@ fn menus(frame: &Frame) {
         .append_item(ID_COPY, "&Copy\tCtrl+C", "")
         .append_item(ID_PASTE, "&Paste\tCtrl+V", "")
         .append_item(ID_SELECTALL, "Select &All\tCtrl+A", "")
+        .append_separator()
+        .append_item(ID_COMPLETE, "Completion &Insight\tRawCtrl+Space", "Complete keywords, tables and columns")
         .build();
     let view = Menu::builder()
         .append_item(ID_TOGGLE_NAV, "&Connections\tCtrl+Shift+L", "Show or hide the Connections navigator")

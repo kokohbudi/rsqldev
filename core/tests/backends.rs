@@ -78,6 +78,10 @@ fn exercise(c: ConnConfig, pw: &str, owner: &str) {
     }
     let tables = query_all(b, &dialect::list_sql(db, dialect::TABLE, owner).unwrap()).unwrap().1;
     let name = tables.iter().filter_map(|r| r[0].clone()).find(|n| n.eq_ignore_ascii_case("rsq_t")).expect("rsq_t listed");
+    // Completion: the columns query's first column is the column name.
+    let dsql = dialect::describe_sql(db, owner, &name).unwrap();
+    let names: Vec<String> = query_all(b, &dsql).unwrap().1.into_iter().filter_map(|r| r[0].clone()).collect();
+    assert!(names.iter().any(|n| n.eq_ignore_ascii_case("name")) && names.iter().any(|n| n.eq_ignore_ascii_case("id")), "{dsql} => {names:?}");
     for t in dialect::tabs(db, dialect::TABLE) {
         let sql = match t.view {
             View::Data => dialect::data_query(db, dialect::TABLE, owner, &name).sql,

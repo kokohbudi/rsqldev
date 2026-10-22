@@ -5,6 +5,7 @@
 //! and object viewer metadata, always fully drained so it never blocks.
 
 use rsqldev_core::config::{ConnConfig, Prefs};
+use rsqldev_core::dialect;
 use rsqldev_core::registry::{self, Kind};
 use rsqldev_core::worker::{Cmd, Reply, Session};
 use rsqldev_core::{Cell, Column, Event};
@@ -71,6 +72,9 @@ pub struct Conn {
     schema_asked: bool,
     waiters: Vec<ReadyCb>,
     open_fetch: Option<Rows>,
+    /// Completion cache: table + view names per owner, column names per (owner, table).
+    names: HashMap<String, Vec<String>>,
+    columns: HashMap<(String, String), Vec<String>>,
 }
 
 impl Conn {
@@ -81,7 +85,7 @@ impl Conn {
         // DuckDB locks the file per database instance: one session only. In-memory SQLite too.
         let shared = kind == Kind::Duckdb || (kind == Kind::Sqlite && cfg.database.is_empty());
         let meta = (!shared).then(|| lane(Session::open(cfg.clone(), password, prefs.clone())));
-        let c = Rc::new(RefCell::new(Conn { cfg, kind, prefs, schema: String::new(), work, meta, state: State::Connecting, ready: false, schema_asked: false, waiters: vec![], open_fetch: None }));
+        let c = Rc::new(RefCell::new(Conn { cfg, kind, prefs, schema: String::new(), work, meta, state: State::Connecting, ready: false, schema_asked: false, waiters: vec![], open_fetch: None, names: HashMap::new(), columns: HashMap::new() }));
         let weak = Rc::downgrade(&c);
         crate::hub::every_tick(move || match weak.upgrade() {
             Some(c) => {
@@ -265,6 +269,47 @@ impl Conn {
         }
         c.work.tx.push_back(Box::new(cb));
         c.work.s.send(cmd);
+    }
+
+    /// Table and view names of `owner` (cached for the session).
+    pub fn names(this: &ConnRef, owner: &str, cb: impl FnOnce(Vec<String>) + 'static) {
+        if let Some(n) = this.borrow().names.get(owner) {
+            return cb(n.clone());
+        }
+        let kind = this.borrow().kind;
+        let sqls: Vec<String> = [dialect::TABLE, dialect::VIEW].into_iter().filter_map(|k| dialect::list_sql(kind, k, owner)).collect();
+        let (c, owner) = (this.clone(), owner.to_string());
+        Conn::first_column(this, sqls, vec![], move |names| {
+            c.borrow_mut().names.insert(owner, names.clone());
+            cb(names)
+        });
+    }
+
+    /// Column names of `owner.table` (cached for the session).
+    pub fn columns(this: &ConnRef, owner: &str, table: &str, cb: impl FnOnce(Vec<String>) + 'static) {
+        let key = (owner.to_string(), table.to_string());
+        if let Some(n) = this.borrow().columns.get(&key) {
+            return cb(n.clone());
+        }
+        let sql = dialect::describe_sql(this.borrow().kind, owner, table);
+        let c = this.clone();
+        Conn::first_column(this, sql.into_iter().collect(), vec![], move |cols| {
+            c.borrow_mut().columns.insert(key, cols.clone());
+            cb(cols)
+        });
+    }
+
+    /// Run metadata queries one after another, collecting each one's first column.
+    fn first_column(this: &ConnRef, mut sqls: Vec<String>, mut acc: Vec<String>, cb: impl FnOnce(Vec<String>) + 'static) {
+        if sqls.is_empty() {
+            return cb(acc);
+        }
+        let sql = sqls.remove(0);
+        let c = this.clone();
+        Conn::meta_query(this, &sql, move |r| {
+            acc.extend(r.map(|r| r.rows).unwrap_or_default().into_iter().filter_map(|r| r.into_iter().next().flatten()));
+            Conn::first_column(&c, sqls, acc, cb)
+        });
     }
 
     pub fn cancel(&self) {

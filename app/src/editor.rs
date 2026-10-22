@@ -10,7 +10,7 @@ const S_NUMBER: i32 = 3;
 const S_KEYWORD: i32 = 4;
 const S_IDENT_Q: i32 = 5;
 
-const KEYWORDS: &[&str] = &[
+pub const KEYWORDS: &[&str] = &[
     "ADD", "ALL", "ALTER", "AND", "ANY", "AS", "ASC", "BEGIN", "BETWEEN", "BODY", "BY", "CASE", "CHECK", "CLOSE", "COLUMN", "COMMENT",
     "COMMIT", "CONSTRAINT", "CREATE", "CROSS", "CURSOR", "DECLARE", "DEFAULT", "DELETE", "DESC", "DISTINCT", "DROP", "ELSE", "ELSIF",
     "END", "EXCEPTION", "EXECUTE", "EXISTS", "EXIT", "FETCH", "FIRST", "FOR", "FOREIGN", "FROM", "FULL", "FUNCTION", "GRANT", "GROUP",
