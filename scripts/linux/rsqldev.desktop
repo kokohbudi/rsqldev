@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=rsqldev
+Comment=Native SQL client for Oracle, PostgreSQL, MySQL, SQL Server, ClickHouse, SQLite, DuckDB
+Exec=rsqldev
+Icon=rsqldev
+Terminal=false
+Categories=Development;Database;

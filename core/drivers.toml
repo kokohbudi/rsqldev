@@ -27,6 +27,22 @@ sha256 = "725eeb7c00041e926b57c3db508ea7439a1935a37f480c0ac6d46eddc4205331"
 archive = "dmg"
 
 [[driver.files]]
+os = "linux-x86_64"
+version = "23.26.4.0.0"
+url = "https://download.oracle.com/otn_software/linux/instantclient/2326400/instantclient-basic-linux.x64-23.26.4.0.0.zip"
+sha256 = "cab59aa3b411b3b50898e456fa9aabfe48d67e25cbc1bb23303800390ce7de26"
+archive = "zip"
+strip = 1
+
+[[driver.files]]
+os = "linux-aarch64"
+version = "23.26.4.0.0"
+url = "https://download.oracle.com/otn_software/linux/instantclient/2326400/instantclient-basic-linux.arm64-23.26.4.0.0.zip"
+sha256 = "688df426cabb4e5945e8409ae022acd16b92ff06582c8d93af2f41e3fb9a42f3"
+archive = "zip"
+strip = 1
+
+[[driver.files]]
 os = "windows-x86_64"
 version = "23.26.4.0.0"
 url = "https://download.oracle.com/otn_software/nt/instantclient/2326400/instantclient-basic-windows.x64-23.26.4.0.0.zip"

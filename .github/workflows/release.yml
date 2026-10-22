@@ -46,8 +46,27 @@ jobs:
           name: windows
           path: rsqldev-windows-x64.zip
 
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-latest }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in container
+        run: scripts/build-linux.sh "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/rsqldev-linux-${{ matrix.arch }}.tar.gz
+
   publish:
-    needs: [macos, windows]
+    # Publish when macOS and Windows built; a failed Linux architecture is just left out.
+    needs: [macos, windows, linux]
+    if: ${{ !cancelled() && needs.macos.result == 'success' && needs.windows.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -58,4 +77,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "rsqldev $GITHUB_REF_NAME" --generate-notes \
-            macos/rsqldev-macos-universal.zip windows/rsqldev-windows-x64.zip
+            macos/rsqldev-macos-universal.zip windows/rsqldev-windows-x64.zip linux-*/rsqldev-linux-*.tar.gz

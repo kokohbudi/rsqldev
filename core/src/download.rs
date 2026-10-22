@@ -125,6 +125,19 @@ fn unzip(file: &Path, dest: &Path, strip: usize) -> Result<()> {
             continue;
         }
         fs::create_dir_all(path.parent().unwrap())?;
+        // Linux Instant Client ships libclntsh.so etc. as symlinks to the versioned library.
+        #[cfg(unix)]
+        if e.is_symlink() {
+            let mut target = String::new();
+            std::io::Read::read_to_string(&mut e, &mut target)?;
+            // Only links to a sibling file: never out of the install folder.
+            if target.is_empty() || target.contains(['/', '\\']) || target == ".." {
+                continue;
+            }
+            let _ = fs::remove_file(&path);
+            std::os::unix::fs::symlink(&target, &path)?;
+            continue;
+        }
         std::io::copy(&mut e, &mut fs::File::create(&path)?)?;
         #[cfg(unix)]
         if let Some(mode) = e.unix_mode() {
@@ -176,6 +189,29 @@ fn undmg(_: &Path, _: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn zip_symlinks() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("rsq-zip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let zf = dir.join("t.zip");
+        let mut w = zip::ZipWriter::new(fs::File::create(&zf).unwrap());
+        let o = zip::write::SimpleFileOptions::default();
+        w.start_file("ic/libclntsh.so.23.1", o).unwrap();
+        w.write_all(b"lib").unwrap();
+        w.add_symlink("ic/libclntsh.so", "libclntsh.so.23.1", o).unwrap();
+        w.add_symlink("ic/evil", "../../etc/passwd", o).unwrap();
+        w.finish().unwrap();
+        let out = dir.join("out");
+        unzip(&zf, &out, 1).unwrap();
+        assert_eq!(fs::read(out.join("libclntsh.so")).unwrap(), b"lib");
+        assert!(fs::symlink_metadata(out.join("libclntsh.so")).unwrap().file_type().is_symlink());
+        assert!(!out.join("evil").exists() && fs::symlink_metadata(out.join("evil")).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn rel_paths() {
