@@ -608,6 +608,42 @@ impl App {
     }
 }
 
+/// Status bar activity: an animated bar and elapsed time whenever a connection is connecting,
+/// executing or fetching (see `worker::busy`), so long work never looks like a hang.
+fn activity_bar(sb: StatusBar) {
+    const F_TIME: usize = 4;
+    const F_BAR: usize = 5;
+    let gauge = Gauge::builder(&sb).with_range(100).build();
+    gauge.show(false);
+    let mut since: Option<std::time::Instant> = None;
+    let mut phase = 0;
+    hub::every_tick(move || {
+        if !gauge.is_valid() {
+            return false;
+        }
+        let busy = rsqldev_core::worker::busy() > 0;
+        match (busy, since) {
+            (true, None) => since = Some(std::time::Instant::now()),
+            (false, Some(_)) => {
+                since = None;
+                gauge.show(false);
+                sb.set_status_text("", F_TIME);
+            }
+            _ => {}
+        }
+        // Skip sub-200 ms blips (tree expands, metadata) so the bar does not flicker.
+        let Some(t) = since.filter(|t| t.elapsed().as_millis() >= 200) else { return true };
+        let r = sb.get_field_rect(F_BAR);
+        gauge.set_size_with_pos(r.x + 4, r.y + 2, r.width - 8, r.height - 4);
+        gauge.show(true);
+        // No indeterminate mode in wxDragon: sweep the bar instead (~1.5 s per pass at 25 ms ticks).
+        phase = (phase + 2) % 102;
+        gauge.set_value(phase.min(100));
+        sb.set_status_text(&format!("Working {:.1} s", t.elapsed().as_secs_f32()), F_TIME);
+        true
+    });
+}
+
 fn menus(frame: &Frame) {
     let file = Menu::builder()
         .append_item(ID_NEW_CONN, "New Connection…\tCtrl+Shift+C", "Create a database connection")
@@ -827,8 +863,9 @@ fn main() {
         if let Some(b) = BitmapBundle::from_svg_text(include_str!("../assets/icon.svg"), Size::new(256, 256)).and_then(|b| b.get_bitmap(Size::new(256, 256))) {
             frame.set_icon(&b);
         }
-        let sb = frame.create_status_bar(4, 0, ID_ANY as i32, "statusbar");
-        sb.set_status_widths(&[-1, 150, 70, 90]);
+        let sb = frame.create_status_bar(6, 0, ID_ANY as i32, "statusbar");
+        sb.set_status_widths(&[-1, 150, 70, 90, 90, 130]);
+        activity_bar(sb);
         let split = SplitterWindow::builder(&frame).build();
         // ponytail: AUI flags not exposed by wxDragon; values from wx/aui/auibook.h.
         let nb_flags = |close: bool| AuiNotebookStyle::from_bits_retain(0x1 | 0x20 | 0x100 | if close { 0x800 | 0x2000 } else { 0 });

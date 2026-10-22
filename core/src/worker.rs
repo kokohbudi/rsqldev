@@ -6,8 +6,34 @@
 use crate::config::{ConnConfig, Prefs};
 use crate::{Backend, Bind, Canceller, Event};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+static BUSY: AtomicUsize = AtomicUsize::new(0);
+
+/// Connection threads currently working on a database: connecting, executing, fetching.
+/// An open cursor waiting for the UI to ask for more rows does not count. Drives the UI's
+/// activity bar.
+pub fn busy() -> usize {
+    BUSY.load(Ordering::Relaxed)
+}
+
+/// Counts the current thread as busy while alive.
+struct Busy;
+
+impl Busy {
+    fn new() -> Busy {
+        BUSY.fetch_add(1, Ordering::Relaxed);
+        Busy
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 pub enum Cmd {
     Exec { id: u64, sql: String, fetch: usize, rows: SyncSender<Event> },
@@ -44,6 +70,7 @@ impl Session {
         std::thread::Builder::new()
             .name(format!("conn {}", cfg.name))
             .spawn(move || {
+                let connecting = Busy::new();
                 let mut b = match crate::backend::connect(&cfg, &password, &prefs) {
                     Ok(b) => b,
                     Err(e) => {
@@ -52,10 +79,14 @@ impl Session {
                         return;
                     }
                 };
+                drop(connecting);
                 *c2.lock().unwrap() = b.canceller();
                 let _ = rtx.send(Reply::Connected);
                 for cmd in rx {
-                    let r = run(b.as_mut(), cmd);
+                    let r = {
+                        let _busy = Busy::new();
+                        run(b.as_mut(), cmd)
+                    };
                     if rtx.send(r).is_err() {
                         break;
                     }
@@ -98,7 +129,15 @@ fn run(b: &mut dyn Backend, cmd: Cmd) -> Reply {
     match cmd {
         Cmd::Exec { id, sql, fetch, rows } => {
             let t = Instant::now();
-            let result = b.execute(&sql, fetch, &mut |e| rows.send(e).is_ok()).map_err(|e| format!("{e:#}"));
+            // Idle while the UI holds the next batch back (fetch-on-scroll).
+            let result = b
+                .execute(&sql, fetch, &mut |e| {
+                    BUSY.fetch_sub(1, Ordering::Relaxed);
+                    let ok = rows.send(e).is_ok();
+                    BUSY.fetch_add(1, Ordering::Relaxed);
+                    ok
+                })
+                .map_err(|e| format!("{e:#}"));
             let output = b.take_output().unwrap_or_default();
             Reply::Done { id, result, output, elapsed: t.elapsed() }
         }
