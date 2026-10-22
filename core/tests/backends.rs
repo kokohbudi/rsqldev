@@ -237,6 +237,31 @@ fn duckdb() {
     let _ = std::fs::remove_file(f);
 }
 
+/// SSH tunnel through the compose `ssh` bastion to the postgres service (system ssh client).
+#[test]
+#[ignore]
+fn ssh_tunnel() {
+    let dir = std::env::temp_dir().join(format!("rsq-ssh-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("id");
+    let ok = |c: &mut std::process::Command| assert!(c.status().unwrap().success(), "{c:?}");
+    ok(std::process::Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key));
+    let public = std::fs::read_to_string(dir.join("id.pub")).unwrap();
+    let compose = concat!(env!("CARGO_MANIFEST_DIR"), "/../docker-compose.test.yml");
+    ok(std::process::Command::new("docker").args(["compose", "-f", compose, "exec", "-T", "ssh", "sh", "-c"]).arg(format!("echo '{}' >> /config/.ssh/authorized_keys", public.trim())));
+    // The container's host key changes when it is recreated: forget the old one (accept-new re-learns it).
+    let _ = std::process::Command::new("ssh-keygen").args(["-R", "[127.0.0.1]:12222"]).output();
+    let mut c = cfg("postgres", 5432, "postgres", "postgres");
+    c.host = "postgres".into(); // resolved by the bastion, not by us
+    c.options.insert("ssh".into(), "rsq@127.0.0.1:12222".into());
+    c.options.insert("ssh_key".into(), key.display().to_string());
+    let mut b = backend::connect(&c, "rsqldev", &Prefs::default()).unwrap_or_else(|e| panic!("{e:#}"));
+    let r = query_all(b.as_mut(), "SELECT inet_server_port()").unwrap().1;
+    assert_eq!(r[0][0].as_deref(), Some("5432"));
+    drop(b);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Also exercises the driver downloader: installs Instant Client on first run.
 #[test]
 #[ignore]

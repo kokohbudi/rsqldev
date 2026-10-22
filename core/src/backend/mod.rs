@@ -7,6 +7,7 @@ mod mysql;
 mod oracle;
 mod postgres;
 mod sqlite;
+mod tunnel;
 
 use crate::config::{ConnConfig, Prefs};
 use crate::registry::{self, Kind};
@@ -36,6 +37,18 @@ pub fn client_dir(driver_id: &str, prefs: &Prefs) -> Option<PathBuf> {
 
 pub fn connect(cfg: &ConnConfig, password: &str, prefs: &Prefs) -> Result<Box<dyn Backend>> {
     let drv = registry::find(&cfg.driver).ok_or_else(|| anyhow!("unknown driver '{}'", cfg.driver))?;
+    // SSH tunnel: connect to a forwarded local port instead of the database host.
+    let ssh = opt(cfg, drv, "ssh").filter(|s| !s.trim().is_empty() && !drv.backend.is_file());
+    if let Some(spec) = ssh {
+        if drv.backend == Kind::Oracle && matches!(cfg.conn_type.as_str(), "tns" | "custom") {
+            anyhow::bail!("SSH tunnel needs the Basic connection type (host and port)");
+        }
+        let target = if drv.backend == Kind::Oracle { cfg.port.unwrap_or(1521) } else { port(cfg, drv) };
+        let t = tunnel::Tunnel::open(spec, opt(cfg, drv, "ssh_key"), &cfg.host, target)?;
+        let local = ConnConfig { host: "127.0.0.1".into(), port: Some(t.port), options: cfg.options.iter().filter(|(k, _)| *k != "ssh").map(|(k, v)| (k.clone(), v.clone())).collect(), ..cfg.clone() };
+        let inner = connect(&local, password, prefs)?;
+        return Ok(Box::new(tunnel::Tunneled { inner, _tunnel: t }));
+    }
     let mut b: Box<dyn Backend> = match drv.backend {
         Kind::Oracle => {
             let dir = client_dir(&drv.id, prefs).ok_or_else(|| DriverMissing(drv.id.clone()))?;

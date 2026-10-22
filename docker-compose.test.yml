@@ -21,3 +21,8 @@ services:
     image: clickhouse/clickhouse-server:25.8
     environment: { CLICKHOUSE_PASSWORD: rsqldev }
     ports: ["18123:8123"]
+  # SSH bastion for the tunnel test (the test installs a throwaway key via docker exec).
+  ssh:
+    image: lscr.io/linuxserver/openssh-server:latest
+    environment: { USER_NAME: rsq, DOCKER_MODS: "linuxserver/mods:openssh-server-ssh-tunnel" }
+    ports: ["12222:2222"]
