@@ -25,12 +25,22 @@ fn secret() -> &'static str {
     })
 }
 
-fn dir() -> PathBuf {
-    std::env::temp_dir().join(format!("rsqldev-lobs-{}", std::process::id()))
+/// This run's spill folder: random name, owner-only (0700), created fresh. An existing folder
+/// is never reused, so another user on a shared /tmp cannot pre-create or watch it.
+fn dir() -> Option<&'static PathBuf> {
+    static D: OnceLock<Option<PathBuf>> = OnceLock::new();
+    D.get_or_init(|| {
+        let p = std::env::temp_dir().join(format!("rsqldev-lobs-{}", secret()));
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        b.create(&p).ok().map(|_| p)
+    })
+    .as_ref()
 }
 
-fn path(id: u64) -> PathBuf {
-    dir().join(format!("{id}.bin"))
+fn path(id: u64) -> Option<PathBuf> {
+    dir().map(|d| d.join(format!("{id}.bin")))
 }
 
 /// `5.2 MB` style size.
@@ -46,8 +56,11 @@ pub fn size(n: usize) -> String {
 /// Spill raw bytes; `kind` labels the marker (BLOB, CLOB, TEXT).
 pub fn spill(bytes: &[u8], kind: &str) -> Option<String> {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    std::fs::create_dir_all(dir()).ok()?;
-    std::fs::write(path(id), bytes).ok()?;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    std::io::Write::write_all(&mut o.open(path(id)?).ok()?, bytes).ok()?;
     // Size comes free here: the bytes are already in hand.
     Some(format!("{TAG}{}:{id}{TAG}({kind} {})", secret(), size(bytes.len())))
 }
@@ -111,7 +124,7 @@ pub fn display(s: &str) -> &str {
 
 /// Bytes of a spilled cell.
 pub fn bytes(s: &str) -> Option<Vec<u8>> {
-    std::fs::read(path(id(s)?)).ok()
+    std::fs::read(path(id(s)?)?).ok()
 }
 
 /// Full value as text for exports: spilled BLOBs as `0x` hex, spilled text as itself.
@@ -125,19 +138,19 @@ pub fn expand(s: &str) -> Cow<'_, str> {
 
 /// Delete a spilled cell's file (grid cleared or closed).
 pub fn release(s: &str) {
-    if let Some(id) = id(s) {
-        let _ = std::fs::remove_file(path(id));
+    if let Some(p) = id(s).and_then(path) {
+        let _ = std::fs::remove_file(p);
     }
 }
 
 /// Remove spill folders left by earlier runs (crashes) after a day.
 pub fn cleanup_stale() {
     let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return };
-    let mine = dir();
     for e in rd.flatten() {
         let p = e.path();
         let old = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| SystemTime::now().duration_since(t).unwrap_or_default() > Duration::from_secs(86_400));
-        if p != mine && old && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("rsqldev-lobs-")) {
+        // A day old: never this run's folder; other users' folders fail to delete (not ours).
+        if old && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("rsqldev-lobs-")) {
             let _ = std::fs::remove_dir_all(p);
         }
     }
@@ -145,7 +158,9 @@ pub fn cleanup_stale() {
 
 /// Remove this run's spill folder (on exit).
 pub fn cleanup_mine() {
-    let _ = std::fs::remove_dir_all(dir());
+    if let Some(d) = dir() {
+        let _ = std::fs::remove_dir_all(d);
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +186,11 @@ mod tests {
         release(&cell);
         assert!(bytes(&cell).is_none());
         assert_eq!(display("plain"), "plain");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(dir().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        }
         // Data that imitates a marker is just data.
         let fake = format!("{TAG}0000000000000000:1{TAG}(BLOB 1 KB)");
         assert!(!is_lob(&fake) && bytes(&fake).is_none() && display(&fake) == fake);
