@@ -196,7 +196,12 @@ fn mysql() {
 #[test]
 #[ignore]
 fn mssql() {
-    exercise(cfg("sqlserver", 11433, "master", "sa"), "Rsqldev#2026", "dbo");
+    // Secure default: the container's self-signed certificate is rejected without trust_cert.
+    let e = backend::connect(&cfg("sqlserver", 11433, "master", "sa"), "Rsqldev#2026", &Prefs::default()).err().expect("self-signed cert must be rejected");
+    eprintln!("expected TLS rejection: {e:#}");
+    let mut c = cfg("sqlserver", 11433, "master", "sa");
+    c.options.insert("trust_cert".into(), "true".into()); // container uses a self-signed certificate
+    exercise(c, "Rsqldev#2026", "dbo");
 }
 
 #[test]

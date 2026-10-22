@@ -22,7 +22,11 @@ static SEQ: AtomicU64 = AtomicU64::new(1);
 
 impl Ch {
     pub fn connect(cfg: &ConnConfig, pw: &str, drv: &Driver) -> Result<Self> {
-        let scheme = if opt(cfg, drv, "https") == Some("true") { "https" } else { "http" };
+        let https = opt(cfg, drv, "https") == Some("true");
+        if !https && !pw.is_empty() && !loopback(&cfg.host) && opt(cfg, drv, "allow_http") != Some("true") {
+            bail!("refusing to send the password unencrypted over HTTP to {}: set https=true (port 8443), or allow_http=true to accept the risk", cfg.host);
+        }
+        let scheme = if https { "https" } else { "http" };
         let db = if cfg.database.is_empty() { "default" } else { &cfg.database };
         let ch = Ch {
             http: Client::builder().timeout(None).build()?,
@@ -48,6 +52,10 @@ impl Ch {
         }
         Ok(r)
     }
+}
+
+fn loopback(host: &str) -> bool {
+    host.is_empty() || host.eq_ignore_ascii_case("localhost") || host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// TSV field unescape; `\N` is NULL.
@@ -144,5 +152,11 @@ mod tests {
     fn tsv_field() {
         assert_eq!(super::field("\\N"), None);
         assert_eq!(super::field("a\\tb\\\\c").as_deref(), Some("a\tb\\c"));
+    }
+
+    #[test]
+    fn loopback_hosts() {
+        assert!(super::loopback("localhost") && super::loopback("127.0.0.1") && super::loopback("[::1]"));
+        assert!(!super::loopback("db.example.com") && !super::loopback("10.0.0.5"));
     }
 }

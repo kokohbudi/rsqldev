@@ -25,9 +25,10 @@ pub struct Pg {
 impl Pg {
     pub fn connect(cfg: &ConnConfig, pw: &str, drv: &Driver) -> Result<Self> {
         let mode = opt(cfg, drv, "sslmode").unwrap_or("prefer");
-        let verify = mode == "verify-full";
+        // libpq semantics: require/prefer encrypt only, verify-ca checks the chain, verify-full the host too.
+        let verify_ca = mode == "verify-ca" || mode == "verify-full";
         let tls = MakeTlsConnector::new(
-            native_tls::TlsConnector::builder().danger_accept_invalid_certs(!verify).danger_accept_invalid_hostnames(!verify).build()?,
+            native_tls::TlsConnector::builder().danger_accept_invalid_certs(!verify_ca).danger_accept_invalid_hostnames(mode != "verify-full").build()?,
         );
         let notices = Arc::new(Mutex::new(Vec::new()));
         let n2 = notices.clone();

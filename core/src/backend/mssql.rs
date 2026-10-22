@@ -36,12 +36,14 @@ impl Ms {
         }
         #[cfg(not(windows))]
         config.authentication(AuthMethod::sql_server(&cfg.user, pw));
+        // Encrypted and certificate-checked unless the connection opts out (self-signed dev servers:
+        // trust_cert=true; encrypt=login encrypts the login only, encrypt=false not at all).
         config.encryption(match opt(cfg, drv, "encrypt") {
-            Some("true") => EncryptionLevel::Required,
             Some("false") => EncryptionLevel::NotSupported,
-            _ => EncryptionLevel::Off,
+            Some("login") => EncryptionLevel::Off,
+            _ => EncryptionLevel::Required,
         });
-        if opt(cfg, drv, "trust_cert") != Some("false") {
+        if opt(cfg, drv, "trust_cert") == Some("true") {
             config.trust_cert();
         }
         config.application_name("rsqldev");
@@ -59,6 +61,13 @@ impl Ms {
                     Ok::<_, anyhow::Error>(Client::connect(config, tcp.compat_write()).await?)
                 }
                 r => Ok(r?),
+            }
+        })
+        .map_err(|e: anyhow::Error| {
+            if format!("{e:#}").contains("certificate") {
+                e.context("server certificate not trusted: add trust_cert=true to the connection Options for a self-signed certificate (dev servers)")
+            } else {
+                e
             }
         })?;
         Ok(Ms { rt, c })

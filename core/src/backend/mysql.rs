@@ -22,8 +22,10 @@ impl My {
             .user(Some(cfg.user.clone()))
             .pass(Some(pw.to_owned()))
             .db_name((!cfg.database.is_empty()).then(|| cfg.database.clone()));
+        // With ssl=true the certificate is checked; verify=false trusts any (self-signed) certificate.
         if opt(cfg, drv, "ssl") == Some("true") {
-            b = b.ssl_opts(Some(SslOpts::default().with_danger_accept_invalid_certs(opt(cfg, drv, "verify") != Some("true"))));
+            let trust_any = opt(cfg, drv, "verify") == Some("false");
+            b = b.ssl_opts(Some(SslOpts::default().with_danger_accept_invalid_certs(trust_any).with_danger_skip_domain_validation(trust_any)));
         }
         let opts = Opts::from(b);
         Ok(My { c: Conn::new(opts.clone())?, opts })

@@ -402,7 +402,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let browse = Button::builder(&dlg).with_label("Browse…").build();
     let tns = text();
     let opts = text();
-    opts.set_tooltip("Driver options, e.g. sslmode=require; encrypt=true; trust_cert=false; tns_admin=/path; https=true");
+    opts.set_tooltip("Driver options, e.g. sslmode=verify-full; trust_cert=true (SQL Server self-signed); ssl=true; verify=false (MySQL); https=true; allow_http=true (ClickHouse); tns_admin=/path");
     let status = StaticText::builder(&dlg).with_label("Status :").build();
 
     let top = FlexGridSizer::builder(0, 2).with_vgap(6).with_hgap(8).build();
