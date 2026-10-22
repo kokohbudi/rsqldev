@@ -277,6 +277,23 @@ impl Worksheet {
         self.me.clone()
     }
 
+    /// Format the selection (or everything) as one undo step.
+    pub fn format_sql(&self) {
+        let e = self.editor;
+        let (mut a, mut b) = (e.get_selection_start(), e.get_selection_end());
+        if a == b {
+            (a, b) = (0, e.get_length());
+        }
+        let text = e.get_text();
+        let Some(part) = text.get(a as usize..b as usize) else { return };
+        let out = rsqldev_core::format::script(part, self.kind());
+        if out != part {
+            e.set_target_start(a);
+            e.set_target_end(b);
+            e.replace_target(&out);
+        }
+    }
+
     pub fn conn(&self) -> ConnRef {
         self.conn.borrow().clone()
     }

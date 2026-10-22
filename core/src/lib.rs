@@ -7,6 +7,7 @@ pub mod dialect;
 pub mod dml;
 pub mod download;
 pub mod export;
+pub mod format;
 pub mod registry;
 pub mod script;
 pub mod worker;

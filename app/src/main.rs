@@ -71,6 +71,7 @@ const ID_FIND: i32 = ID_HIGHEST + 24;
 const ID_REPLACE: i32 = ID_HIGHEST + 25;
 const ID_FIND_NEXT: i32 = ID_HIGHEST + 26;
 const ID_FIND_PREV: i32 = ID_HIGHEST + 27;
+const ID_FORMAT: i32 = ID_HIGHEST + 28;
 
 enum Page {
     Sheet(SheetRef),
@@ -577,6 +578,11 @@ impl App {
                     }
                 }
             }
+            ID_FORMAT => {
+                if let Some(s) = sheet {
+                    s.format_sql();
+                }
+            }
             ID_COMPLETE => {
                 if let Some(s) = sheet {
                     complete::show(s.editor, &s.conn(), true);
@@ -687,6 +693,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_SELECTALL, "Select &All\tCtrl+A", "")
         .append_separator()
         .append_item(ID_COMPLETE, "Completion &Insight\tRawCtrl+Space", "Complete keywords, tables and columns")
+        .append_item(ID_FORMAT, "F&ormat SQL\tCtrl+F7", "Format the selection, or the whole worksheet")
         .append_separator()
         .append_item(ID_FIND, "&Find…\tCtrl+F", "")
         .append_item(ID_REPLACE, "R&eplace…\tCtrl+R", "")
@@ -773,6 +780,12 @@ const SHORTCUTS: &str = "Worksheet
   SQL History              F8
   Clear                    Ctrl/Cmd+D
   Unshared Worksheet       Ctrl/Cmd+Shift+N
+
+Editor
+  Completion Insight       Ctrl+Space (also after typing alias.)
+  Format SQL               Ctrl/Cmd+F7
+  Find / Replace           Ctrl/Cmd+F / Ctrl/Cmd+R
+  Find Next / Previous     F3 / Shift+F3
 
 Files and tabs
   New Connection           Ctrl/Cmd+Shift+C
