@@ -144,6 +144,9 @@ impl App {
         if n > 500 {
             h.drain(..n - 500);
         }
+        drop(h);
+        // Saved at once: a crash or forced quit must not lose the history.
+        self.save_history();
     }
 
     pub fn history(&self) -> Vec<String> {
@@ -750,7 +753,7 @@ fn activity_bar(sb: StatusBar) {
         if !gauge.is_valid() {
             return false;
         }
-        let busy = rsqldev_core::worker::busy() > 0;
+        let busy = rsqldev_core::worker::busy() > 0 || conn::meta_pending() > 0;
         match (busy, since) {
             (true, None) => since = Some(std::time::Instant::now()),
             (false, Some(_)) => {
@@ -760,8 +763,8 @@ fn activity_bar(sb: StatusBar) {
             }
             _ => {}
         }
-        // Skip sub-200 ms blips (tree expands, metadata) so the bar does not flicker.
-        let Some(t) = since.filter(|t| t.elapsed().as_millis() >= 200) else { return true };
+        // Shown at once: a click that waits on the database must never look like a hang.
+        let Some(t) = since else { return true };
         let r = sb.get_field_rect(F_BAR);
         gauge.set_size_with_pos(r.x + 4, r.y + 2, r.width - 8, r.height - 4);
         gauge.show(true);

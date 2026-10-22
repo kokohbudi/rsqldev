@@ -661,7 +661,7 @@ impl Worksheet {
     pub fn history(&self) {
         let h = crate::app().history();
         if h.is_empty() {
-            return;
+            return crate::ui::info(&self.panel, "SQL History is empty: statements you run are listed here.");
         }
         let labels: Vec<String> = h.iter().rev().map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(120).collect()).collect();
         let refs: Vec<&str> = labels.iter().map(String::as_str).collect();

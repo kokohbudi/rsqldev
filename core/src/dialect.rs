@@ -79,14 +79,21 @@ pub fn sessions_sql(db: Db) -> Option<Vec<&'static str>> {
 }
 
 /// Statement that ends the session in `row` (as returned by [`sessions_sql`]). Ids must be
-/// plain numbers (ClickHouse: a query id literal), so a grid value cannot inject SQL.
+/// plain numbers (ClickHouse: a UUID-like query id), so a grid value cannot inject SQL.
 pub fn kill_sql(db: Db, row: &[Option<String>]) -> Option<String> {
     let num = |i: usize| row.get(i)?.as_deref()?.trim().parse::<u64>().ok();
     Some(match db {
         Db::Oracle => format!("ALTER SYSTEM KILL SESSION '{},{}' IMMEDIATE", num(0)?, num(1)?),
         Db::Postgres => format!("SELECT pg_terminate_backend({})", num(0)?),
         Db::Mysql | Db::Mssql => format!("KILL {}", num(0)?),
-        Db::Clickhouse => format!("KILL QUERY WHERE query_id = '{}'", lit(row.first()?.as_deref()?)),
+        // ClickHouse strings take backslash escapes: accept only id characters, no escaping games.
+        Db::Clickhouse => {
+            let id = row.first()?.as_deref()?.trim();
+            if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                return None;
+            }
+            format!("KILL QUERY WHERE query_id = '{id}'")
+        }
         Db::Sqlite | Db::Duckdb => return None,
     })
 }
@@ -582,7 +589,8 @@ mod tests {
         assert_eq!(kill_sql(Db::Oracle, &r(&["12", "345"])).unwrap(), "ALTER SYSTEM KILL SESSION '12,345' IMMEDIATE");
         assert_eq!(kill_sql(Db::Postgres, &r(&["99"])).unwrap(), "SELECT pg_terminate_backend(99)");
         assert!(kill_sql(Db::Mysql, &r(&["1; DROP TABLE x"])).is_none(), "non-numeric id refused");
-        assert_eq!(kill_sql(Db::Clickhouse, &r(&["a'b"])).unwrap(), "KILL QUERY WHERE query_id = 'a''b'");
+        assert_eq!(kill_sql(Db::Clickhouse, &r(&["5a1c-9f_0"])).unwrap(), "KILL QUERY WHERE query_id = '5a1c-9f_0'");
+        assert!(kill_sql(Db::Clickhouse, &r(&["a\\' OR 1=1 --"])).is_none());
     }
 
     #[test]
