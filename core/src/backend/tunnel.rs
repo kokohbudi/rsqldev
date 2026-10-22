@@ -26,6 +26,10 @@ impl Tunnel {
     pub fn open(spec: &str, key: Option<&str>, host: &str, port: u16) -> Result<Tunnel> {
         let local = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
         let (dest, ssh_port) = target(spec.trim());
+        // An option-looking destination (`-oProxyCommand=...`) would run commands: refuse it.
+        if dest.is_empty() || dest.starts_with('-') || key.is_some_and(|k| k.starts_with('-')) || host.starts_with('-') {
+            bail!("invalid ssh option: expected ssh=user@host[:port]");
+        }
         let mut cmd = Command::new("ssh");
         cmd.args(["-N", "-L", &format!("127.0.0.1:{local}:{host}:{port}")])
             .args(["-o", "ExitOnForwardFailure=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=30"]);
@@ -35,7 +39,7 @@ impl Tunnel {
         if let Some(k) = key.filter(|k| !k.is_empty()) {
             cmd.args(["-i", k]);
         }
-        cmd.arg(dest).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        cmd.arg("--").arg(dest).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -109,5 +113,7 @@ mod tests {
     fn ssh_target() {
         assert_eq!(super::target("me@bastion:2222"), ("me@bastion", Some("2222")));
         assert_eq!(super::target("me@bastion"), ("me@bastion", None));
+        let e = super::Tunnel::open("-oProxyCommand=touch /tmp/x", None, "db", 5432).err().unwrap();
+        assert!(e.to_string().contains("invalid ssh option"));
     }
 }
