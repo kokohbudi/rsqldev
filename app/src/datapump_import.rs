@@ -525,13 +525,21 @@ fn ended(conn: &ConnRef, env: &Env, spec: &ImportSpec, uploaded: bool) {
     if spec.sql_file.is_empty() {
         return offer_delete(&c2, &e2, &s2, uploaded);
     }
-    let to = std::env::temp_dir().join("rsqldev-datapump");
-    let _ = std::fs::create_dir_all(&to);
+    let to = match rsqldev_core::lob::private_dir("rsqldev-datapump") {
+        Ok(d) => d,
+        Err(e) => {
+            ui::error(&crate::app().frame, &format!("Cannot create a temporary folder: {e}"));
+            return offer_delete(&c2, &e2, &s2, uploaded);
+        }
+    };
+    let cleanup = to.clone();
     crate::transfer::download(conn, spec.directory.clone(), vec![spec.sql_file.clone()], to, move |r| {
-        match r.and_then(|v| {
+        let text = r.and_then(|v| {
             let p = v.into_iter().next().ok_or("No file came back.")?;
             std::fs::read(&p).map(|b| String::from_utf8_lossy(&b).to_string()).map_err(|e| format!("Cannot read {}: {e}", p.display()))
-        }) {
+        });
+        let _ = std::fs::remove_dir_all(&cleanup);
+        match text {
             Ok(sql) => {
                 let app = crate::app();
                 app.open_worksheet(c2.clone());

@@ -39,6 +39,29 @@ fn dir() -> Option<&'static PathBuf> {
     .as_ref()
 }
 
+/// A fresh private folder `<prefix>-<random hex>` under the temp dir: created with `DirBuilder::create`
+/// (never reused, never followed through a planted link), owner-only (0700) on unix.
+pub fn private_dir(prefix: &str) -> std::io::Result<PathBuf> {
+    use std::hash::{BuildHasher, Hasher};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let mut last = None;
+    for _ in 0..10 {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_nanos());
+        h.write_u64(N.fetch_add(1, Ordering::Relaxed));
+        let p = std::env::temp_dir().join(format!("{prefix}-{:016x}", h.finish()));
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        match b.create(&p) {
+            Ok(()) => return Ok(p),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free folder name")))
+}
+
 fn path(id: u64) -> Option<PathBuf> {
     dir().map(|d| d.join(format!("{id}.bin")))
 }
@@ -166,6 +189,20 @@ pub fn cleanup_mine() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_dirs_are_fresh_and_owner_only() {
+        let (a, b) = (private_dir("rsq-test").unwrap(), private_dir("rsq-test").unwrap());
+        assert_ne!(a, b);
+        assert!(a.is_dir() && b.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        let _ = std::fs::remove_dir_all(a);
+        let _ = std::fs::remove_dir_all(b);
+    }
 
     #[test]
     fn spill_round_trip() {

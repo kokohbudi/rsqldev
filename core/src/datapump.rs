@@ -327,6 +327,11 @@ pub fn job_running_sql(owner: &str, job: &str) -> String {
     )
 }
 
+/// Like `job_running_sql` but on the job name alone (names carry a timestamp), so a job of another user counts.
+pub fn job_running_any_sql(job: &str) -> String {
+    format!("SELECT state FROM dba_datapump_jobs WHERE job_name = {}", q(job))
+}
+
 /// Same check against `USER_DATAPUMP_JOBS`, for users who cannot read the DBA view.
 pub fn job_running_sql_user(job: &str) -> String {
     format!("SELECT state FROM user_datapump_jobs WHERE job_name = '{}'", lit(job))
@@ -611,6 +616,12 @@ mod tests {
         assert_eq!(all[2].conn, "dev-new");
         let t = toml::to_string(&Files { file: all.clone() }).unwrap();
         assert_eq!(toml::from_str::<Files>(&t).unwrap().file, all);
+    }
+
+    #[test]
+    fn job_running_any_sql_matches_name_only() {
+        let q = job_running_any_sql("A'B");
+        assert!(q.contains("dba_datapump_jobs") && q.contains("'A''B'") && !q.contains("owner_name"));
     }
 
     #[test]

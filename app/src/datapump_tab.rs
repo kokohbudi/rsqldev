@@ -48,8 +48,17 @@ pub struct DataPumpTab {
     env: RefCell<Option<(String, String)>>,
     disp: RefCell<Vec<Disp>>,
     busy: StdCell<bool>,
+    jobs_busy: StdCell<bool>,
+    last_done: StdCell<Instant>,
+    /// Selected row keys: (owner, job) and (directory, file); they survive a refresh.
+    jkey: RefCell<Option<Key>>,
+    fkey: RefCell<Option<Key>>,
+    restoring: StdCell<bool>,
     me: Weak<DataPumpTab>,
 }
+
+const JOB_KEY: (&str, &str) = ("owner", "job_name");
+const FILE_KEY: (&str, &str) = ("directory", "file");
 
 fn col(n: &str) -> Column {
     Column { name: n.into(), type_name: String::new(), numeric: false }
@@ -75,11 +84,24 @@ fn kind_label(k: FileKind) -> &'static str {
     }
 }
 
-fn cell(g: &ResultGrid, name: &str) -> Option<String> {
+/// Cell `name` of grid row `row`.
+fn row_cell(g: &ResultGrid, row: usize, name: &str) -> Option<String> {
     let st = g.st.borrow();
-    let r = g.grid.get_grid_cursor_row();
     let i = st.cols.iter().position(|c| c.name.eq_ignore_ascii_case(name))?;
-    st.rows.get(usize::try_from(r).ok()?)?.cur.get(i).cloned().flatten()
+    st.rows.get(row)?.cur.get(i).cloned().flatten()
+}
+
+type Key = (String, String);
+
+/// Key (two columns) of grid row `row`.
+fn row_key(g: &ResultGrid, row: usize, c: (&str, &str)) -> Option<Key> {
+    Some((row_cell(g, row, c.0)?, row_cell(g, row, c.1)?))
+}
+
+/// Index of the grid row with this key.
+fn find_row(g: &ResultGrid, key: &Key, c: (&str, &str)) -> Option<usize> {
+    let n = g.st.borrow().rows.len();
+    (0..n).find(|&i| row_key(g, i, c).as_ref() == Some(key))
 }
 
 fn lines_grid(g: &ResultGrid, title: &str, lines: Vec<String>) {
@@ -178,6 +200,11 @@ impl DataPumpTab {
             env: RefCell::new(None),
             disp: RefCell::new(vec![]),
             busy: StdCell::new(false),
+            jobs_busy: StdCell::new(false),
+            last_done: StdCell::new(Instant::now()),
+            jkey: RefCell::new(None),
+            fkey: RefCell::new(None),
+            restoring: StdCell::new(false),
             me: me.clone(),
         });
         let acts: [(Button, fn(&DataPumpTab)); 9] = [
@@ -212,11 +239,25 @@ impl DataPumpTab {
             }
         });
         let w = v.me.clone();
-        let mut last = Instant::now();
+        v.jobs.grid.on_select_cell(move |e| {
+            if let (Some(v), Ok(r)) = (w.upgrade(), usize::try_from(e.get_row())) {
+                if !v.restoring.get() {
+                    *v.jkey.borrow_mut() = row_key(&v.jobs, r, JOB_KEY);
+                }
+            }
+        });
+        let w = v.me.clone();
+        v.files.grid.on_select_cell(move |e| {
+            if let (Some(v), Ok(r)) = (w.upgrade(), usize::try_from(e.get_row())) {
+                if !v.restoring.get() {
+                    *v.fkey.borrow_mut() = row_key(&v.files, r, FILE_KEY);
+                }
+            }
+        });
+        let w = v.me.clone();
         crate::hub::every_tick(move || {
             let Some(v) = w.upgrade() else { return false };
-            if v.auto.get_value() && last.elapsed() >= Duration::from_secs(5) {
-                last = Instant::now();
+            if v.auto.get_value() && !v.jobs_busy.get() && !v.busy.get() && v.last_done.get().elapsed() >= Duration::from_secs(5) {
                 v.refresh();
             }
             true
@@ -258,7 +299,23 @@ impl DataPumpTab {
 
     // ---- jobs ----
 
+    /// Show rows and put the cursor back on the row with the remembered key; forget the key when it is gone.
+    fn set_keyed(&self, g: &ResultGrid, key: &RefCell<Option<Key>>, kc: (&str, &str), cols: Vec<Column>, rows: Vec<Vec<Cell>>) {
+        self.restoring.set(true);
+        g.set(cols, rows);
+        let k = key.borrow().clone();
+        match k.and_then(|k| find_row(g, &k, kc)) {
+            Some(i) => g.grid.set_grid_cursor(i as i32, 0),
+            None => *key.borrow_mut() = None,
+        }
+        self.restoring.set(false);
+    }
+
     pub fn refresh_jobs(&self) {
+        if self.jobs_busy.get() {
+            return;
+        }
+        self.jobs_busy.set(true);
         self.jstatus.set_label("Refreshing…");
         let qs = vec![datapump::jobs_sql(true), datapump::jobs_sql(false), datapump::jobs_sql_basic(true), datapump::jobs_sql_basic(false)];
         self.run_jobs(qs, 0);
@@ -272,11 +329,17 @@ impl DataPumpTab {
             match r {
                 Ok(r) => {
                     let n = r.rows.len();
-                    v.jobs.set(r.cols, r.rows);
+                    v.jobs_busy.set(false);
+                    v.last_done.set(Instant::now());
+                    v.set_keyed(&v.jobs, &v.jkey, JOB_KEY, r.cols, r.rows);
                     v.jstatus.set_label(&format!("{n} job(s) · refreshed {}", chrono::Local::now().format("%H:%M:%S")));
                 }
                 Err(_) if i + 1 < qs.len() => v.run_jobs(qs, i + 1),
-                Err(e) => v.jobs_failed(&e),
+                Err(e) => {
+                    v.jobs_busy.set(false);
+                    v.last_done.set(Instant::now());
+                    v.jobs_failed(&e)
+                }
             }
         });
     }
@@ -288,26 +351,28 @@ impl DataPumpTab {
         if e.contains("ORA-00942") || e.contains("ORA-01031") {
             lines.push(format!("{user} may not read the Data Pump job views. Ask a DBA for:"));
             lines.push(format!("  GRANT SELECT ON SYS.DBA_DATAPUMP_JOBS TO {user};   (or the SELECT_CATALOG_ROLE)"));
-        } else if let Some(h) = datapump::hint(e, &user, "DATA_PUMP_DIR") {
+        } else if let Some(h) = datapump::hint(e, &user, "") {
             lines.push(h);
         }
         lines_grid(&self.jobs, "Data Pump jobs are not available", lines);
         self.jstatus.set_label("Could not list jobs (see below)");
     }
 
-    /// (owner, job, state) under the jobs cursor.
+    /// (owner, job, state) of the selected job row, by its remembered key.
     fn job_sel(&self) -> Option<(String, String, String)> {
-        let job = cell(&self.jobs, "job_name");
-        let Some(job) = job else {
-            ui::error(&self.panel, "Select a job row first.");
+        let key = self.jkey.borrow().clone();
+        let Some(row) = key.as_ref().and_then(|k| find_row(&self.jobs, k, JOB_KEY)) else {
+            *self.jkey.borrow_mut() = None;
+            ui::error(&self.panel, "Select a row first.");
             return None;
         };
-        let owner = cell(&self.jobs, "owner").unwrap_or_else(|| self.user());
-        Some((owner, job, cell(&self.jobs, "state").unwrap_or_default()))
+        let (owner, job) = key?;
+        Some((owner, job, row_cell(&self.jobs, row, "state").unwrap_or_default()))
     }
 
-    fn report(&self, what: &str, e: &str) {
-        let msg = match datapump::hint(e, &self.user(), "DATA_PUMP_DIR") {
+    /// Error text with the GRANT hint for `dir` (empty when no directory is involved).
+    fn report(&self, what: &str, e: &str, dir: &str) {
+        let msg = match datapump::hint(e, &self.user(), dir) {
             Some(h) => format!("{what}\n\n{e}\n\n{h}"),
             None => format!("{what}\n\n{e}"),
         };
@@ -320,22 +385,24 @@ impl DataPumpTab {
             let Some(v) = w.upgrade() else { return };
             match r {
                 Ok(_) => v.refresh_jobs(),
-                Err(e) => v.report(&format!("{what} failed."), &e),
+                Err(e) => v.report(&format!("{what} failed."), &e, ""),
             }
         });
     }
 
     fn stop(&self) {
         let Some((owner, job, _)) = self.job_sel() else { return };
-        if ui::confirm(&self.panel, &format!("Stop job {owner}.{job}?\n\nThe master table stays, so Resume can continue it.")) {
-            self.run_block(format!("Stop of {job}"), datapump::stop_block(&owner, &job, false));
+        let sql = datapump::stop_block(&owner, &job, false);
+        if ui::confirm(&self.panel, &format!("Stop job {owner}.{job}?\n\nThe master table stays, so Resume can continue it.\n\n{sql}")) {
+            self.run_block(format!("Stop of {job}"), sql);
         }
     }
 
     fn kill(&self) {
         let Some((owner, job, _)) = self.job_sel() else { return };
-        if ui::confirm(&self.panel, &format!("Kill job {owner}.{job}?\n\nThe job is stopped and its master table dropped: it cannot be resumed.")) {
-            self.run_block(format!("Kill of {job}"), datapump::stop_block(&owner, &job, true));
+        let sql = datapump::stop_block(&owner, &job, true);
+        if ui::confirm(&self.panel, &format!("Kill job {owner}.{job}?\n\nThe job is stopped and its master table dropped: it cannot be resumed.\n\n{sql}")) {
+            self.run_block(format!("Kill of {job}"), sql);
         }
     }
 
@@ -349,7 +416,10 @@ impl DataPumpTab {
                 _ => return ui::error(&self.panel, "Parallel degree must be a whole number, 1 or more."),
             },
         };
-        self.run_block(format!("Resume of {job}"), datapump::resume_block(&owner, &job, parallel));
+        let sql = datapump::resume_block(&owner, &job, parallel);
+        if ui::confirm(&self.panel, &format!("Resume job {owner}.{job}?\n\n{sql}")) {
+            self.run_block(format!("Resume of {job}"), sql);
+        }
     }
 
     fn cleanup(&self) {
@@ -453,6 +523,7 @@ impl DataPumpTab {
 
     fn probed(&self, p: Probe) {
         self.busy.set(false);
+        self.last_done.set(Instant::now());
         let rows: Vec<Vec<Cell>> = p
             .out
             .iter()
@@ -473,7 +544,7 @@ impl DataPumpTab {
             })
             .collect();
         let n = rows.len();
-        self.files.set(["Directory", "File", "Kind", "Job", "Created", "Exists", "Size"].iter().map(|c| col(c)).collect(), rows);
+        self.set_keyed(&self.files, &self.fkey, FILE_KEY, ["Directory", "File", "Kind", "Job", "Created", "Exists", "Size"].iter().map(|c| col(c)).collect(), rows);
         *self.disp.borrow_mut() = p.out;
         let when = chrono::Local::now().format("%H:%M:%S");
         match p.err {
@@ -487,15 +558,13 @@ impl DataPumpTab {
     }
 
     fn sel_disp(&self) -> Option<Disp> {
-        let (dir, file) = (cell(&self.files, "directory"), cell(&self.files, "file"));
-        let d = match (dir, file) {
-            (Some(d), Some(f)) => self.disp.borrow().iter().find(|x| x.dir == d && x.file == f).cloned(),
-            _ => None,
-        };
-        if d.is_none() {
-            ui::error(&self.panel, "Select a file row first.");
+        let key = self.fkey.borrow().clone();
+        let found = key.as_ref().filter(|k| find_row(&self.files, k, FILE_KEY).is_some()).and_then(|(d, f)| self.disp.borrow().iter().find(|x| &x.dir == d && &x.file == f).cloned());
+        if found.is_none() {
+            *self.fkey.borrow_mut() = None;
+            ui::error(&self.panel, "Select a row first.");
         }
-        d
+        found
     }
 
     /// Existing pieces of the selected record (a dump) or just the selected file.
@@ -525,8 +594,7 @@ impl DataPumpTab {
     /// Run `go` when the job is not running; refuse while it is, ask when the state cannot be read.
     fn check_not_running(&self, job: String, go: impl FnOnce(&DataPumpTab) + 'static) {
         let w = self.me.clone();
-        let user = self.user();
-        let (q1, q2) = (datapump::job_running_sql(&user, &job), datapump::job_running_sql_user(&job));
+        let (q1, q2) = (datapump::job_running_any_sql(&job), datapump::job_running_sql_user(&job));
         let decide = move |v: &DataPumpTab, rows: Vec<Vec<Cell>>, job: &str, go: Box<dyn FnOnce(&DataPumpTab)>| match rows.into_iter().next() {
             None => go(v),
             Some(row) => {
@@ -612,23 +680,25 @@ impl DataPumpTab {
         if !datapump::valid_name(&dir) || !datapump::valid_name(&file) {
             return ui::error(&self.panel, &format!("Invalid name: {dir} / {file}"));
         }
-        let tmp = std::env::temp_dir().join(format!("rsqldev-dp-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
+        let tmp = match rsqldev_core::lob::private_dir("rsqldev-dp") {
+            Ok(d) => d,
+            Err(e) => return ui::error(&self.panel, &format!("Cannot create a temporary folder: {e}")),
+        };
         let path = tmp.join(&file);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(transfer::part_path(&tmp, &file));
-        let title = file.clone();
+        let (title, cleanup, user, dir2) = (file.clone(), tmp.clone(), self.user(), dir.clone());
         transfer::download(&self.conn, dir, vec![file], tmp, move |r| {
             let app = crate::app();
-            match r {
-                Ok(_) => match std::fs::read(&path) {
-                    Ok(b) => {
-                        let _ = std::fs::remove_file(&path);
-                        show_text(&title, &String::from_utf8_lossy(&b));
-                    }
-                    Err(e) => ui::error(&app.frame, &format!("Cannot read {}: {e}", path.display())),
-                },
-                Err(e) => ui::error(&app.frame, &e),
+            let text = r.and_then(|_| std::fs::read(&path).map_err(|e| format!("Cannot read {}: {e}", path.display())));
+            let _ = std::fs::remove_dir_all(&cleanup);
+            match text {
+                Ok(b) => show_text(&title, &String::from_utf8_lossy(&b)),
+                Err(e) => {
+                    let e = match datapump::hint(&e, &user, &dir2) {
+                        Some(h) if !e.contains(&h) => format!("{e}\n\n{h}"),
+                        _ => e,
+                    };
+                    ui::error(&app.frame, &e)
+                }
             }
         });
     }
@@ -644,7 +714,14 @@ impl DataPumpTab {
             }
             return;
         }
-        if !ui::confirm(&self.panel, &format!("Delete from directory {}:\n\n{}\n\nThis cannot be undone.", d.dir, pieces.join("\n"))) {
+        let mut stmts = vec![];
+        for f in &pieces {
+            match datapump::delete_block(&d.dir, f) {
+                Ok(b) => stmts.push(b),
+                Err(e) => return ui::error(&self.panel, &e),
+            }
+        }
+        if !ui::confirm(&self.panel, &format!("Delete from directory {}:\n\n{}\n\nThis cannot be undone.", d.dir, stmts.join("\n"))) {
             return;
         }
         let mut q = pieces;
@@ -654,7 +731,11 @@ impl DataPumpTab {
 
     fn forget(&self, d: &Disp) {
         let mut all = datapump::load_files();
-        all.retain(|r| !(r.directory == d.dir && r.file == d.tmpl && r.job == d.job && (r.conn == self.conn_name || r.kind == d.kind)));
+        let db = self.env.borrow().as_ref().map(|e| e.0.clone()).unwrap_or_default();
+        all.retain(|r| {
+            let same_db = if db.is_empty() { r.conn == self.conn_name } else { r.db == db };
+            !(same_db && r.directory == d.dir && r.file == d.tmpl && r.job == d.job)
+        });
         let _ = datapump::save_files(&all);
     }
 
@@ -673,7 +754,7 @@ impl DataPumpTab {
             match r {
                 Ok(_) => v.delete_next(d, q),
                 Err(e) => {
-                    v.report(&format!("Delete of {f} failed."), &e);
+                    v.report(&format!("Delete of {f} failed."), &e, &d.dir);
                     v.refresh_files();
                 }
             }
