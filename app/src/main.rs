@@ -401,21 +401,9 @@ impl App {
     /// View ▸ Find DB Object: name search across all schemas, open the pick in the object viewer.
     fn find_object(&self, c: ConnRef) {
         let Some(pat) = ui::ask(&self.frame, "Object name contains (* = any):", "Find DB Object", "").filter(|p| !p.trim().is_empty()) else { return };
-        let (db, conn) = (c.borrow().kind, c.borrow().cfg.name.clone());
-        Conn::meta_query(&c, &dialect::find_sql(db, &pat), move |r| {
+        let conn = c.borrow().cfg.name.clone();
+        found_objects(&c, &pat.clone(), move |rows| {
             let app = app();
-            let rows: Vec<(String, String, &'static str)> = match r {
-                Ok(r) => r
-                    .rows
-                    .into_iter()
-                    .filter_map(|row| {
-                        let mut it = row.into_iter().map(Option::unwrap_or_default);
-                        let (owner, name, kind) = (it.next()?, it.next()?, it.next()?);
-                        Some((owner, name, dialect::kind_const(&kind)?))
-                    })
-                    .collect(),
-                Err(e) => return ui::error(&app.frame, &e),
-            };
             if rows.is_empty() {
                 return ui::info(&app.frame, &format!("No objects match \"{pat}\"."));
             }
@@ -425,6 +413,28 @@ impl App {
             if d.show_modal() == ID_OK && d.get_selection() >= 0 {
                 let (o, n, k) = &rows[d.get_selection() as usize];
                 app.open_object(&conn, o, k, n);
+            }
+        });
+    }
+
+    /// Ctrl/Cmd+Click in the editor: open `[owner.]name` in the object viewer. An exact name
+    /// match wins, in the given owner or else the current schema first.
+    pub fn goto_object(&self, c: ConnRef, ident: &str) {
+        let db = c.borrow().kind;
+        let (owner, name) = match ident.rsplit_once('.') {
+            Some((o, n)) => (Some(dialect::fold(db, o.trim_matches('"'))), dialect::fold(db, n.trim_matches('"'))),
+            None => (None, dialect::fold(db, ident.trim_matches('"'))),
+        };
+        let (conn, schema) = (c.borrow().cfg.name.clone(), c.borrow().schema.clone());
+        let n2 = name.clone();
+        found_objects(&c, &name, move |rows| {
+            // PostgreSQL functions are listed as name(args).
+            let base = |n: &str| n.split('(').next().unwrap_or(n).trim_matches('"').to_string();
+            let hits: Vec<_> = rows.into_iter().filter(|(o, n, _)| base(n).eq_ignore_ascii_case(&n2) && owner.as_ref().is_none_or(|w| w.eq_ignore_ascii_case(o))).collect();
+            let pick = hits.iter().find(|(o, _, _)| o.eq_ignore_ascii_case(&schema)).or(hits.first());
+            match pick {
+                Some((o, n, k)) => app().open_object(&conn, o, k, n),
+                None => app().status(0, &format!("No object named {n2}")),
             }
         });
     }
@@ -754,6 +764,26 @@ impl App {
         }
         true
     }
+}
+
+/// Run [`dialect::find_sql`] on the metadata session: (owner, name, kind) rows, or an error
+/// dialog.
+// ponytail: "contains" search capped at 200 rows; an exact-name lookup can fall outside it in
+// very large catalogs. Add an exact query per engine if that bites.
+fn found_objects(c: &ConnRef, pattern: &str, cb: impl FnOnce(Vec<(String, String, &'static str)>) + 'static) {
+    let db = c.borrow().kind;
+    Conn::meta_query(c, &dialect::find_sql(db, pattern), move |r| match r {
+        Ok(r) => cb(r
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                let mut it = row.into_iter().map(Option::unwrap_or_default);
+                let (owner, name, kind) = (it.next()?, it.next()?, it.next()?);
+                Some((owner, name, dialect::kind_const(&kind)?))
+            })
+            .collect()),
+        Err(e) => ui::error(&app().frame, &e),
+    });
 }
 
 /// Status bar activity: an animated bar and elapsed time whenever a connection is connecting,

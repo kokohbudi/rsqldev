@@ -250,6 +250,18 @@ impl Worksheet {
                 }
             }
         });
+        // Ctrl+Click (Cmd+Click on macOS): open the object under the caret.
+        let w = Rc::downgrade(&ws);
+        ws.editor.on_mouse_left_up(move |_| {
+            let Some(w) = w.upgrade() else { return };
+            if !wxdragon::utils::get_key_state(wxdragon::keycode::WXK_COMMAND) {
+                return;
+            }
+            let ident = ident_at(&w.editor.get_text(), w.editor.get_current_pos() as usize);
+            if !ident.is_empty() {
+                crate::app().goto_object(w.conn(), &ident);
+            }
+        });
         let w3 = Rc::downgrade(&ws);
         ws.results.st.borrow_mut().on_change = Some(Rc::new(move |st| {
             if let Some(w) = w3.upgrade() {
@@ -728,6 +740,16 @@ impl Worksheet {
             Err(e) => crate::ui::error(&self.panel, &format!("Save failed: {e}")),
         }
     }
+}
+
+/// `[owner.]name` around byte offset `pos` (letters, digits, `_ $ #`, dots, double quotes).
+fn ident_at(text: &str, pos: usize) -> String {
+    let ok = |c: char| c.is_alphanumeric() || "_$#.\"".contains(c);
+    let pos = pos.min(text.len());
+    let Some((a, b)) = text.get(..pos).zip(text.get(pos..)) else { return String::new() };
+    let start = a.char_indices().rev().take_while(|(_, c)| ok(*c)).last().map_or(pos, |(i, _)| i);
+    let end = pos + b.char_indices().find(|(_, c)| !ok(*c)).map_or(b.len(), |(i, _)| i);
+    text[start..end].trim_matches('.').to_string()
 }
 
 fn save_text(parent: &Panel, text: &str) {
