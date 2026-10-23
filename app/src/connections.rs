@@ -38,6 +38,10 @@ const M_TRUNCATE: i32 = 7110;
 const M_DDL: i32 = 7111;
 const M_COMPILE: i32 = 7112;
 const M_RENAME: i32 = 7113;
+const M_NEW_TABLE: i32 = 7114;
+const M_EDIT_TABLE: i32 = 7115;
+const M_NEW_INDEX: i32 = 7116;
+const M_REBUILD: i32 = 7117;
 
 impl Navigator {
     pub fn new(parent: &dyn WxWidget) -> Navigator {
@@ -276,14 +280,26 @@ impl Navigator {
             Node::Obj { kind, conn, .. } => {
                 b = b.append_item(M_OPEN, "Open", "").append_item(M_REFRESH, "Refresh", "").append_item(M_DDL, "Quick DDL ▸ Worksheet", "").append_separator();
                 if *kind == dialect::TABLE {
-                    b = b.append_item(M_COUNT, "Count Rows", "").append_item(M_RENAME, "Rename…", "").append_item(M_TRUNCATE, "Truncate…", "");
+                    b = b
+                        .append_item(M_EDIT_TABLE, "Edit Table…", "Columns, constraints and indexes, with the DDL shown first")
+                        .append_item(M_NEW_INDEX, "New Index…", "")
+                        .append_separator()
+                        .append_item(M_COUNT, "Count Rows", "")
+                        .append_item(M_RENAME, "Rename…", "")
+                        .append_item(M_TRUNCATE, "Truncate…", "");
                 }
-                let oracle = crate::app().open_conn(conn).is_some_and(|c| c.borrow().kind == Kind::Oracle);
+                let db = crate::app().open_conn(conn).map(|c| c.borrow().kind);
+                // Rebuild needs only the index name on these engines.
+                if *kind == dialect::INDEX && matches!(db, Some(Kind::Oracle | Kind::Postgres | Kind::Sqlite)) {
+                    b = b.append_item(M_REBUILD, "Rebuild", "");
+                }
+                let oracle = db == Some(Kind::Oracle);
                 if oracle && matches!(*kind, dialect::PACKAGE | dialect::PROCEDURE | dialect::FUNCTION | dialect::TRIGGER | dialect::VIEW | dialect::TYPE) {
                     b = b.append_item(M_COMPILE, "Compile", "");
                 }
                 b = b.append_item(M_DROP, "Drop…", "");
             }
+            Node::Kind { kind, .. } if *kind == dialect::TABLE => b = b.append_item(M_NEW_TABLE, "New Table…", "").append_separator().append_item(M_REFRESH, "Refresh", ""),
             Node::Kind { .. } | Node::Schemas { .. } | Node::Schema { .. } => b = b.append_item(M_REFRESH, "Refresh", ""),
             _ => return,
         }
@@ -316,6 +332,17 @@ impl Navigator {
             }
             (M_OPEN, Node::Obj { conn, owner, kind, name }) => app.open_object(&conn, &owner, kind, &name),
             (M_DDL, Node::Obj { conn, owner, kind, name }) => app.ddl_to_worksheet(&conn, &owner, kind, &name),
+            (M_NEW_TABLE, Node::Kind { conn, owner, .. }) => {
+                let Some(c) = app.open_conn(&conn) else { return };
+                let (nav, item) = (*self, i.clone());
+                crate::table_editor::create(c, owner, move || nav.refresh(&item));
+            }
+            (M_EDIT_TABLE | M_NEW_INDEX, Node::Obj { conn, owner, name, .. }) => {
+                let Some(c) = app.open_conn(&conn) else { return };
+                let (nav, item) = (*self, i.clone());
+                let start = if id == M_NEW_INDEX { crate::table_editor::Start::Indexes } else { crate::table_editor::Start::Columns };
+                crate::table_editor::edit(c, owner, name, start, move || nav.refresh(&item));
+            }
             (_, Node::Obj { conn, owner, kind, name }) => {
                 let Some(c) = app.open_conn(&conn) else { return };
                 let db = c.borrow().kind;
@@ -332,6 +359,10 @@ impl Navigator {
                         _ => format!("DROP {kind} {q}"),
                     },
                     M_COMPILE => format!("ALTER {} {q} COMPILE", if kind == dialect::PACKAGE { "PACKAGE" } else { kind }),
+                    M_REBUILD => match rsqldev_core::ddl::rebuild_index(db, &owner, "", &name) {
+                        Some(s) if crate::ui::confirm(&self.tree, &format!("Rebuild index {q}?\n\n{s}")) => s,
+                        _ => return,
+                    },
                     M_RENAME => match crate::ui::ask(&self.tree, "New name:", "Rename Table", &name) {
                         Some(n) if n != name => match db {
                             Kind::Mssql => format!("EXEC sp_rename '{}', '{}'", dialect::lit(&format!("{owner}.{name}")), dialect::lit(&n)),

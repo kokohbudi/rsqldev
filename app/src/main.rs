@@ -17,6 +17,7 @@ mod object_view;
 mod prefs;
 mod sessions;
 mod snippets;
+mod table_editor;
 mod topsql;
 mod ui;
 mod value;
