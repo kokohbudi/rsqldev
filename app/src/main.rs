@@ -20,6 +20,7 @@ mod sessions;
 mod snippets;
 mod table_editor;
 mod topsql;
+mod transfer;
 mod ui;
 mod value;
 mod worksheet;
