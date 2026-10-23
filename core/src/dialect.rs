@@ -668,6 +668,25 @@ fn top_words(sql: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// Query for an object's DDL: (sql, column), column `usize::MAX` = concatenate column 0 of
+/// every row (source text). Oracle uses DBMS_METADATA for every kind.
+pub fn ddl_sql(db: Db, kind: &str, owner: &str, name: &str) -> Option<(String, usize)> {
+    let view = if db == Db::Oracle { ora_ddl(kind) } else { tabs(db, kind).into_iter().map(|t| t.view).find(|v| matches!(v, View::Ddl(..) | View::Code(_)))? };
+    match view {
+        View::Ddl(s, col) => Some((fill(db, &s, owner, name), col)),
+        View::Code(s) => Some((fill(db, &s, owner, name), usize::MAX)),
+        _ => None,
+    }
+}
+
+/// Query for an object's source text to compare (cheaper than DDL where a Code view exists).
+pub fn code_sql(db: Db, kind: &str, owner: &str, name: &str) -> Option<(String, usize)> {
+    match tabs(db, kind).into_iter().map(|t| t.view).find(|v| matches!(v, View::Code(_))) {
+        Some(View::Code(s)) => Some((fill(db, &s, owner, name), usize::MAX)),
+        _ => ddl_sql(db, kind, owner, name),
+    }
+}
+
 /// Columns query for DESCRIBE in the script runner.
 pub fn describe_sql(db: Db, owner: &str, name: &str) -> Option<String> {
     children_sql(db, TABLE).map(|s| fill(db, &s, owner, name))

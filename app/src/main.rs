@@ -2,6 +2,7 @@
 //! rsqldev: a native SQL Developer. wxWidgets gives Cocoa widgets on macOS and Win32 on Windows.
 
 mod autosave;
+mod compare;
 mod complete;
 mod conn;
 mod connections;
@@ -89,6 +90,7 @@ const ID_BOOKMARK: i32 = ID_HIGHEST + 40;
 const ID_BOOKMARK_NEXT: i32 = ID_HIGHEST + 41;
 const ID_BOOKMARK_PREV: i32 = ID_HIGHEST + 42;
 const ID_AUTOTRACE: i32 = ID_HIGHEST + 43;
+const ID_COMPARE: i32 = ID_HIGHEST + 44;
 
 enum Page {
     Sheet(SheetRef),
@@ -774,6 +776,7 @@ impl App {
                 }
             }
             ID_DRIVERS => driver_manager::show(&self.frame),
+            ID_COMPARE => compare::show(&self.frame),
             ID_PREFERENCES => prefs::show(&self.frame),
             ID_ABOUT => ui::info(
                 &self.frame,
@@ -935,6 +938,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_UNSHARED, "&Unshared SQL Worksheet\tCtrl+Shift+N", "")
         .append_separator()
         .append_item(ID_SESSIONS, "S&essions…", "Sessions and locks of a connection: who blocks whom, kill session")
+        .append_item(ID_COMPARE, "Schema &Compare…", "Compare two schemas and open a script that brings the target in line")
         .append_item(ID_DRIVERS, "&Drivers…", "Download or locate native client drivers")
         .append_item(ID_PREFERENCES, "&Preferences…", "")
         .build();
