@@ -327,7 +327,7 @@ fn dialog(conn: ConnRef, env: Env, dirs: Vec<String>) {
         sy();
         match bl() {
             Ok(b) => {
-                *p1.borrow_mut() = Some(Picked::Copy(b));
+                *p1.borrow_mut() = Some(Picked::Copy(datapump::without_password(&b)));
                 dlg.end_modal(ID_OK);
             }
             Err(e) => ui::error(&dlg, &e),
@@ -405,7 +405,9 @@ fn run(conn: ConnRef, env: Env, spec: ImportSpec, block: String, password: Optio
         }
         Ok(()) => {
             // The file is on the server now: remember it even if the job then fails to start.
-            record(&c2, &e2, &s2, &[(file, FileKind::Upload)]);
+            if let Some(e) = record(&c2, &e2, &s2, &[(file, FileKind::Upload)]) {
+                ui::error(&crate::app().frame, &format!("The uploaded dump was not added to the file list.\n\n{e}"));
+            }
             start(true);
         }
     });
@@ -418,11 +420,12 @@ fn now() -> String {
 /// Add records to the local file list; the error text when saving failed.
 fn record(conn: &ConnRef, env: &Env, spec: &ImportSpec, files: &[(String, FileKind)]) -> Option<String> {
     let conn_name = conn.borrow().cfg.name.clone();
-    let mut all = datapump::load_files();
-    for (file, kind) in files {
-        all.push(FileRecord { conn: conn_name.clone(), db: env.db.clone(), directory: spec.directory.clone(), file: file.clone(), kind: *kind, job: spec.job.clone(), created: now() });
-    }
-    datapump::save_files(&all).err().map(|e| e.to_string())
+    datapump::update_files(|all| {
+        for (file, kind) in files {
+            all.push(FileRecord { conn: conn_name.clone(), db: env.db.clone(), directory: spec.directory.clone(), file: file.clone(), kind: *kind, job: spec.job.clone(), created: now() });
+        }
+    })
+    .err()
 }
 
 /// Report the outcome; on success remember the files and, where needed, watch the job end.
@@ -475,6 +478,15 @@ enum Poll {
     Failed,
 }
 
+/// A job-state lookup: no row = the job is gone.
+fn poll_state(r: Result<crate::conn::Res, String>) -> Poll {
+    match r {
+        Err(_) => Poll::Failed,
+        Ok(r) if r.rows.is_empty() => Poll::Gone,
+        Ok(_) => Poll::Running,
+    }
+}
+
 /// Look the job up every 5 s (non-blocking) until it is gone, the lookup fails or 24 h pass.
 fn watch(conn: ConnRef, env: Env, spec: ImportSpec, uploaded: bool) {
     let state = Rc::new(RefCell::new(Poll::Idle));
@@ -487,7 +499,7 @@ fn watch(conn: ConnRef, env: Env, spec: ImportSpec, uploaded: bool) {
             Poll::Failed => {
                 ui::info(
                     &crate::app().frame,
-                    &format!("Cannot watch job {} (the DBA_DATAPUMP_JOBS view is not readable).\n\nWhen it has ended, fetch the SQL file or delete the uploaded dump from the Jobs & Files tab.", spec.job),
+                    &format!("Cannot watch job {} (neither DBA_DATAPUMP_JOBS nor USER_DATAPUMP_JOBS could be read).\n\nWhen it has ended, fetch the SQL file or delete the uploaded dump from the Jobs & Files tab.", spec.job),
                 );
                 return false;
             }
@@ -507,12 +519,11 @@ fn watch(conn: ConnRef, env: Env, spec: ImportSpec, uploaded: bool) {
         }
         last = Instant::now();
         let st = state.clone();
-        Conn::meta_query(&conn, &datapump::job_running_sql(&env.user, &spec.job), move |r| {
-            *st.borrow_mut() = match r {
-                Err(_) => Poll::Failed,
-                Ok(r) if r.rows.is_empty() => Poll::Gone,
-                Ok(_) => Poll::Running,
-            };
+        let (c2, user_q) = (conn.clone(), datapump::job_running_sql_user(&spec.job));
+        // By job name alone (the job may belong to another user), else from USER_DATAPUMP_JOBS.
+        Conn::meta_query(&conn, &datapump::job_running_any_sql(&spec.job), move |r| match r {
+            Ok(r) => *st.borrow_mut() = poll_state(Ok(r)),
+            Err(_) => Conn::meta_query(&c2, &user_q, move |r| *st.borrow_mut() = poll_state(r)),
         });
         true
     });
@@ -563,11 +574,18 @@ fn offer_delete(conn: &ConnRef, env: &Env, spec: &ImportSpec, uploaded: bool) {
     if !uploaded {
         return;
     }
+    // The job may have failed: offer its log before the dump can go.
+    let view = format!("The import job {} has ended (check the log for errors).\n\nView the log {} now?", spec.job, spec.log_file);
+    if ui::confirm(&crate::app().frame, &view) {
+        let (c2, e2, s2) = (conn.clone(), env.clone(), spec.clone());
+        return crate::datapump_tab::view_server_file(conn, env.user.clone(), spec.directory.clone(), spec.log_file.clone(), move || ask_delete(&c2, &e2, &s2));
+    }
+    ask_delete(conn, env, spec);
+}
+
+fn ask_delete(conn: &ConnRef, env: &Env, spec: &ImportSpec) {
     let file = &spec.dump_files[0];
-    let q = format!(
-        "Import job {} has ended. Check the log {} if unsure that it went well.\n\nDelete the uploaded dump {file} from {} on the server?",
-        spec.job, spec.log_file, spec.directory
-    );
+    let q = format!("The import job has ended (check the log for errors). Delete the uploaded dump from the server?\n\n{file} in {}", spec.directory);
     if !ui::confirm(&crate::app().frame, &q) {
         return;
     }
@@ -579,10 +597,11 @@ fn offer_delete(conn: &ConnRef, env: &Env, spec: &ImportSpec, uploaded: bool) {
     Conn::meta_query(conn, &block, move |r| match r {
         Ok(_) => {
             // Forget the Upload record of the deleted file.
-            let mut all = datapump::load_files();
-            all.retain(|x| !(x.conn == conn_name && x.directory == dir && x.file == f2 && x.kind == FileKind::Upload));
-            let _ = datapump::save_files(&all);
+            let r = datapump::update_files(|all| all.retain(|x| !(x.conn == conn_name && x.directory == dir && x.file == f2 && x.kind == FileKind::Upload)));
             crate::app().status(0, &format!("Deleted {f2} from {dir}"));
+            if let Err(e) = r {
+                ui::error(&crate::app().frame, &format!("Deleted {f2}, but the file list was not changed.\n\n{e}"));
+            }
         }
         Err(e) => {
             let e = match datapump::hint(&e, &user, &dir) {

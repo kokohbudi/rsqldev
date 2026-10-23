@@ -1,7 +1,8 @@
 //! Tools > Data Pump > Export: a dialog (What / Options / Files / PL/SQL) that builds one
 //! DBMS_DATAPUMP block. The PL/SQL tab shows exactly what runs; OK confirms and runs it, Copy to
 //! Worksheet opens it for running by hand. The encryption password never reaches the text: the
-//! block keeps the `:password` placeholder and the password goes in as a bind.
+//! block keeps the `:password` placeholder and the password goes in as a bind; the worksheet copy
+//! has no bind at all (`datapump::without_password`), only a note to set the password by hand.
 
 use crate::conn::{Conn, ConnRef};
 use crate::ui;
@@ -9,6 +10,7 @@ use rsqldev_core::datapump::{self, Compression, Content, ExportSpec, FileKind, F
 use rsqldev_core::worker::Reply;
 use rsqldev_core::Bind;
 use std::cell::RefCell;
+use std::sync::mpsc::TryRecvError;
 use std::rc::Rc;
 use wxdragon::prelude::*;
 
@@ -353,7 +355,7 @@ fn dialog(conn: ConnRef, env: Env, dirs: Vec<String>) {
         sy();
         match bl() {
             Ok(b) => {
-                *p1.borrow_mut() = Some(Picked::Copy(b));
+                *p1.borrow_mut() = Some(Picked::Copy(datapump::without_password(&b)));
                 dlg.end_modal(ID_OK);
             }
             Err(e) => ui::error(&dlg, &e),
@@ -403,12 +405,22 @@ pub(crate) fn exec(conn: &ConnRef, what: &str, block: String, password: Option<S
     match password {
         None => Conn::meta_query(conn, &block, move |r| done(r.map(|_| ()))),
         Some(pw) => {
-            let Some(mut sess) = crate::transfer::open_session(conn) else { return };
+            let Some(mut sess) = crate::transfer::open_session(conn) else { return done(Err("Cancelled.".into())) };
             let mut pending: Option<u64> = None;
             let mut done = Some(done);
             crate::app().status(0, &format!("Starting {what} on {conn_name}…"));
             crate::hub::every_tick(move || {
-                while let Ok(r) = sess.replies.try_recv() {
+                loop {
+                    let r = match sess.replies.try_recv() {
+                        Ok(r) => r,
+                        Err(TryRecvError::Empty) => return true,
+                        Err(TryRecvError::Disconnected) => {
+                            if let Some(d) = done.take() {
+                                d(Err("The session ended unexpectedly.".into()));
+                            }
+                            return false;
+                        }
+                    };
                     match r {
                         Reply::Connected => pending = Some(sess.exec_binds(&block, vec![Bind::Text(pw.clone())])),
                         Reply::ConnectFailed { error, .. } => {
@@ -426,7 +438,6 @@ pub(crate) fn exec(conn: &ConnRef, what: &str, block: String, password: Option<S
                         _ => {}
                     }
                 }
-                true
             });
         }
     }
@@ -447,12 +458,12 @@ fn finish(conn: &ConnRef, env: &Env, spec: &ExportSpec, r: Result<(), String>) {
         Ok(()) => {
             let created = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
             let rec = |file: &str, kind| FileRecord { conn: conn_name.clone(), db: env.db.clone(), directory: spec.directory.clone(), file: file.to_string(), kind, job: spec.job.clone(), created: created.clone() };
-            let mut all = datapump::load_files();
-            if !spec.estimate_only {
-                all.push(rec(&spec.dump_file, FileKind::Dump));
-            }
-            all.push(rec(&spec.log_file, FileKind::Log));
-            let saved = datapump::save_files(&all);
+            let saved = datapump::update_files(|all| {
+                if !spec.estimate_only {
+                    all.push(rec(&spec.dump_file, FileKind::Dump));
+                }
+                all.push(rec(&spec.log_file, FileKind::Log));
+            });
             app.status(0, &format!("Export job {} started on {conn_name}", spec.job));
             app.open_datapump(conn.clone());
             let mut msg = format!("Export job {} started on {conn_name}.\n\nDirectory: {}\n", spec.job, spec.directory);

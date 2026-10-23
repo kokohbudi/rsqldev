@@ -81,6 +81,7 @@ fn kind_label(k: FileKind) -> &'static str {
         FileKind::Log => "log",
         FileKind::SqlFile => "sql",
         FileKind::Upload => "upload",
+        FileKind::Other => "other",
     }
 }
 
@@ -107,6 +108,41 @@ fn find_row(g: &ResultGrid, key: &Key, c: (&str, &str)) -> Option<usize> {
 fn lines_grid(g: &ResultGrid, title: &str, lines: Vec<String>) {
     let rows: Vec<Vec<Cell>> = lines.into_iter().filter(|l| !l.trim().is_empty()).map(|l| vec![Some(l)]).collect();
     g.set(vec![col(title)], rows);
+}
+
+/// Download text file `file` of server directory `dir` to a private temp folder, show it, then run
+/// `then` (also when it could not be fetched). `user` names the grantee in error hints.
+pub(crate) fn view_server_file(conn: &ConnRef, user: String, dir: String, file: String, then: impl FnOnce() + 'static) {
+    let app = crate::app();
+    if !datapump::valid_name(&dir) || !datapump::valid_name(&file) {
+        ui::error(&app.frame, &format!("Invalid name: {dir} / {file}"));
+        return then();
+    }
+    let tmp = match rsqldev_core::lob::private_dir("rsqldev-dp") {
+        Ok(d) => d,
+        Err(e) => {
+            ui::error(&app.frame, &format!("Cannot create a temporary folder: {e}"));
+            return then();
+        }
+    };
+    let path = tmp.join(&file);
+    let (title, cleanup, dir2) = (file.clone(), tmp.clone(), dir.clone());
+    transfer::download(conn, dir, vec![file], tmp, move |r| {
+        let app = crate::app();
+        let text = r.and_then(|_| std::fs::read(&path).map_err(|e| format!("Cannot read {}: {e}", path.display())));
+        let _ = std::fs::remove_dir_all(&cleanup);
+        match text {
+            Ok(b) => show_text(&title, &String::from_utf8_lossy(&b)),
+            Err(e) => {
+                let e = match datapump::hint(&e, &user, &dir2) {
+                    Some(h) if !e.contains(&h) => format!("{e}\n\n{h}"),
+                    _ => e,
+                };
+                ui::error(&app.frame, &e)
+            }
+        }
+        then();
+    });
 }
 
 /// Read-only monospace text in a modal dialog.
@@ -300,14 +336,17 @@ impl DataPumpTab {
     // ---- jobs ----
 
     /// Show rows and put the cursor back on the row with the remembered key; forget the key when it is gone.
+    /// A refresh, not the user: it runs quietly, so Ctrl+C keeps copying from where the user selected.
     fn set_keyed(&self, g: &ResultGrid, key: &RefCell<Option<Key>>, kc: (&str, &str), cols: Vec<Column>, rows: Vec<Vec<Cell>>) {
         self.restoring.set(true);
-        g.set(cols, rows);
-        let k = key.borrow().clone();
-        match k.and_then(|k| find_row(g, &k, kc)) {
-            Some(i) => g.grid.set_grid_cursor(i as i32, 0),
-            None => *key.borrow_mut() = None,
-        }
+        crate::copy::quietly(|| {
+            g.set(cols, rows);
+            let k = key.borrow().clone();
+            match k.and_then(|k| find_row(g, &k, kc)) {
+                Some(i) => g.move_cursor(i as i32, 0, false),
+                None => *key.borrow_mut() = None,
+            }
+        });
         self.restoring.set(false);
     }
 
@@ -435,7 +474,7 @@ impl DataPumpTab {
 
     fn view_job_log(&self) {
         let Some((_, job, _)) = self.job_sel() else { return };
-        let known = datapump::load_files().into_iter().find(|r| r.job == job && r.kind == FileKind::Log && r.conn == self.conn_name);
+        let known = datapump::load_files().unwrap_or_default().into_iter().find(|r| r.job == job && r.kind == FileKind::Log && r.conn == self.conn_name);
         let (dir, file) = match known {
             Some(r) => (r.directory, r.file),
             None => {
@@ -455,7 +494,15 @@ impl DataPumpTab {
         self.busy.set(true);
         self.fstatus.set_label("Refreshing…");
         self.with_env(|v, db, _| {
-            let all = datapump::load_files();
+            let all = match datapump::load_files() {
+                Ok(all) => all,
+                Err(e) => {
+                    v.busy.set(false);
+                    v.last_done.set(Instant::now());
+                    v.fstatus.set_label(&format!("The file list cannot be read: {e}"));
+                    return;
+                }
+            };
             let todo: VecDeque<FileRecord> = datapump::files_for(&all, &v.conn_name, &db).into_iter().cloned().collect();
             v.probe(Probe { todo, cur: None, out: vec![], err: None });
         });
@@ -588,11 +635,12 @@ impl DataPumpTab {
         if d.job.is_empty() {
             return self.pick_and_download(d.dir, files);
         }
-        self.check_not_running(d.job.clone(), move |v| v.pick_and_download(d.dir, files));
+        self.check_not_running(d.job.clone(), false, move |v| v.pick_and_download(d.dir, files));
     }
 
-    /// Run `go` when the job is not running; refuse while it is, ask when the state cannot be read.
-    fn check_not_running(&self, job: String, go: impl FnOnce(&DataPumpTab) + 'static) {
+    /// Run `go` (a download, or a delete when `deleting`) when the job is not running; refuse while
+    /// it is, ask when it is stopped or its state cannot be read.
+    fn check_not_running(&self, job: String, deleting: bool, go: impl FnOnce(&DataPumpTab) + 'static) {
         let w = self.me.clone();
         let (q1, q2) = (datapump::job_running_any_sql(&job), datapump::job_running_sql_user(&job));
         let decide = move |v: &DataPumpTab, rows: Vec<Vec<Cell>>, job: &str, go: Box<dyn FnOnce(&DataPumpTab)>| match rows.into_iter().next() {
@@ -600,9 +648,16 @@ impl DataPumpTab {
             Some(row) => {
                 let state = row.first().cloned().flatten().unwrap_or_default();
                 if state.trim().eq_ignore_ascii_case("NOT RUNNING") {
-                    if ui::confirm(&v.panel, &format!("Job {job} is stopped, so its files may be incomplete. Download anyway?")) {
+                    let q = if deleting {
+                        format!("Job {job} is stopped and could be resumed; without its files it cannot. Delete anyway?")
+                    } else {
+                        format!("Job {job} is stopped, so its files may be incomplete. Download anyway?")
+                    };
+                    if ui::confirm(&v.panel, &q) {
                         go(v);
                     }
+                } else if deleting {
+                    ui::error(&v.panel, &format!("The job {job} is still running ({state}) and uses its files. Delete them after it ends."));
                 } else {
                     ui::error(&v.panel, &format!("The job {job} is still running ({state}); its files are incomplete. Download after it ends."));
                 }
@@ -621,7 +676,8 @@ impl DataPumpTab {
                             Ok(r) => decide(&v, r.rows, &job, go),
                             Err(e) => {
                                 let first = e.lines().next().unwrap_or("").to_string();
-                                if ui::confirm(&v.panel, &format!("Cannot tell whether job {job} is still running ({first}).\n\nIf it is, the file is incomplete. Download anyway?")) {
+                                let tail = if deleting { "If it is, deleting its files breaks it. Delete anyway?" } else { "If it is, the file is incomplete. Download anyway?" };
+                                if ui::confirm(&v.panel, &format!("Cannot tell whether job {job} is still running ({first}).\n\n{tail}")) {
                                     go(&v);
                                 }
                             }
@@ -677,30 +733,7 @@ impl DataPumpTab {
 
     /// Download a text file to the temp folder and show it.
     fn view_file(&self, dir: String, file: String) {
-        if !datapump::valid_name(&dir) || !datapump::valid_name(&file) {
-            return ui::error(&self.panel, &format!("Invalid name: {dir} / {file}"));
-        }
-        let tmp = match rsqldev_core::lob::private_dir("rsqldev-dp") {
-            Ok(d) => d,
-            Err(e) => return ui::error(&self.panel, &format!("Cannot create a temporary folder: {e}")),
-        };
-        let path = tmp.join(&file);
-        let (title, cleanup, user, dir2) = (file.clone(), tmp.clone(), self.user(), dir.clone());
-        transfer::download(&self.conn, dir, vec![file], tmp, move |r| {
-            let app = crate::app();
-            let text = r.and_then(|_| std::fs::read(&path).map_err(|e| format!("Cannot read {}: {e}", path.display())));
-            let _ = std::fs::remove_dir_all(&cleanup);
-            match text {
-                Ok(b) => show_text(&title, &String::from_utf8_lossy(&b)),
-                Err(e) => {
-                    let e = match datapump::hint(&e, &user, &dir2) {
-                        Some(h) if !e.contains(&h) => format!("{e}\n\n{h}"),
-                        _ => e,
-                    };
-                    ui::error(&app.frame, &e)
-                }
-            }
-        });
+        view_server_file(&self.conn, self.user(), dir, file, || {});
     }
 
     fn delete(&self) {
@@ -714,6 +747,14 @@ impl DataPumpTab {
             }
             return;
         }
+        if d.job.is_empty() {
+            return self.delete_pieces(d, pieces);
+        }
+        self.check_not_running(d.job.clone(), true, move |v| v.delete_pieces(d, pieces));
+    }
+
+    /// Confirm with the statements shown, then remove the files one by one.
+    fn delete_pieces(&self, d: Disp, pieces: Vec<String>) {
         let mut stmts = vec![];
         for f in &pieces {
             match datapump::delete_block(&d.dir, f) {
@@ -730,13 +771,12 @@ impl DataPumpTab {
     }
 
     fn forget(&self, d: &Disp) {
-        let mut all = datapump::load_files();
         let db = self.env.borrow().as_ref().map(|e| e.0.clone()).unwrap_or_default();
-        all.retain(|r| {
-            let same_db = if db.is_empty() { r.conn == self.conn_name } else { r.db == db };
-            !(same_db && r.directory == d.dir && r.file == d.tmpl && r.job == d.job)
-        });
-        let _ = datapump::save_files(&all);
+        let conn = self.conn_name.clone();
+        let r = datapump::update_files(|all| all.retain(|r| !(datapump::same_target(r, &conn, &db) && r.directory == d.dir && r.file == d.tmpl && r.job == d.job)));
+        if let Err(e) = r {
+            ui::error(&self.panel, &format!("The file list was not changed.\n\n{e}"));
+        }
     }
 
     fn delete_next(&self, d: Disp, mut q: Vec<String>) {
