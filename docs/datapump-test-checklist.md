@@ -32,7 +32,7 @@ GRANT READ, WRITE ON DIRECTORY dp_test_dir TO dp_dba;
 As `dp_user` create sample data: `CREATE TABLE t_small AS SELECT level id, 'row '||level txt FROM dual CONNECT BY level <= 1000;` and a bigger `t_big` (a few hundred MB) so a job runs long enough to observe and cancel.
 
 - [ ] Create two saved connections, `dp_user` and `dp_dba`. Both connect.
-- [ ] Open the Tools menu on a non-Oracle connection. The Data Pump items are not offered (or say Oracle only).
+- [ ] Open the Tools menu on a non-Oracle connection. The three Tools > Data Pump items are still shown; choosing one shows the message "Data Pump is available on Oracle connections" and opens nothing.
 - [ ] Note the server file size for each test with `SELECT DBMS_LOB.GETLENGTH(BFILENAME('DP_TEST_DIR','x.dmp')) FROM dual;` (or the Size column in Jobs & Files) for comparisons below.
 
 ## Export
@@ -48,7 +48,7 @@ As `dp_user` create sample data: `CREATE TABLE t_small AS SELECT level id, 'row 
 - [ ] Export with a table WHERE filter (Tables mode, Add Filter, e.g. `t_small` WHERE `id <= 10`). Import it later (see Import): only 10 rows.
 - [ ] Export with parallel 2 and a file size (e.g. 50 MB). The PL/SQL tab uses `<JOB>_%U.dmp`. After the job: `_01` and `_02` pieces are listed (and more if size forces it); each Downloads with its exact server size. The list stops at the first missing number.
 - [ ] Metadata only, then data only. Log and dump sizes differ accordingly (metadata-only is tiny).
-- [ ] Compression and Encryption controls are labelled "needs Advanced Compression" / "Needs Advanced Security". Default compression is metadata-only.
+- [ ] Compression and Encryption controls are labelled "needs Advanced Compression" / "needs Advanced Security". Default compression is metadata-only.
 - [ ] Encrypt the dump with password `Secret#1`. The PL/SQL tab shows `:password`, never the real value. OK runs and completes. Copy to Worksheet leaves `:password` and the worksheet asks for the bind on run. The password is not in the worksheet text, autosave or config.
 - [ ] As `dp_dba`, export Full and another user's schema. Both start. As `dp_user`, choosing another schema or Full gives a clear privilege hint (needs `DATAPUMP_EXP_FULL_DATABASE`), not a raw stack.
 - [ ] Copy to Worksheet, run the block there by hand. Job runs and shows in the Jobs monitor while it runs. It is NOT recorded in the local exports list; its files can be fetched with Download by Name.
@@ -59,7 +59,8 @@ As `dp_user` create sample data: `CREATE TABLE t_small AS SELECT level id, 'row 
 - [ ] Open Data Pump Import (tabs Source / What / Options / PL/SQL). Source: "Upload a local .dmp file first" with Browse...; or "Dump file(s) already in the directory".
 - [ ] Source = file already on the server, mode Schemas, remap `DP_USER` to `DP_SCRATCH`. PL/SQL tab shows `METADATA_REMAP`. Run. Job completes; in `dp_scratch`, `SELECT COUNT(*)` on each table equals the source table.
 - [ ] Source = upload: Browse... to a local .dmp, run. Upload progress dialog moves, then the import job starts and completes; row counts match. The uploaded dump is tracked in the local list; after success the app offers to delete the uploaded dump from the server. Accept: the file is gone from the server.
-- [ ] Table exists action: run the same import again with Skip (nothing changes), Append (rows double), Truncate (back to original), Replace (table recreated). The confirmation names Truncate and Replace and shows the PL/SQL before anything runs.
+- [ ] Source = "Upload a local .dmp file first" AND remap schema `DP_USER` to `DP_SCRATCH` in one run: the upload completes, the job runs and completes, and row counts in `dp_scratch` match the source tables.
+- [ ] "If a table exists:" control: run the same import again with "Skip (leave the existing table)" (nothing changes), "Append rows" (rows double), "Truncate, then load" (back to original), "Replace (drop and recreate)" (table recreated). The confirmation names Truncate and Replace and shows the PL/SQL before anything runs.
 - [ ] Remap tablespace (e.g. USERS to another existing tablespace). Objects land in the new tablespace.
 - [ ] Tables mode: import only one table from a schema dump. Only that table appears.
 - [ ] "Only write the DDL to a SQL file (nothing is imported)": job completes, nothing is created, the SQL file is downloaded and opens in a worksheet with the DDL. The temp folder for it is cleaned up afterwards (see Failure cases).
