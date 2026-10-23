@@ -303,6 +303,7 @@ impl Backend for Oracle {
             st.bind(6, &OracleType::BLOB)?;
             st.execute(&[])?;
             let len = st.bind_value::<_, u64>(5)?;
+            let before = written;
             if offset + written < len {
                 if let Some(mut blob) = st.bind_value::<_, Option<oracle::sql_type::Blob>>(6)? {
                     loop {
@@ -314,6 +315,9 @@ impl Backend for Oracle {
                         written += n as u64;
                     }
                 }
+            }
+            if offset + written < len && written == before {
+                anyhow::bail!("server file shrank or could not be read at offset {}", offset + written);
             }
             if !progress(offset + written, len) {
                 anyhow::bail!("cancelled");

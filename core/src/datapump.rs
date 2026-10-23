@@ -384,9 +384,11 @@ pub const DOWNLOAD_READ: usize = 1024 * 1024;
 
 /// One download chunk. Binds: `:1` directory, `:2` file, `:3` 1-based start, `:4` max bytes,
 /// out `:5` file length (NUMBER), out `:6` chunk (BLOB).
-pub const DOWNLOAD_BLOCK: &str = "DECLARE\n  src BFILE := BFILENAME(:1, :2);\n  dst BLOB;\n  soff INTEGER := :3;\n  doff INTEGER := 1;\n  amt INTEGER;\n  len INTEGER;\nBEGIN\n  \
+/// Positional binds are numbered by the order each placeholder first appears in the text, not by
+/// its digit: keep `:1`..`:6` appearing in this order.
+pub const DOWNLOAD_BLOCK: &str = "DECLARE\n  src BFILE := BFILENAME(:1, :2);\n  dst BLOB;\n  soff INTEGER := :3;\n  amt INTEGER := :4;\n  doff INTEGER := 1;\n  len INTEGER;\nBEGIN\n  \
 DBMS_LOB.FILEOPEN(src, DBMS_LOB.FILE_READONLY);\n  len := DBMS_LOB.GETLENGTH(src);\n  :5 := len;\n  DBMS_LOB.CREATETEMPORARY(dst, TRUE);\n  \
-IF soff <= len THEN\n    amt := LEAST(:4, len - soff + 1);\n    DBMS_LOB.LOADBLOBFROMFILE(dst, src, amt, doff, soff);\n  END IF;\n  \
+IF soff <= len THEN\n    amt := LEAST(amt, len - soff + 1);\n    DBMS_LOB.LOADBLOBFROMFILE(dst, src, amt, doff, soff);\n  END IF;\n  \
 DBMS_LOB.FILECLOSE(src);\n  :6 := dst;\nEXCEPTION WHEN OTHERS THEN\n  IF DBMS_LOB.FILEISOPEN(src) = 1 THEN DBMS_LOB.FILECLOSE(src); END IF;\n  RAISE;\nEND;";
 
 /// Upload chunk size: one round trip carries this many bytes.
@@ -483,6 +485,13 @@ mod tests {
             assert!(DOWNLOAD_BLOCK.contains(&format!(":{i}")), ":{i}");
         }
         assert!(!DOWNLOAD_BLOCK.contains(":7"));
+        let pos = |b: &str, i: usize| b.find(&format!(":{i}")).unwrap();
+        for i in 1..6 {
+            assert!(pos(DOWNLOAD_BLOCK, i) < pos(DOWNLOAD_BLOCK, i + 1), "download :{i} before :{}", i + 1);
+        }
+        for i in 1..4 {
+            assert!(pos(UPLOAD_BLOCK, i) < pos(UPLOAD_BLOCK, i + 1), "upload :{i} before :{}", i + 1);
+        }
     }
 
     fn spec() -> ExportSpec {
