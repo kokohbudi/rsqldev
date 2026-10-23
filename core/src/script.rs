@@ -279,6 +279,15 @@ impl Utf8Hint for u8 {
     }
 }
 
+/// "PACKAGE BODY" → "Package body", as SQL*Plus feedback writes object types.
+pub fn title_case(s: &str) -> String {
+    let mut c = s.to_lowercase();
+    if let Some(f) = c.get_mut(0..1) {
+        f.make_ascii_uppercase();
+    }
+    c
+}
+
 /// Statement under the cursor (Ctrl/Cmd+Enter); falls back to the closest one before it.
 pub fn statement_at(items: &[Item], pos: usize) -> Option<&Item> {
     items.iter().find(|it| it.start <= pos && pos <= it.end).or_else(|| items.iter().rev().find(|it| it.end <= pos)).or(items.first())
@@ -450,13 +459,7 @@ pub fn feedback(sql: &str, affected: Option<u64>) -> String {
         let n = affected.unwrap_or(0);
         format!("{n} row{} {verb}.", if n == 1 { "" } else { "s" })
     };
-    let title = |s: &str| {
-        let mut c = s.to_lowercase();
-        if let Some(f) = c.get_mut(0..1) {
-            f.make_ascii_uppercase();
-        }
-        c
-    };
+    let title = title_case;
     // CREATE [OR REPLACE] [EDITIONABLE] [UNIQUE|PUBLIC|GLOBAL TEMPORARY] <TYPE> <name>
     let object = |start: usize| {
         let mut i = start;

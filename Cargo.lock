@@ -3160,8 +3160,9 @@ dependencies = [
 
 [[package]]
 name = "rsqldev"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
+ "chrono",
  "embed-manifest",
  "image",
  "rsqldev-core",
@@ -3173,7 +3174,7 @@ dependencies = [
 
 [[package]]
 name = "rsqldev-core"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "calamine",
