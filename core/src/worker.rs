@@ -39,6 +39,7 @@ impl Drop for Busy {
     }
 }
 
+#[derive(Clone)]
 pub enum Cmd {
     Exec { id: u64, sql: String, fetch: usize, rows: SyncSender<Event> },
     /// DML with bind values (BLOB upload, long text). Replies `Done`.
@@ -86,10 +87,31 @@ impl Session {
                 drop(connecting);
                 *c2.lock().unwrap() = b.canceller();
                 let _ = rtx.send(Reply::Connected);
+                let (mut autocommit, mut output) = (prefs.autocommit, false);
                 for cmd in rx {
+                    match cmd {
+                        Cmd::Autocommit(on) => autocommit = on,
+                        Cmd::Output(on) => output = on,
+                        _ => {}
+                    }
                     let r = {
                         let _busy = Busy::new();
-                        run(b.as_mut(), cmd)
+                        let mut sent = false;
+                        let mut r = run(b.as_mut(), cmd.clone(), &mut sent);
+                        // The server or a firewall dropped an idle session: reconnect once and
+                        // retry, unless rows already reached the UI. Uncommitted work is lost with it.
+                        if !sent && lost(&r) {
+                            if let Ok(mut nb) = crate::backend::connect(&cfg, &password, &prefs) {
+                                let _ = nb.set_autocommit(autocommit);
+                                if output {
+                                    let _ = nb.enable_output(true);
+                                }
+                                *c2.lock().unwrap() = nb.canceller();
+                                b = nb;
+                                r = run(b.as_mut(), cmd, &mut sent);
+                            }
+                        }
+                        r
                     };
                     if rtx.send(r).is_err() {
                         break;
@@ -128,7 +150,15 @@ impl Session {
     }
 }
 
-fn run(b: &mut dyn Backend, cmd: Cmd) -> Reply {
+/// Error text of a dead connection: ODPI-C not connected / closed, Oracle ORA-03113, 03114,
+/// 03135 (end-of-file, not connected, lost contact) and 02396 (idle timeout). Statements only:
+/// a retried Commit would report success on a fresh session whose transaction is empty.
+fn lost(r: &Reply) -> bool {
+    let Reply::Done { result: Err(e), .. } = r else { return false };
+    ["DPI-1010", "DPI-1080", "ORA-03113", "ORA-03114", "ORA-03135", "ORA-02396"].iter().any(|c| e.contains(c))
+}
+
+fn run(b: &mut dyn Backend, cmd: Cmd, sent: &mut bool) -> Reply {
     let tx = |r: crate::Result<()>, ok: &'static str| Reply::TxDone(r.map(|_| ok).map_err(|e| format!("{e:#}")));
     match cmd {
         Cmd::Exec { id, sql, fetch, rows } => {
@@ -136,6 +166,7 @@ fn run(b: &mut dyn Backend, cmd: Cmd) -> Reply {
             // Idle while the UI holds the next batch back (fetch-on-scroll).
             let result = b
                 .execute(&sql, fetch, &mut |e| {
+                    *sent = true;
                     BUSY.fetch_sub(1, Ordering::Relaxed);
                     let ok = rows.send(e).is_ok();
                     BUSY.fetch_add(1, Ordering::Relaxed);
