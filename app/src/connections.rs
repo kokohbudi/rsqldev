@@ -95,10 +95,21 @@ impl Navigator {
         self.tree.get_custom_data(i).and_then(|d| d.downcast_ref::<Node>().cloned()).unwrap_or(Node::Leaf)
     }
 
+    /// Tree image of connection `name`: its engine's icon, with the "open" badge when `up`.
+    fn conn_image(name: &str, up: bool) -> i32 {
+        let driver = crate::app().conns.borrow().iter().find(|c| c.name == name).map(|c| c.driver.clone()).unwrap_or_default();
+        crate::icons::tree_index(&crate::icons::conn_icon(&driver, up))
+    }
+
+    fn set_conn_image(&self, i: &TreeItemId, name: &str, up: bool) {
+        let img = Self::conn_image(name, up);
+        self.tree.set_item_image(i, img, TreeItemIcon::Normal);
+        self.tree.set_item_image(i, img, TreeItemIcon::Selected);
+    }
+
     fn add(&self, parent: &TreeItemId, text: &str, n: Node, expandable: bool) -> Option<TreeItemId> {
         let icon = match &n {
-            Node::Conn(name) if crate::app().open_conn(name).is_some() => "conn_up",
-            Node::Conn(_) => "conn",
+            Node::Conn(_) => "",
             Node::Folder => "folder",
             Node::Schemas { .. } | Node::Schema { .. } => "user",
             Node::Kind { kind, .. } => crate::icons::for_kind(kind),
@@ -106,7 +117,11 @@ impl Navigator {
             Node::Leaf => "column",
             Node::Loading => "",
         };
-        let img = Some(crate::icons::tree_index(icon)).filter(|i| *i >= 0);
+        let img = match &n {
+            Node::Conn(name) => Self::conn_image(name, crate::app().open_conn(name).is_some()),
+            _ => crate::icons::tree_index(icon),
+        };
+        let img = Some(img).filter(|i| *i >= 0);
         let i = self.tree.append_item_with_data(parent, text, n, img, img)?;
         if expandable {
             self.tree.append_item_with_data(&i, "Loading…", Node::Loading, None, None);
@@ -146,8 +161,7 @@ impl Navigator {
             Node::Conn(name) => crate::app().connect(&name.clone(), move |c| {
                 let owner = c.borrow().schema.clone();
                 nav.tree.delete_children(&item);
-                nav.tree.set_item_image(&item, crate::icons::tree_index("conn_up"), TreeItemIcon::Normal);
-                nav.tree.set_item_image(&item, crate::icons::tree_index("conn_up"), TreeItemIcon::Selected);
+                nav.set_conn_image(&item, &name, true);
                 nav.add_folders(&item, &name, &owner, c.borrow().kind);
                 nav.add(&item, dialect::schemas_label(c.borrow().kind), Node::Schemas { conn: name.clone() }, true);
                 nav.tree.expand(&item);
@@ -288,8 +302,7 @@ impl Navigator {
             (M_CONNECT, Node::Conn(_)) => self.tree.expand(i),
             (M_DISCONNECT, Node::Conn(name)) => {
                 app.disconnect(&name);
-                self.tree.set_item_image(i, crate::icons::tree_index("conn"), TreeItemIcon::Normal);
-                self.tree.set_item_image(i, crate::icons::tree_index("conn"), TreeItemIcon::Selected);
+                self.set_conn_image(i, &name, false);
                 self.tree.collapse(i);
                 self.tree.delete_children(i);
                 self.tree.append_item_with_data(i, "Loading…", Node::Loading, None, None);
