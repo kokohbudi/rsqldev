@@ -29,6 +29,15 @@ pub fn confirm(parent: &dyn WxWidget, msg: &str) -> bool {
         == ID_YES
 }
 
+/// Like `confirm`, with No as the default button.
+pub fn confirm_no(parent: &dyn WxWidget, msg: &str) -> bool {
+    MessageDialog::builder(parent, msg, "rsqldev")
+        .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::NoDefault | MessageDialogStyle::IconQuestion)
+        .build()
+        .show_modal()
+        == ID_YES
+}
+
 pub fn ask(parent: &dyn WxWidget, msg: &str, title: &str, default: &str) -> Option<String> {
     let d = TextEntryDialog::builder(parent, msg, title).with_default_value(default).build();
     (d.show_modal() == ID_OK).then(|| d.get_value()).flatten()

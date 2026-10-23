@@ -2,22 +2,24 @@
 //! over a session of their own (worksheets and metadata stay free). A modeless dialog shows
 //! progress; the UI thread only polls channels from `hub::every_tick`, it never blocks.
 //! Downloads land in `<file>.part` and are renamed only when complete, so an interrupted one
-//! resumes from the part's size.
+//! resumes from the part's size. A `<file>.part.json` sidecar records where the part came from:
+//! it resumes only from the same file of the same server, and one folder never gets two
+//! downloads of the same file at once.
 
 use crate::conn::ConnRef;
 use crate::ui;
-use rsqldev_core::config;
-use rsqldev_core::datapump::{self, UPLOAD_BLOCK, UPLOAD_CHUNK};
+use rsqldev_core::config::{self, ConnConfig};
+use rsqldev_core::datapump::{self, PartInfo, UPLOAD_BLOCK, UPLOAD_CHUNK};
 use rsqldev_core::worker::{Reply, Session};
 use rsqldev_core::Bind;
-use std::cell::Cell;
-use std::collections::VecDeque;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Instant;
 use wxdragon::prelude::*;
 
@@ -26,9 +28,45 @@ pub fn part_path(to: &Path, file: &str) -> PathBuf {
     to.join(format!("{file}.part"))
 }
 
+/// `<to>/<file>.part.json`: the sidecar saying where the part's bytes came from.
+pub fn sidecar_path(to: &Path, file: &str) -> PathBuf {
+    to.join(format!("{file}.part.json"))
+}
+
 /// Bytes already downloaded into `part` (0 when absent).
 pub fn resume_offset(part: &Path) -> u64 {
     std::fs::metadata(part).map(|m| m.len()).unwrap_or(0)
+}
+
+/// The server a connection points at (driver, host, port, service / TNS), for matching a part.
+fn source_of(cfg: &ConnConfig) -> String {
+    format!("{}|{}|{}|{}|{}", cfg.driver, cfg.host, cfg.port.map(|p| p.to_string()).unwrap_or_default(), cfg.database, cfg.tns)
+}
+
+thread_local! {
+    /// Part files some download is writing (or has queued) right now.
+    static ACTIVE: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
+}
+
+/// Reserve the part files of a download; Err(i) when `parts[i]` belongs to another download.
+fn hold(parts: &[PathBuf]) -> Result<(), usize> {
+    ACTIVE.with(|a| {
+        let mut a = a.borrow_mut();
+        if let Some(i) = parts.iter().position(|p| a.contains(p)) {
+            return Err(i);
+        }
+        a.extend(parts.iter().cloned());
+        Ok(())
+    })
+}
+
+fn release(parts: &[PathBuf]) {
+    ACTIVE.with(|a| {
+        let mut a = a.borrow_mut();
+        for p in parts {
+            a.remove(p);
+        }
+    })
 }
 
 fn mb(n: u64) -> f64 {
@@ -106,11 +144,16 @@ type DownDone = Box<dyn FnOnce(Result<Vec<PathBuf>, String>)>;
 struct Cur {
     name: String,
     part: PathBuf,
+    sidecar: PathBuf,
     id: u64,
     rx: Receiver<(u64, u64)>,
     cancel: Arc<AtomicBool>,
     base: u64,
+    /// Server length recorded when the resumed part was started (None = unknown).
+    expect: Option<u64>,
     first_len: Option<u64>,
+    /// The resumed part does not fit the server file (shorter, or another length than recorded).
+    mismatch: bool,
     restarted: bool,
     last: (u64, u64),
     started: Instant,
@@ -120,8 +163,12 @@ struct Down {
     sess: Session,
     dir: String,
     user: String,
+    /// The connection's server, written into the sidecars.
+    source: String,
     to: PathBuf,
     queue: VecDeque<String>,
+    /// Part files reserved for this download (see `hold`).
+    held: Vec<PathBuf>,
     out: Vec<PathBuf>,
     cur: Option<Cur>,
     prog: Prog,
@@ -130,6 +177,7 @@ struct Down {
 
 impl Down {
     fn end(&mut self, r: Result<Vec<PathBuf>, String>) -> bool {
+        release(&std::mem::take(&mut self.held));
         self.prog.close();
         if let Some(d) = self.done.take() {
             d(r);
@@ -137,34 +185,80 @@ impl Down {
         false
     }
 
-    /// Start the next queued file; false when the whole transfer ended.
+    /// Start the next queued file (a file the user would not overwrite is skipped); false when
+    /// the whole transfer ended.
     fn next(&mut self) -> bool {
-        let Some(name) = self.queue.pop_front() else {
-            let out = self.out.clone();
-            return self.end(Ok(out));
-        };
-        let fin = self.to.join(&name);
-        if fin.exists() && !ui::confirm(&self.prog.dlg, &format!("{} exists. Overwrite?", fin.display())) {
-            return self.end(Err(format!("Not overwritten: {}", fin.display())));
+        loop {
+            let Some(name) = self.queue.pop_front() else {
+                let out = self.out.clone();
+                return self.end(Ok(out));
+            };
+            let fin = self.to.join(&name);
+            if fin.exists() && !ui::confirm(&self.prog.dlg, &format!("{} exists. Overwrite?\n\nNo skips this file.", fin.display())) {
+                continue;
+            }
+            self.start(name, false);
+            return true;
         }
-        self.start(name, false);
-        true
+    }
+
+    /// Where a part resumes: its size when the sidecar says it came from this very file, else
+    /// ask (default: start over). Also the server length recorded with it.
+    fn resume_from(&self, name: &str, part: &Path, sidecar: &Path) -> (u64, Option<u64>) {
+        let have = resume_offset(part);
+        if have == 0 {
+            return (0, None);
+        }
+        let saved = std::fs::read_to_string(sidecar).ok().and_then(|s| PartInfo::from_json(&s));
+        match saved {
+            Some(p) if p.matches(&self.source, &self.dir, name) => (have, p.len),
+            _ => {
+                let q = format!("Resume {:.1} MB from an earlier download of a different source?\n\n{} was not written by a download of {name} from {} on this server. No starts over.", mb(have), part.display(), self.dir);
+                if ui::confirm_no(&self.prog.dlg, &q) { (have, None) } else { (0, None) }
+            }
+        }
+    }
+
+    fn sidecar(&self, name: &str, len: Option<u64>) -> PartInfo {
+        PartInfo { source: self.source.clone(), directory: self.dir.clone(), file: name.to_string(), len }
     }
 
     fn start(&mut self, name: String, restarted: bool) {
         let part = part_path(&self.to, &name);
-        let base = if restarted { 0 } else { resume_offset(&part) };
+        let sidecar = sidecar_path(&self.to, &name);
+        let (base, expect) = if restarted { (0, None) } else { self.resume_from(&name, &part, &sidecar) };
+        if base == 0 {
+            // The worker appends: a part that is not resumed must go first.
+            let _ = std::fs::remove_file(&part);
+        }
+        let _ = std::fs::write(&sidecar, self.sidecar(&name, expect).to_json());
         let (id, rx, cancel) = self.sess.download(&self.dir, &name, part.clone(), base);
-        self.cur = Some(Cur { name, part, id, rx, cancel, base, first_len: None, restarted, last: (base, 0), started: Instant::now() });
+        self.cur = Some(Cur { name, part, sidecar, id, rx, cancel, base, expect, first_len: None, mismatch: false, restarted, last: (base, 0), started: Instant::now() });
     }
 
     fn drain(&mut self) {
+        let mut learned = None;
         if let Some(c) = &mut self.cur {
             while let Ok((d, l)) = c.rx.try_recv() {
                 c.last = (d, l);
-                c.first_len.get_or_insert(l);
+                if c.first_len.is_none() {
+                    c.first_len = Some(l);
+                    if c.base > 0 && (l < c.base || c.expect.is_some_and(|e| e != l)) {
+                        // Another file than the one the part started from: stop, then start over.
+                        c.mismatch = true;
+                        c.cancel.store(true, Ordering::Relaxed);
+                    } else if c.expect.is_none() {
+                        learned = Some((c.name.clone(), c.sidecar.clone(), l));
+                    }
+                }
             }
             self.prog.show(&c.name, c.last.0, c.last.1, c.started, c.base);
+        }
+        if let Some((name, path, l)) = learned {
+            let _ = std::fs::write(&path, self.sidecar(&name, Some(l)).to_json());
+            if let Some(c) = &mut self.cur {
+                c.expect = Some(l);
+            }
         }
     }
 
@@ -177,7 +271,12 @@ impl Down {
             }
         }
         self.drain();
-        while let Ok(r) = self.sess.replies.try_recv() {
+        loop {
+            let r = match self.sess.replies.try_recv() {
+                Ok(r) => r,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return self.end(Err("The download session ended unexpectedly.".into())),
+            };
             match r {
                 Reply::Connected => {
                     if !self.next() {
@@ -188,19 +287,20 @@ impl Down {
                 Reply::Done { id, result, .. } if self.cur.as_ref().is_some_and(|c| c.id == id) => {
                     self.drain();
                     let c = self.cur.take().unwrap();
+                    // The part came from another version of the file (it was replaced): start over once.
+                    if c.mismatch && !c.restarted && !self.prog.cancelled.get() {
+                        let _ = std::fs::remove_file(&c.part);
+                        self.start(c.name, true);
+                        continue;
+                    }
                     match result {
                         Ok(_) => {
-                            // The part is longer than the server file (it was replaced): start over once.
-                            if !c.restarted && c.first_len.is_some_and(|l| l < c.base) {
-                                let _ = std::fs::remove_file(&c.part);
-                                self.start(c.name, true);
-                                continue;
-                            }
                             let fin = self.to.join(&c.name);
                             let _ = std::fs::remove_file(&fin);
                             if let Err(e) = std::fs::rename(&c.part, &fin) {
                                 return self.end(Err(format!("Cannot rename {}: {e}", c.part.display())));
                             }
+                            let _ = std::fs::remove_file(&c.sidecar);
                             self.out.push(fin);
                             if !self.next() {
                                 return false;
@@ -221,10 +321,21 @@ impl Down {
 
 /// Download `files` of server directory `dir` into folder `to`, one after another. Resumes a
 /// `.part` left by an earlier attempt. `done` gets the final paths or the error.
+/// A second download of a file already downloading into the same folder is refused.
 pub fn download(conn: &ConnRef, dir: String, files: Vec<String>, to: PathBuf, done: impl FnOnce(Result<Vec<PathBuf>, String>) + 'static) {
-    let Some(sess) = open_session(conn) else { return done(Err("Cancelled.".into())) };
-    let user = conn.borrow().cfg.user.clone();
-    let mut st = Down { sess, dir, user, to, queue: files.into(), out: vec![], cur: None, prog: Prog::new("Download"), done: Some(Box::new(done)) };
+    let held: Vec<PathBuf> = files.iter().map(|f| part_path(&to, f)).collect();
+    if let Err(i) = hold(&held) {
+        return done(Err(format!("{} is already downloading into {}.", files[i], to.display())));
+    }
+    let Some(sess) = open_session(conn) else {
+        release(&held);
+        return done(Err("Cancelled.".into()));
+    };
+    let (user, source) = {
+        let c = conn.borrow();
+        (c.cfg.user.clone(), source_of(&c.cfg))
+    };
+    let mut st = Down { sess, dir, user, source, to, queue: files.into(), held, out: vec![], cur: None, prog: Prog::new("Download"), done: Some(Box::new(done)) };
     crate::hub::every_tick(move || st.tick());
 }
 
@@ -266,6 +377,12 @@ impl Up {
             }
         }
         if n == 0 {
+            if self.sent < self.len {
+                return self.end(Err(format!(
+                    "The local file got shorter while uploading ({} of {} bytes sent). {} on the server is incomplete.",
+                    self.sent, self.len, self.file
+                )));
+            }
             return self.end(Ok(()));
         }
         buf.truncate(n);
@@ -277,7 +394,12 @@ impl Up {
     }
 
     fn tick(&mut self) -> bool {
-        while let Ok(r) = self.sess.replies.try_recv() {
+        loop {
+            let r = match self.sess.replies.try_recv() {
+                Ok(r) => r,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return self.end(Err(format!("The upload session ended unexpectedly. {} on the server may be incomplete.", self.file))),
+            };
             match r {
                 Reply::Connected => {
                     if !self.send() {
@@ -341,5 +463,18 @@ mod tests {
         assert_eq!(resume_offset(&p), 0);
         std::fs::write(&p, [0u8; 10]).unwrap();
         assert_eq!(resume_offset(&p), 10);
+        assert_eq!(sidecar_path(&d, "a.dmp"), d.join("a.dmp.part.json"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn one_download_per_part_file() {
+        let (a, b) = (PathBuf::from("/x/a.dmp.part"), PathBuf::from("/x/b.dmp.part"));
+        assert_eq!(hold(std::slice::from_ref(&a)), Ok(()));
+        assert_eq!(hold(&[b.clone(), a.clone()]), Err(1), "a is taken");
+        assert_eq!(hold(std::slice::from_ref(&b)), Ok(()), "a refused request reserves nothing");
+        release(&[a.clone(), b]);
+        assert_eq!(hold(std::slice::from_ref(&a)), Ok(()));
+        release(&[a]);
     }
 }
