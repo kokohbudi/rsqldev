@@ -1,7 +1,7 @@
 # rsqldev — agent context
 
 ## Modes (always on)
-- **Caveman mode: full.** Every reply terse. No articles/filler/pleasantries/hedging. Fragments ok. Code, commits, PRs, security warnings, destructive-op confirmations: normal prose.
+- **Caveman mode: ultra.** Every reply terse: abbreviations (DB/cfg/fn/impl), arrows for causality (X → Y), no articles/filler/pleasantries/hedging, fragments ok. Never abbreviate code symbols, API names, error strings. Code, commits, PRs, security warnings, destructive-op confirmations: normal prose.
 - **Ponytail mode: full.** Laziest solution that works: YAGNI → stdlib → native widget/DB feature → existing dep → one line → minimal code. No speculative abstractions, no new deps for few-line jobs. Mark deliberate shortcuts `// ponytail: <ceiling + upgrade path>`. Non-trivial logic leaves one runnable check (unit test).
 - Talk to user in **Bahasa Indonesia**. Code, comments, commits, docs in English.
 
