@@ -54,6 +54,50 @@ pub fn quote(db: Db, ident: &str) -> String {
     }
 }
 
+/// Session / lock monitor queries, tried in order (later ones are fallbacks for servers without
+/// the blocking views, e.g. MariaDB without the sys schema). Rows with a non-empty BLOCKED_BY
+/// sort first. None = no sessions to show (file databases).
+pub fn sessions_sql(db: Db) -> Option<Vec<&'static str>> {
+    Some(match db {
+        Db::Oracle => vec![
+            "SELECT s.sid, s.serial# AS serial, s.username, s.status, s.osuser, s.machine, s.program, s.blocking_session AS blocked_by, s.event, s.seconds_in_wait AS wait_s, s.sql_id, s.logon_time FROM v$session s WHERE s.type = 'USER' ORDER BY s.blocking_session NULLS LAST, s.sid",
+        ],
+        Db::Postgres => vec![
+            "SELECT pid, usename AS username, datname AS database, state, application_name, client_addr::text AS client, NULLIF(array_to_string(pg_blocking_pids(pid), ','), '') AS blocked_by, wait_event_type || ':' || wait_event AS wait, (now() - query_start)::text AS running_for, left(query, 300) AS query FROM pg_stat_activity WHERE backend_type = 'client backend' ORDER BY cardinality(pg_blocking_pids(pid)) DESC, pid",
+            "SELECT pid, usename AS username, datname AS database, state, application_name, left(query, 300) AS query FROM pg_stat_activity ORDER BY pid",
+        ],
+        Db::Mysql => vec![
+            "SELECT p.id, p.user, p.host, p.db, p.command, p.time, p.state, w.blocking_pid AS blocked_by, LEFT(p.info, 300) AS query FROM information_schema.processlist p LEFT JOIN sys.innodb_lock_waits w ON w.waiting_pid = p.id ORDER BY w.blocking_pid IS NULL, p.time DESC",
+            "SELECT id, user, host, db, command, time, state, LEFT(info, 300) AS query FROM information_schema.processlist ORDER BY time DESC",
+        ],
+        Db::Mssql => vec![
+            "SELECT s.session_id, s.login_name, s.host_name, s.program_name, DB_NAME(s.database_id) AS db, s.status, NULLIF(r.blocking_session_id, 0) AS blocked_by, r.wait_type, r.total_elapsed_time / 1000 AS elapsed_s, LEFT(t.text, 300) AS query FROM sys.dm_exec_sessions s LEFT JOIN sys.dm_exec_requests r ON r.session_id = s.session_id OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) t WHERE s.is_user_process = 1 ORDER BY CASE WHEN r.blocking_session_id > 0 THEN 0 ELSE 1 END, s.session_id",
+        ],
+        Db::Clickhouse => vec!["SELECT query_id, user, elapsed, read_rows, formatReadableSize(memory_usage) AS memory, left(query, 300) AS query FROM system.processes ORDER BY elapsed DESC"],
+        Db::Sqlite | Db::Duckdb => return None,
+    })
+}
+
+/// Statement that ends the session in `row` (as returned by [`sessions_sql`]). Ids must be
+/// plain numbers (ClickHouse: a UUID-like query id), so a grid value cannot inject SQL.
+pub fn kill_sql(db: Db, row: &[Option<String>]) -> Option<String> {
+    let num = |i: usize| row.get(i)?.as_deref()?.trim().parse::<u64>().ok();
+    Some(match db {
+        Db::Oracle => format!("ALTER SYSTEM KILL SESSION '{},{}' IMMEDIATE", num(0)?, num(1)?),
+        Db::Postgres => format!("SELECT pg_terminate_backend({})", num(0)?),
+        Db::Mysql | Db::Mssql => format!("KILL {}", num(0)?),
+        // ClickHouse strings take backslash escapes: accept only id characters, no escaping games.
+        Db::Clickhouse => {
+            let id = row.first()?.as_deref()?.trim();
+            if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                return None;
+            }
+            format!("KILL QUERY WHERE query_id = '{id}'")
+        }
+        Db::Sqlite | Db::Duckdb => return None,
+    })
+}
+
 /// `SELECT COUNT(*)` over a query, for Count Rows without fetching. None when the statement
 /// cannot be wrapped (not a plain query; SQL Server forbids a CTE inside a derived table).
 pub fn count_sql(db: Db, sql: &str) -> Option<String> {
@@ -538,6 +582,16 @@ pub fn fold(db: Db, ident: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_kill() {
+        let r = |v: &[&str]| v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>();
+        assert_eq!(kill_sql(Db::Oracle, &r(&["12", "345"])).unwrap(), "ALTER SYSTEM KILL SESSION '12,345' IMMEDIATE");
+        assert_eq!(kill_sql(Db::Postgres, &r(&["99"])).unwrap(), "SELECT pg_terminate_backend(99)");
+        assert!(kill_sql(Db::Mysql, &r(&["1; DROP TABLE x"])).is_none(), "non-numeric id refused");
+        assert_eq!(kill_sql(Db::Clickhouse, &r(&["5a1c-9f_0"])).unwrap(), "KILL QUERY WHERE query_id = '5a1c-9f_0'");
+        assert!(kill_sql(Db::Clickhouse, &r(&["a\\' OR 1=1 --"])).is_none());
+    }
 
     #[test]
     fn counting() {

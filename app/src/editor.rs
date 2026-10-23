@@ -9,6 +9,7 @@ const S_STRING: i32 = 2;
 const S_NUMBER: i32 = 3;
 const S_KEYWORD: i32 = 4;
 const S_IDENT_Q: i32 = 5;
+pub const MARK_ERROR: i32 = 1;
 
 pub const KEYWORDS: &[&str] = &[
     "ADD", "ALL", "ALTER", "AND", "ANY", "AS", "ASC", "BEGIN", "BETWEEN", "BODY", "BY", "CASE", "CHECK", "CLOSE", "COLUMN", "COMMENT",
@@ -39,6 +40,8 @@ pub fn new_editor(parent: &dyn WxWidget, font_face: &str, font_size: i32) -> Sty
     stc.style_set_foreground(S_KEYWORD, rgb(kw));
     stc.style_set_bold(S_KEYWORD, true);
     stc.style_set_foreground(S_IDENT_Q, rgb(fg));
+    // Lines with PL/SQL compilation errors: tinted background.
+    stc.marker_define_symbol(MARK_ERROR, MarkerSymbol::Background, rgb(p.deleted_bg), rgb(p.deleted_bg));
     stc.style_set_background(33, rgb(margin)); // STYLE_LINENUMBER
     stc.style_set_foreground(33, rgb(p.ed_margin_text));
     // SCLEX_CONTAINER = 0 (wxDragon's Lexer enum is off: its Container = 2 is SCLEX_PYTHON).

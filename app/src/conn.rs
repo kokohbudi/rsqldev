@@ -17,6 +17,16 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 pub type ConnRef = Rc<RefCell<Conn>>;
+
+thread_local! {
+    /// Metadata requests sent and not yet answered (tree, object tabs, completion, counts),
+    /// including ones still queued behind another query. Drives the activity bar.
+    static META_PENDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub fn meta_pending() -> usize {
+    META_PENDING.with(std::cell::Cell::get)
+}
 /// Shared handle to an open cursor; set to None to close it.
 pub type Rows = Rc<RefCell<Option<Receiver<Event>>>>;
 
@@ -228,7 +238,16 @@ impl Conn {
         }
         let lane = c.lane(meta);
         let (id, rx) = lane.s.exec(sql, fetch);
-        lane.pending.insert(id, Box::new(done));
+        let done: DoneCb = if meta {
+            META_PENDING.with(|p| p.set(p.get() + 1));
+            Box::new(move |d| {
+                META_PENDING.with(|p| p.set(p.get().saturating_sub(1)));
+                done(d)
+            })
+        } else {
+            Box::new(done)
+        };
+        lane.pending.insert(id, done);
         let rows: Rows = Rc::new(RefCell::new(Some(rx)));
         if !meta {
             c.open_fetch = Some(rows.clone());

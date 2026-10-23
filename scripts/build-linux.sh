@@ -20,13 +20,5 @@ docker run --rm --platform "$P" -v "$PWD":/src -w /src -e ARCH="$ARCH" -e DEBIAN
   curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal
   . "$HOME/.cargo/env"
   cargo build --release -p rsqldev
-  OUT=dist/rsqldev-linux-$ARCH
-  rm -rf "$OUT" && mkdir -p "$OUT"
-  cp "$CARGO_TARGET_DIR/release/rsqldev" "$OUT/"
-  strip "$OUT/rsqldev"
-  cp app/assets/icon-256.png "$OUT/rsqldev.png"
-  cp scripts/linux/rsqldev.desktop scripts/linux/install.sh "$OUT/"
-  tar -C dist -czf "dist/rsqldev-linux-$ARCH.tar.gz" "rsqldev-linux-$ARCH"
-  rm -rf "$OUT"
-  echo "Built dist/rsqldev-linux-$ARCH.tar.gz"
+  scripts/linux/package.sh "$ARCH" "$CARGO_TARGET_DIR"
 '
