@@ -27,10 +27,16 @@ pub fn set(f: impl Fn() -> bool + 'static) {
 
 /// Run `f` (code moving a cursor or a selection) without it changing the Copy target.
 pub fn quietly<R>(f: impl FnOnce() -> R) -> R {
-    let was = QUIET.with(|q| q.replace(true));
-    let r = f();
-    QUIET.with(|q| q.set(was));
-    r
+    // Restored on drop: a panic inside `f` (wxDragon catches callback panics) must not leave
+    // QUIET set, which would silently disable Copy for the rest of the session.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            QUIET.with(|q| q.set(self.0));
+        }
+    }
+    let _restore = Restore(QUIET.with(|q| q.replace(true)));
+    f()
 }
 
 /// Copy from the current target. False when there is none (or it was closed).

@@ -287,11 +287,21 @@ impl Down {
                 Reply::Done { id, result, .. } if self.cur.as_ref().is_some_and(|c| c.id == id) => {
                     self.drain();
                     let c = self.cur.take().unwrap();
-                    // The part came from another version of the file (it was replaced): start over once.
-                    if c.mismatch && !c.restarted && !self.prog.cancelled.get() {
+                    // The part came from another version of the file (it was replaced): start over
+                    // once. Its bytes are never renamed into place, even when the worker reports Ok
+                    // or the user cancelled at that moment.
+                    if c.mismatch {
                         let _ = std::fs::remove_file(&c.part);
-                        self.start(c.name, true);
-                        continue;
+                        let _ = std::fs::remove_file(&c.sidecar);
+                        if !c.restarted && !self.prog.cancelled.get() {
+                            self.start(c.name, true);
+                            continue;
+                        }
+                        return self.end(Err(if self.prog.cancelled.get() {
+                            "Cancelled.".into()
+                        } else {
+                            format!("{} changed on the server during the download; start it again.", c.name)
+                        }));
                     }
                     match result {
                         Ok(_) => {
