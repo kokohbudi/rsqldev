@@ -687,6 +687,68 @@ pub fn code_sql(db: Db, kind: &str, owner: &str, name: &str) -> Option<(String, 
     }
 }
 
+/// Run PL/SQL (Oracle): arguments of `[owner.][package.]name`. Columns: owner, package_name,
+/// object_name, argument_name, position, data_type, in_out, overload; first overload first.
+pub fn plsql_args_sql(ident: &str) -> String {
+    let p: Vec<String> = ident.split('.').map(|s| lit(&fold(Db::Oracle, s.trim().trim_matches('"')))).collect();
+    let cur = "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')";
+    let cond = match p.as_slice() {
+        [n] => format!("object_name = '{n}' AND package_name IS NULL AND owner = {cur}"),
+        [a, n] => format!("object_name = '{n}' AND ((owner = '{a}' AND package_name IS NULL) OR (package_name = '{a}' AND owner = {cur}))"),
+        [o, k, n, ..] => format!("object_name = '{n}' AND owner = '{o}' AND package_name = '{k}'"),
+        [] => "1 = 0".into(),
+    };
+    format!("SELECT owner, package_name, object_name, argument_name, position, data_type, in_out, overload FROM all_arguments WHERE data_level = 0 AND {cond} ORDER BY overload NULLS FIRST, position")
+}
+
+/// Anonymous block calling the procedure / function described by [`plsql_args_sql`] rows:
+/// one variable per argument (IN values to fill in), OUT values and the return printed.
+pub fn plsql_block(rows: &[Vec<Option<String>>]) -> Option<String> {
+    let get = |r: &Vec<Option<String>>, i: usize| r.get(i).cloned().flatten().unwrap_or_default();
+    let first = rows.first()?;
+    let (owner, pkg, name, ov) = (get(first, 0), get(first, 1), get(first, 2), get(first, 7));
+    let rows: Vec<_> = rows.iter().filter(|r| (get(r, 0), get(r, 1), get(r, 7)) == (owner.clone(), pkg.clone(), ov.clone())).collect();
+    let ty = |dt: &str| match dt {
+        "VARCHAR2" | "NVARCHAR2" | "CHAR" | "NCHAR" | "RAW" => format!("{dt}(32767)"),
+        "REF CURSOR" => "SYS_REFCURSOR".into(),
+        "PL/SQL BOOLEAN" => "BOOLEAN".into(),
+        "NUMBER" | "DATE" | "CLOB" | "NCLOB" | "BLOB" | "BOOLEAN" | "BINARY_INTEGER" | "PLS_INTEGER" | "INTEGER" | "FLOAT" | "BINARY_FLOAT" | "BINARY_DOUBLE" | "ROWID" => dt.into(),
+        t if t.starts_with("TIMESTAMP") || t.starts_with("INTERVAL") => t.into(),
+        t => format!("{t} /* adjust type */"),
+    };
+    let printable = |dt: &str| !matches!(dt, "REF CURSOR" | "PL/SQL BOOLEAN" | "BOOLEAN" | "BLOB" | "PL/SQL RECORD" | "PL/SQL TABLE" | "TABLE" | "OBJECT" | "VARRAY");
+    let target = [owner.as_str(), pkg.as_str(), name.as_str()].iter().filter(|s| !s.is_empty()).map(|s| quote(Db::Oracle, s)).collect::<Vec<_>>().join(".");
+    let mut decl = String::new();
+    let mut prints = String::new();
+    let mut args = vec![];
+    let mut ret = None;
+    for r in &rows {
+        let (arg, pos, dt, io) = (get(r, 3), get(r, 4), get(r, 5), get(r, 6));
+        if arg.is_empty() {
+            // Function return (position 0); a procedure without arguments has one empty row.
+            if pos == "0" && !dt.is_empty() {
+                decl += &format!("  v_return {};\n", ty(&dt));
+                if printable(&dt) {
+                    prints += "  DBMS_OUTPUT.PUT_LINE('v_return = ' || v_return);\n";
+                }
+                ret = Some(());
+            }
+            continue;
+        }
+        let v = quote(Db::Oracle, &arg);
+        let init = if io == "OUT" { String::new() } else { " := NULL".into() };
+        decl += &format!("  {v} {}{init};  -- {io}\n", ty(&dt));
+        if io != "IN" && printable(&dt) {
+            prints += &format!("  DBMS_OUTPUT.PUT_LINE('{} = ' || {v});\n", lit(&arg));
+        }
+        args.push(format!("{v} => {v}"));
+    }
+    let call = if args.is_empty() { target } else { format!("{target}(\n    {}\n  )", args.join(",\n    ")) };
+    let call = if ret.is_some() { format!("v_return := {call}") } else { call };
+    let decl = if decl.is_empty() { String::new() } else { format!("DECLARE\n{decl}") };
+    Some(format!("SET SERVEROUTPUT ON\n{decl}BEGIN\n  {call};\n{prints}END;\n/\n"))
+}
+
 /// Columns query for DESCRIBE in the script runner.
 pub fn describe_sql(db: Db, owner: &str, name: &str) -> Option<String> {
     children_sql(db, TABLE).map(|s| fill(db, &s, owner, name))
@@ -704,6 +766,25 @@ pub fn fold(db: Db, ident: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plsql_run_block() {
+        assert!(plsql_args_sql("hr.pkg.f").contains("owner = 'HR' AND package_name = 'PKG'"));
+        let r = |v: &[&str]| v.iter().map(|x| (!x.is_empty()).then(|| x.to_string())).collect::<Vec<_>>();
+        let rows = vec![
+            r(&["HR", "PKG", "F", "", "0", "NUMBER", "OUT", "1"]),
+            r(&["HR", "PKG", "F", "P_ID", "1", "NUMBER", "IN", "1"]),
+            r(&["HR", "PKG", "F", "P_NAME", "2", "VARCHAR2", "OUT", "1"]),
+            r(&["HR", "PKG", "F", "P_X", "1", "DATE", "IN", "2"]),
+        ];
+        let b = plsql_block(&rows).unwrap();
+        assert_eq!(
+            b,
+            "SET SERVEROUTPUT ON\nDECLARE\n  v_return NUMBER;\n  \"P_ID\" NUMBER := NULL;  -- IN\n  \"P_NAME\" VARCHAR2(32767);  -- OUT\nBEGIN\n  v_return := \"HR\".\"PKG\".\"F\"(\n    \"P_ID\" => \"P_ID\",\n    \"P_NAME\" => \"P_NAME\"\n  );\n  DBMS_OUTPUT.PUT_LINE('v_return = ' || v_return);\n  DBMS_OUTPUT.PUT_LINE('P_NAME = ' || \"P_NAME\");\nEND;\n/\n"
+        );
+        let none = vec![r(&["HR", "", "P", "", "1", "", "IN", ""])];
+        assert_eq!(plsql_block(&none).unwrap(), "SET SERVEROUTPUT ON\nBEGIN\n  \"HR\".\"P\";\nEND;\n/\n");
+    }
 
     #[test]
     fn autotrace_hint() {

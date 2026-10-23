@@ -648,6 +648,32 @@ impl Worksheet {
         self.explain_step(ex.stmts, ex.show, 0);
     }
 
+    /// Run ▸ Run PL/SQL (Oracle): a worksheet with an anonymous block calling the procedure or
+    /// function under the caret, its arguments declared to fill in.
+    pub fn run_plsql(&self) {
+        if self.kind() != Kind::Oracle {
+            return crate::ui::info(&self.panel, "Run PL/SQL is available on Oracle connections.");
+        }
+        let sel = self.editor.get_selected_text();
+        let guess = if sel.trim().is_empty() { ident_at(&self.editor.get_text(), self.editor.get_current_pos() as usize) } else { sel.trim().to_string() };
+        let Some(name) = crate::ui::ask(&self.panel, "Procedure or function ([owner.][package.]name):", "Run PL/SQL", &guess).filter(|n| !n.trim().is_empty()) else { return };
+        let c = self.conn();
+        let c2 = c.clone();
+        Conn::meta_query(&c, &dialect::plsql_args_sql(name.trim()), move |r| {
+            let app = crate::app();
+            match r.map(|r| dialect::plsql_block(&r.rows)) {
+                Ok(Some(block)) => {
+                    app.open_worksheet(c2);
+                    if let Some(ws) = app.current_sheet() {
+                        ws.editor.set_text(&block);
+                    }
+                }
+                Ok(None) => crate::ui::info(&app.frame, &format!("No procedure or function {} visible to this user.", name.trim())),
+                Err(e) => crate::ui::error(&app.frame, &e),
+            }
+        });
+    }
+
     /// Run the query and show the plan with actual rows / time (Oracle ALLSTATS LAST,
     /// EXPLAIN ANALYZE elsewhere) in the Explain Plan pane.
     pub fn autotrace(&self) {
