@@ -400,6 +400,13 @@ impl Worksheet {
         })
     }
 
+    /// DELETE / UPDATE without WHERE: ask before it touches every row.
+    fn allow(&self, sql: &str) -> bool {
+        let Some(verb) = script::unbounded_dml(sql) else { return true };
+        let head: String = sql.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
+        crate::ui::confirm(&self.panel, &format!("{verb} without WHERE changes every row of the table:\n\n{head}\n\nRun it anyway?"))
+    }
+
     /// Tint editor lines named in a compile-error report (`LINE/COL  ERROR` rows, numbered from
     /// the statement that starts at 1-based editor line `start`).
     fn mark_errors(&self, start: i32, err: &str) {
@@ -431,6 +438,9 @@ impl Worksheet {
             return;
         }
         let Some(sql) = self.substitute(&item.text) else { return };
+        if !self.allow(&sql) {
+            return;
+        }
         crate::app().add_history(&sql);
         let line = self.line_of(item.start);
         let sql = if item.kind == script::Kind::Block { format!("\u{1}{sql}") } else { sql };
@@ -582,6 +592,11 @@ impl Worksheet {
             self.running.set(false);
             return;
         };
+        if !self.allow(&sql) {
+            self.out(&format!("\nScript stopped at line {}: not confirmed.\n", self.line_of(item.start)));
+            self.running.set(false);
+            return next(items);
+        }
         self.script_sql(sql, item.start, items, i, Box::new(next));
     }
 

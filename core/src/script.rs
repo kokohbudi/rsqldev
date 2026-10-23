@@ -413,6 +413,43 @@ pub fn bind_literals(text: &str, ask: &mut dyn FnMut(&str) -> Option<String>) ->
     Some(out)
 }
 
+/// `DELETE` / `UPDATE` with no top-level `WHERE` (one inside a subquery, string or comment does
+/// not count): returns the verb, so the worksheet can confirm before touching every row.
+pub fn unbounded_dml(sql: &str) -> Option<&'static str> {
+    let verb = match crate::first_keyword(sql).as_str() {
+        "DELETE" => "DELETE",
+        "UPDATE" => "UPDATE",
+        _ => return None,
+    };
+    let (s, b) = (sql, sql.as_bytes());
+    let (mut i, mut depth) = (0, 0i32);
+    while i < b.len() {
+        let rest = &s[i..];
+        match b[i] {
+            _ if rest.starts_with("--") => i = next_line(s, i),
+            _ if rest.starts_with("/*") => i = s[i + 2..].find("*/").map_or(s.len(), |n| i + 2 + n + 2),
+            q @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < b.len() && !(b[i] == q && b.get(i + 1) != Some(&q)) {
+                    i += if b[i] == q { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'(' => (depth, i) = (depth + 1, i + 1),
+            b')' => (depth, i) = (depth - 1, i + 1),
+            c if c.is_ascii_alphabetic() => {
+                let end = rest.find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).map_or(s.len(), |n| i + n);
+                if depth == 0 && s[i..end].eq_ignore_ascii_case("WHERE") {
+                    return None;
+                }
+                i = end;
+            }
+            c => i += c.len_utf8_hint(),
+        }
+    }
+    Some(verb)
+}
+
 /// What the worksheet should do for a command item.
 #[derive(Debug, PartialEq)]
 pub enum Action {
@@ -630,6 +667,16 @@ mod tests {
         assert_eq!(command("@/tmp/x.sql", &mut d), Action::Include("/tmp/x.sql".into()));
         command("set define off", &mut d);
         assert_eq!(d.substitute("a & b &x", &mut |_| None).unwrap(), "a & b &x");
+    }
+
+    #[test]
+    fn unbounded() {
+        assert_eq!(unbounded_dml("delete from emp"), Some("DELETE"));
+        assert_eq!(unbounded_dml("UPDATE emp SET sal = (SELECT max(sal) FROM emp WHERE 1 = 1) -- where"), Some("UPDATE"));
+        assert_eq!(unbounded_dml("update emp set note = 'where' "), Some("UPDATE"));
+        assert_eq!(unbounded_dml("delete from emp where id = 1"), None);
+        assert_eq!(unbounded_dml("UPDATE emp SET x = 1\nWHERE id IN (SELECT id FROM t)"), None);
+        assert_eq!(unbounded_dml("select * from emp"), None);
     }
 
     #[test]
