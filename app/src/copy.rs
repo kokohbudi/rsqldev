@@ -2,8 +2,10 @@
 //! before grids, the tree or text panes see it, so each of them registers itself here when the
 //! user selects in it, and the menu copies from the last one. wxDragon has no FindFocus, and a
 //! grid's focus sits on an inner window that sends the Grid no focus events.
+//! Only the user's own selecting counts: code that moves a cursor or rebuilds a tree runs inside
+//! [`quietly`], so a refresh never steals the target.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wxdragon::prelude::*;
 
@@ -12,11 +14,23 @@ type Target = Rc<dyn Fn() -> bool>;
 
 thread_local! {
     static TARGET: RefCell<Option<Target>> = const { RefCell::new(None) };
+    static QUIET: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Make `f` what Copy copies from, until something else is selected.
+/// Make `f` what Copy copies from, until something else is selected. Ignored inside [`quietly`].
 pub fn set(f: impl Fn() -> bool + 'static) {
+    if QUIET.with(Cell::get) {
+        return;
+    }
     TARGET.with(|t| *t.borrow_mut() = Some(Rc::new(f)));
+}
+
+/// Run `f` (code moving a cursor or a selection) without it changing the Copy target.
+pub fn quietly<R>(f: impl FnOnce() -> R) -> R {
+    let was = QUIET.with(|q| q.replace(true));
+    let r = f();
+    QUIET.with(|q| q.set(was));
+    r
 }
 
 /// Copy from the current target. False when there is none (or it was closed).

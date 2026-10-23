@@ -84,6 +84,7 @@ impl Navigator {
             }
         });
         // Ctrl+C / Cmd+C copies the selected node's name (connection, table, column, ...).
+        // Registered on focus and on the user's selecting; rebuilds from code run quietly.
         let copy_target = move || {
             crate::copy::set(move || {
                 if !tree.is_valid() {
@@ -105,7 +106,7 @@ impl Navigator {
         let Some(root) = self.tree.get_root_item() else { return };
         if let Some((c, _)) = self.tree.get_first_child(&root) {
             self.tree.expand(&c);
-            self.tree.select_item(&c);
+            crate::copy::quietly(|| self.tree.select_item(&c));
         }
     }
 
@@ -149,6 +150,10 @@ impl Navigator {
 
     /// Rebuild the top level from saved connections, grouped by folder.
     pub fn reload(&self, conns: &[ConnConfig]) {
+        crate::copy::quietly(|| self.rebuild(conns));
+    }
+
+    fn rebuild(&self, conns: &[ConnConfig]) {
         let t = self.tree;
         t.delete_all_items();
         let Some(root) = t.add_root("Connections", None, None) else { return };
@@ -178,11 +183,13 @@ impl Navigator {
         match self.node(i) {
             Node::Conn(name) => crate::app().connect(&name.clone(), move |c| {
                 let owner = c.borrow().schema.clone();
-                nav.tree.delete_children(&item);
-                nav.set_conn_image(&item, &name, true);
-                nav.add_folders(&item, &name, &owner, c.borrow().kind);
-                nav.add(&item, dialect::schemas_label(c.borrow().kind), Node::Schemas { conn: name.clone() }, true);
-                nav.tree.expand(&item);
+                crate::copy::quietly(|| {
+                    nav.tree.delete_children(&item);
+                    nav.set_conn_image(&item, &name, true);
+                    nav.add_folders(&item, &name, &owner, c.borrow().kind);
+                    nav.add(&item, dialect::schemas_label(c.borrow().kind), Node::Schemas { conn: name.clone() }, true);
+                    nav.tree.expand(&item);
+                });
             }),
             Node::Schema { conn, owner } => {
                 if let Some(c) = crate::app().open_conn(&conn) {
@@ -247,13 +254,15 @@ impl Navigator {
         let nav = *self;
         let item = i.clone();
         Conn::meta_query(&c, &sql, move |r| {
-            nav.tree.delete_children(&item);
-            match r {
-                Ok(r) => fill(&nav, &item, kind, r.rows),
-                Err(e) => {
-                    nav.add(&item, &format!("Error: {e}"), Node::Leaf, false);
+            crate::copy::quietly(|| {
+                nav.tree.delete_children(&item);
+                match r {
+                    Ok(r) => fill(&nav, &item, kind, r.rows),
+                    Err(e) => {
+                        nav.add(&item, &format!("Error: {e}"), Node::Leaf, false);
+                    }
                 }
-            }
+            });
         });
     }
 
