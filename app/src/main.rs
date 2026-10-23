@@ -15,6 +15,7 @@ mod theme;
 mod object_view;
 mod prefs;
 mod sessions;
+mod snippets;
 mod ui;
 mod value;
 mod worksheet;
@@ -76,6 +77,8 @@ const ID_FORMAT: i32 = ID_HIGHEST + 28;
 const ID_IMPORT_CONNS: i32 = ID_HIGHEST + 29;
 const ID_UPDATES: i32 = ID_HIGHEST + 30;
 const ID_SESSIONS: i32 = ID_HIGHEST + 31;
+const ID_SNIPPET: i32 = ID_HIGHEST + 32;
+const ID_SNIPPET_SAVE: i32 = ID_HIGHEST + 33;
 
 enum Page {
     Sheet(SheetRef),
@@ -667,6 +670,11 @@ impl App {
                     complete::show(s.editor, &s.conn(), true);
                 }
             }
+            ID_SNIPPET | ID_SNIPPET_SAVE => {
+                if let Some(s) = sheet {
+                    if id == ID_SNIPPET { snippets::insert(&self.frame, s.editor) } else { snippets::save_selection(&self.frame, s.editor) }
+                }
+            }
             ID_RUN | ID_SCRIPT | ID_EXPLAIN | ID_COMMIT | ID_ROLLBACK | ID_CANCEL_STMT | ID_HISTORY | ID_CLEAR => {
                 let Some(s) = sheet else { return true };
                 match id {
@@ -800,6 +808,8 @@ fn menus(frame: &Frame) {
         .append_separator()
         .append_item(ID_COMPLETE, "Completion &Insight\tRawCtrl+Space", "Complete keywords, tables and columns")
         .append_item(ID_FORMAT, "F&ormat SQL\tCtrl+F7", "Format the selection, or the whole worksheet")
+        .append_item(ID_SNIPPET, "Insert S&nippet…\tCtrl+Shift+J", "Insert a SQL template at the caret")
+        .append_item(ID_SNIPPET_SAVE, "Save Selection as Snippet…", "Keep the selected SQL as one of your snippets")
         .append_separator()
         .append_item(ID_FIND, "&Find…\tCtrl+F", "")
         .append_item(ID_REPLACE, "R&eplace…\tCtrl+R", "")
@@ -892,6 +902,7 @@ const SHORTCUTS: &str = "Worksheet
 Editor
   Completion Insight       Ctrl+Space (also after typing alias.)
   Format SQL               Ctrl/Cmd+F7
+  Insert Snippet           Ctrl/Cmd+Shift+J
   Find / Replace           Ctrl/Cmd+F / Ctrl/Cmd+R
   Find Next / Previous     F3 / Shift+F3
 
