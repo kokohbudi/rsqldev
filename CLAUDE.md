@@ -21,7 +21,7 @@ Native SQL Developer clone. Rust + wxWidgets via wxDragon 0.9.23 (real Cocoa / W
 
 ## Workflow
 - Work on `develop`. Commit per change, push a few commits at once (each push = 4 CI jobs downloading ~0.8 GB caches; too many → cache egress limit → full rebuilds). Newer push cancels older run.
-- CI: `.github/workflows/build.yml` (macOS universal, Windows x64, Linux x86_64/aarch64). Release profile = fat LTO, 1 codegen unit, stripped.
+- CI: `.github/workflows/build.yml` (macOS universal, Windows x64, Linux x86_64/aarch64). Release profile = fat LTO, 1 codegen unit, stripped. Changing any `[profile.*]` → bump `CACHE_PREFIX` in build.yml (cache key ignores profiles).
 - Release only when user asks: write the `CHANGELOG.md` entry first (version + date, **Features** and **Bug fixes** since the last tag, from `git log <last-tag>..develop`, user-facing wording), merge `develop` → `main`, bump `version` in root `Cargo.toml` (`[workspace.package]`), push tag `v*` (`release.yml` publishes zips).
 - Stage files by path, never `git add -A` (`.idea/` etc.).
 
