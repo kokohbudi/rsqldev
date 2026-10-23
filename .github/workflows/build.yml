@@ -10,6 +10,12 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+# A newer push to the same branch cancels the older run: parallel runs each download the
+# ~0.8 GB caches and ran the account's cache egress limit out (restore failed, full rebuild).
+# Tag (release) builds are never cancelled.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/') }}
 env:
   SAVE_CACHE: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' }}
 jobs:
