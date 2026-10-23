@@ -14,11 +14,11 @@ use wxdragon::prelude::*;
 
 /// What the server told us about itself (all optional).
 #[derive(Clone)]
-struct Env {
+pub(crate) struct Env {
     /// `DB_UNIQUE_NAME/CON_NAME`, empty when unknown.
-    db: String,
-    user: String,
-    enterprise: bool,
+    pub(crate) db: String,
+    pub(crate) user: String,
+    pub(crate) enterprise: bool,
 }
 
 const COMPRESSION: [(&str, Compression); 4] = [
@@ -30,6 +30,11 @@ const COMPRESSION: [(&str, Compression); 4] = [
 
 /// Tools > Data Pump > Export…: read the server environment and the directories, then open the dialog.
 pub fn show(conn: ConnRef) {
+    load(conn, dialog);
+}
+
+/// Read the server environment and the directories, then hand them to `then`.
+pub(crate) fn load(conn: ConnRef, then: impl FnOnce(ConnRef, Env, Vec<String>) + 'static) {
     let c2 = conn.clone();
     let cfg_user = conn.borrow().cfg.user.to_uppercase();
     Conn::meta_query(&conn, datapump::ENV_SQL, move |r| {
@@ -49,13 +54,13 @@ pub fn show(conn: ConnRef) {
         let c3 = c2.clone();
         Conn::meta_query(&c2, datapump::DIRECTORIES_SQL, move |r| {
             let dirs: Vec<String> = r.map(|r| r.rows.into_iter().filter_map(|row| row.into_iter().next().flatten()).collect()).unwrap_or_default();
-            dialog(c3, env, dirs);
+            then(c3, env, dirs);
         });
     });
 }
 
 /// Unquoted names are upper-cased, `"Quoted"` keeps its case.
-fn ident(s: &str) -> String {
+pub(crate) fn ident(s: &str) -> String {
     let s = s.trim();
     match s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
         Some(inner) => inner.to_string(),
@@ -64,12 +69,12 @@ fn ident(s: &str) -> String {
 }
 
 /// Non-empty trimmed items split on newlines and commas.
-fn items(text: &str) -> Vec<String> {
+pub(crate) fn items(text: &str) -> Vec<String> {
     text.split(['\n', ',']).map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect()
 }
 
 /// `SCHEMA.TABLE` or `TABLE` (default schema).
-fn split_table(s: &str, default_schema: &str) -> (String, String) {
+pub(crate) fn split_table(s: &str, default_schema: &str) -> (String, String) {
     match s.split_once('.') {
         Some((a, b)) => (ident(a), ident(b)),
         None => (default_schema.to_string(), ident(s)),
@@ -93,7 +98,7 @@ fn grid(parent: &Panel) -> Grid {
     g
 }
 
-fn muted(p: &Panel, text: &str) -> StaticText {
+pub(crate) fn muted(p: &Panel, text: &str) -> StaticText {
     let t = StaticText::builder(p).with_label(text).build();
     t.set_foreground_color(crate::theme::c(crate::theme::p().muted));
     t
@@ -385,18 +390,23 @@ fn dialog(conn: ConnRef, env: Env, dirs: Vec<String>) {
 
 /// Start the job: on the metadata session, or on a short-lived session with the password bound.
 fn run(conn: ConnRef, env: Env, spec: ExportSpec, block: String, password: Option<String>) {
-    let conn_name = conn.borrow().cfg.name.clone();
     let c2 = conn.clone();
     let spec2 = spec.clone();
     let env2 = env.clone();
-    let done = move |r: Result<(), String>| finish(&c2, &env2, &spec2, r);
+    exec(&conn, &format!("export job {}", spec.job), block, password, move |r| finish(&c2, &env2, &spec2, r));
+}
+
+/// Run a Data Pump block: on the metadata session, or (with a password) on a short-lived session
+/// with `:password` bound. `what` names the job in the status line.
+pub(crate) fn exec(conn: &ConnRef, what: &str, block: String, password: Option<String>, done: impl FnOnce(Result<(), String>) + 'static) {
+    let conn_name = conn.borrow().cfg.name.clone();
     match password {
-        None => Conn::meta_query(&conn, &block, move |r| done(r.map(|_| ()))),
+        None => Conn::meta_query(conn, &block, move |r| done(r.map(|_| ()))),
         Some(pw) => {
-            let Some(mut sess) = crate::transfer::open_session(&conn) else { return };
+            let Some(mut sess) = crate::transfer::open_session(conn) else { return };
             let mut pending: Option<u64> = None;
             let mut done = Some(done);
-            crate::app().status(0, &format!("Starting export job {} on {conn_name}…", spec.job));
+            crate::app().status(0, &format!("Starting {what} on {conn_name}…"));
             crate::hub::every_tick(move || {
                 while let Ok(r) = sess.replies.try_recv() {
                     match r {

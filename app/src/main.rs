@@ -8,6 +8,7 @@ mod copy;
 mod conn;
 mod connections;
 mod datapump_export;
+mod datapump_import;
 mod driver_manager;
 mod editor;
 mod find;
@@ -99,6 +100,7 @@ const ID_COMPARE: i32 = ID_HIGHEST + 44;
 const ID_RUN_PLSQL: i32 = ID_HIGHEST + 45;
 const ID_TOPSQL: i32 = ID_HIGHEST + 46;
 const ID_DP_EXPORT: i32 = ID_HIGHEST + 47;
+const ID_DP_IMPORT: i32 = ID_HIGHEST + 48;
 
 enum Page {
     Sheet(SheetRef),
@@ -643,6 +645,13 @@ impl App {
                     ui::info(&app().frame, "Data Pump is available on Oracle connections");
                 }
             }),
+            ID_DP_IMPORT => self.pick_conn(|c| {
+                if c.borrow().kind == rsqldev_core::registry::Kind::Oracle {
+                    datapump_import::show(c);
+                } else {
+                    ui::info(&app().frame, "Data Pump is available on Oracle connections");
+                }
+            }),
             ID_TOPSQL => self.pick_conn(|c| {
                 let a = app();
                 let title = format!("Top SQL: {}", c.borrow().cfg.name);
@@ -970,6 +979,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_SESSIONS, "S&essions…", "Sessions and locks of a connection: who blocks whom, kill session")
         .append_item(ID_TOPSQL, "&Top SQL…", "Heaviest statements on the server: elapsed, CPU, reads, executions, cost")
         .append_item(ID_DP_EXPORT, "Data Pump &Export…", "Export schemas, tables or the whole database with Oracle Data Pump (Oracle only)")
+        .append_item(ID_DP_IMPORT, "Data Pump &Import…", "Import a dump file, uploading it first if it is on this computer (Oracle only)")
         .append_item(ID_COMPARE, "Schema &Compare…", "Compare two schemas and open a script that brings the target in line")
         .append_item(ID_DRIVERS, "&Drivers…", "Download or locate native client drivers")
         .append_item(ID_PREFERENCES, "&Preferences…", "")
