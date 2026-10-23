@@ -31,8 +31,9 @@ pub fn show(frame: &Frame) {
             if s.borrow().kind != t.borrow().kind {
                 return crate::ui::error(&crate::app().frame, "Schema Compare needs two connections to the same kind of database.");
             }
-            schema_of(&s, src_schema, move |so| {
-                schema_of(&t, tgt_schema, move |to| run(s, so, t, to));
+            let (s1, t1) = (s.clone(), t.clone());
+            schema_of(&s1, src_schema, move |so| {
+                schema_of(&t1, tgt_schema, move |to| run(s, so, t, to));
             });
         });
     });
