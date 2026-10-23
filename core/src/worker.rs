@@ -112,7 +112,8 @@ impl Session {
                         let mut r = run(b.as_mut(), cmd.clone(), &mut sent);
                         // The server or a firewall dropped an idle session: reconnect once and
                         // retry, unless rows already reached the UI. Uncommitted work is lost with it.
-                        if !sent && lost(&r) && !matches!(cmd, Cmd::Download { .. }) {
+                        let query = matches!(&cmd, Cmd::Exec { sql, .. } if crate::is_query(sql));
+                        if !sent && lost(&r, query) && !matches!(cmd, Cmd::Download { .. }) {
                             if let Ok(mut nb) = crate::backend::connect(&cfg, &password, &prefs) {
                                 let _ = nb.set_autocommit(autocommit);
                                 if output {
@@ -173,12 +174,18 @@ impl Session {
     }
 }
 
-/// Error text of a dead connection: ODPI-C not connected / closed, Oracle ORA-03113, 03114,
-/// 03135 (end-of-file, not connected, lost contact) and 02396 (idle timeout). Statements only:
-/// a retried Commit would report success on a fresh session whose transaction is empty.
-fn lost(r: &Reply) -> bool {
+/// Error text of a dead connection worth one reconnect and retry. Statements only: a retried
+/// Commit would report success on a fresh session whose transaction is empty.
+/// DPI-1010 / ORA-03114 (not connected) and ORA-02396 (idle timeout) are raised before the
+/// statement reaches the server, so any statement may run again. ORA-03113 / ORA-03135
+/// (end-of-file, lost contact) and DPI-1080 can come mid-call, after the server already ran it:
+/// only a query (`query`) is safe to repeat then; DML under autocommit or a UTL_FILE upload
+/// chunk would run twice.
+fn lost(r: &Reply, query: bool) -> bool {
     let Reply::Done { result: Err(e), .. } = r else { return false };
-    ["DPI-1010", "DPI-1080", "ORA-03113", "ORA-03114", "ORA-03135", "ORA-02396"].iter().any(|c| e.contains(c))
+    let before_send = ["DPI-1010", "ORA-03114", "ORA-02396"];
+    let mid_call = ["DPI-1080", "ORA-03113", "ORA-03135"];
+    before_send.iter().any(|c| e.contains(c)) || (query && mid_call.iter().any(|c| e.contains(c)))
 }
 
 fn run(b: &mut dyn Backend, cmd: Cmd, sent: &mut bool) -> Reply {
@@ -229,6 +236,18 @@ fn run(b: &mut dyn Backend, cmd: Cmd, sent: &mut bool) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_only_when_safe() {
+        let err = |e: &str| Reply::Done { id: 1, result: Err(e.into()), output: vec![], elapsed: Duration::ZERO };
+        assert!(lost(&err("DPI-1010: not connected"), false));
+        assert!(lost(&err("ORA-02396: exceeded maximum idle time"), false));
+        // Mid-call loss: the server may have run it already, so only a query repeats.
+        assert!(!lost(&err("ORA-03113: end-of-file on communication channel"), false));
+        assert!(lost(&err("ORA-03113: end-of-file on communication channel"), true));
+        assert!(!lost(&err("ORA-00942: table or view does not exist"), true));
+        assert!(!lost(&Reply::TxDone(Err("DPI-1010".into())), true));
+    }
 
     #[test]
     fn download_needs_oracle() {
