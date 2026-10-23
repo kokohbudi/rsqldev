@@ -129,7 +129,27 @@ pub fn fill(db: Db, tpl: &str, owner: &str, name: &str) -> String {
     // MySQL / ClickHouse strings also take backslash escapes: a name ending in `\` would
     // otherwise escape the closing quote.
     let l = |s: &str| if matches!(db, Db::Mysql | Db::Clickhouse) { lit(&s.replace('\\', "\\\\")) } else { lit(s) };
-    tpl.replace("{lq}", &l(&q)).replace("{q}", &q).replace("{o}", &l(owner)).replace("{n}", &l(name))
+    let subs = [("{lq}", l(&q)), ("{q}", q.clone()), ("{o}", l(owner)), ("{n}", l(name))];
+    // One pass over the template: placeholder-like text inside a substituted name is never
+    // scanned again (chained replace() would turn a name's "{q}" into an unescaped name).
+    let mut out = String::with_capacity(tpl.len() + 64);
+    let mut rest = tpl;
+    while let Some(i) = rest.find('{') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        match subs.iter().find(|(k, _)| rest.starts_with(k)) {
+            Some((k, v)) => {
+                out.push_str(v);
+                rest = &rest[k.len()..];
+            }
+            None => {
+                out.push('{');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Folders under a connection / schema node, in SQL Developer order.
@@ -769,6 +789,12 @@ pub fn fold(db: Db, ident: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_single_pass() {
+        assert_eq!(fill(Db::Oracle, "'{n}' {q} '{lq}'", "HR", "{q}'x"), "'{q}''x' \"HR\".\"{q}'x\" '\"HR\".\"{q}''x\"'");
+        assert_eq!(fill(Db::Mysql, "'{n}'", "", "a\\"), "'a\\\\'");
+    }
 
     #[test]
     fn plsql_run_block() {
