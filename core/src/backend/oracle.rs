@@ -289,30 +289,39 @@ impl Backend for Oracle {
         out: &mut dyn std::io::Write,
         progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<u64> {
-        use oracle::sql_type::{Bfile, Lob};
-        use std::io::{Read, Seek, SeekFrom};
-        let mut st = self.c.statement("SELECT BFILENAME(:1, :2) FROM dual").lob_locator().build()?;
-        let mut bf = st.query_row_as::<Bfile>(&[&dir, &file])?;
-        bf.open_resource()?;
-        let r = (|| -> Result<u64> {
-            let len = bf.size()?;
-            bf.seek(SeekFrom::Start(offset))?;
-            let mut buf = vec![0u8; crate::datapump::DOWNLOAD_READ];
-            let mut written = 0u64;
-            loop {
-                let n = bf.read(&mut buf)?;
-                if n == 0 {
-                    return Ok(written);
-                }
-                out.write_all(&buf[..n])?;
-                written += n as u64;
-                if !progress(offset + written, len) {
-                    anyhow::bail!("cancelled");
+        use std::io::Read;
+        let (dir, file) = (dir.to_string(), file.to_string());
+        let mut buf = vec![0u8; crate::datapump::DOWNLOAD_READ];
+        let mut written = 0u64;
+        loop {
+            let mut st = self.c.statement(crate::datapump::DOWNLOAD_BLOCK).build()?;
+            st.bind(1, &dir)?;
+            st.bind(2, &file)?;
+            st.bind(3, &((offset + written + 1) as i64))?;
+            st.bind(4, &(crate::datapump::DOWNLOAD_READ as i64))?;
+            st.bind(5, &OracleType::Number(0, 0))?;
+            st.bind(6, &OracleType::BLOB)?;
+            st.execute(&[])?;
+            let len = st.bind_value::<_, u64>(5)?;
+            if offset + written < len {
+                if let Some(mut blob) = st.bind_value::<_, Option<oracle::sql_type::Blob>>(6)? {
+                    loop {
+                        let n = blob.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        out.write_all(&buf[..n])?;
+                        written += n as u64;
+                    }
                 }
             }
-        })();
-        let _ = bf.close_resource();
-        r
+            if !progress(offset + written, len) {
+                anyhow::bail!("cancelled");
+            }
+            if offset + written >= len {
+                return Ok(written);
+            }
+        }
     }
 
     fn execute_binds(&mut self, sql: &str, binds: &[Bind]) -> Result<Option<u64>> {

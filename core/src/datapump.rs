@@ -379,9 +379,17 @@ pub fn hint(err: &str, user: &str, dir: &str) -> Option<String> {
     }
 }
 
-/// Upload chunk size: one round trip carries this many bytes.
-/// Bytes per BFILE read when downloading a dump.
+/// Bytes per round trip when downloading a dump.
 pub const DOWNLOAD_READ: usize = 1024 * 1024;
+
+/// One download chunk. Binds: `:1` directory, `:2` file, `:3` 1-based start, `:4` max bytes,
+/// out `:5` file length (NUMBER), out `:6` chunk (BLOB).
+pub const DOWNLOAD_BLOCK: &str = "DECLARE\n  src BFILE := BFILENAME(:1, :2);\n  dst BLOB;\n  soff INTEGER := :3;\n  doff INTEGER := 1;\n  amt INTEGER;\n  len INTEGER;\nBEGIN\n  \
+DBMS_LOB.FILEOPEN(src, DBMS_LOB.FILE_READONLY);\n  len := DBMS_LOB.GETLENGTH(src);\n  :5 := len;\n  DBMS_LOB.CREATETEMPORARY(dst, TRUE);\n  \
+IF soff <= len THEN\n    amt := LEAST(:4, len - soff + 1);\n    DBMS_LOB.LOADBLOBFROMFILE(dst, src, amt, doff, soff);\n  END IF;\n  \
+DBMS_LOB.FILECLOSE(src);\n  :6 := dst;\nEXCEPTION WHEN OTHERS THEN\n  IF DBMS_LOB.FILEISOPEN(src) = 1 THEN DBMS_LOB.FILECLOSE(src); END IF;\n  RAISE;\nEND;";
+
+/// Upload chunk size: one round trip carries this many bytes.
 pub const UPLOAD_CHUNK: usize = 4 * 1024 * 1024;
 
 /// Binds (positional): `:1` directory, `:2` file, `:3` open mode (`wb` first chunk, `ab` after), `:4` BLOB chunk.
@@ -467,6 +475,15 @@ pub fn rename_conn(all: &mut [FileRecord], old: &str, new: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_block_binds() {
+        assert!(DOWNLOAD_BLOCK.contains("LOADBLOBFROMFILE"));
+        for i in 1..=6 {
+            assert!(DOWNLOAD_BLOCK.contains(&format!(":{i}")), ":{i}");
+        }
+        assert!(!DOWNLOAD_BLOCK.contains(":7"));
+    }
 
     fn spec() -> ExportSpec {
         ExportSpec {
