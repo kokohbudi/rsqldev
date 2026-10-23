@@ -6,7 +6,7 @@
 use crate::conn::{Conn, ConnRef};
 use crate::ui;
 use rsqldev_core::datapump::{self, Compression, Content, ExportSpec, FileKind, FileRecord, Mode};
-use rsqldev_core::worker::{Reply, Session};
+use rsqldev_core::worker::Reply;
 use rsqldev_core::Bind;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -240,7 +240,7 @@ fn dialog(conn: ConnRef, env: Env, dirs: Vec<String>) {
     let sync = {
         let last = last.clone();
         Rc::new(move || {
-            let (d, l) = datapump::default_files(job.get_value().trim(), parallel.get_value().max(1) as u32, fsize.get_value().trim());
+            let (d, l) = datapump::default_files(job.get_value().trim(), parallel.value().max(1) as u32, fsize.get_value().trim());
             let mut last = last.borrow_mut();
             if dump.get_value().trim() == last.0 {
                 dump.set_value(&d);
@@ -300,7 +300,7 @@ fn dialog(conn: ConnRef, env: Env, dirs: Vec<String>) {
             dump_file: dump.get_value().trim().to_string(),
             log_file: log.get_value().trim().to_string(),
             file_size: fsize.get_value().trim().to_uppercase(),
-            parallel: parallel.get_value().max(1) as u32,
+            parallel: parallel.value().max(1) as u32,
             content: [Content::All, Content::MetadataOnly, Content::DataOnly][content.get_selection().unwrap_or(0).min(2) as usize],
             include: items(include.get_value().as_str()).iter().map(|x| x.to_uppercase()).collect(),
             exclude: items(exclude.get_value().as_str()).iter().map(|x| x.to_uppercase()).collect(),
