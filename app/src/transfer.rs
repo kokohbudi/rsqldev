@@ -44,7 +44,7 @@ fn explain(err: &str, user: &str, dir: &str) -> String {
 }
 
 /// Own session with the connection's config; asks for the password when not saved.
-fn open_session(conn: &ConnRef) -> Option<Session> {
+pub fn open_session(conn: &ConnRef) -> Option<Session> {
     let (cfg, prefs) = (conn.borrow().cfg.clone(), conn.borrow().prefs.clone());
     let pw = config::get_password(&cfg.name).or_else(|| ui::ask_password(&crate::app().frame, "Password:"))?;
     Some(Session::open(cfg, pw, prefs))
