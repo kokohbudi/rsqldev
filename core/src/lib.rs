@@ -4,6 +4,7 @@ pub mod backend;
 pub mod compare;
 pub mod complete;
 pub mod config;
+pub mod ddl;
 pub mod dialect;
 pub mod dml;
 pub mod download;
