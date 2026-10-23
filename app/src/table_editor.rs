@@ -457,8 +457,8 @@ fn run(conn: ConnRef, stmts: Vec<String>, i: usize, done: Rc<dyn Fn()>) {
         return done();
     }
     let c = conn.clone();
-    let sql = stmts[i].clone();
-    Conn::work_query(&conn, &sql, move |r| match r {
+    let (sql, q) = (stmts[i].clone(), stmts[i].clone());
+    Conn::work_query(&conn, &q, move |r| match r {
         Ok(_) => run(c, stmts, i + 1, done),
         Err(e) => {
             let left = stmts.len() - i - 1;
