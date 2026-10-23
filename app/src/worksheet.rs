@@ -92,6 +92,7 @@ impl Worksheet {
         let b_script = mk("script", "Run Script (F5)");
         sep();
         let b_explain = mk("explain", "Explain Plan (F10)");
+        let b_autotrace = mk("autotrace", "Autotrace (F6)");
         sep();
         let b_commit = mk("commit", "Commit (F11)");
         let b_rollback = mk("rollback", "Rollback (F12)");
@@ -189,6 +190,7 @@ impl Worksheet {
             (b_run, Worksheet::run_statement),
             (b_script, Worksheet::run_script),
             (b_explain, Worksheet::explain_plan),
+            (b_autotrace, Worksheet::autotrace),
             (b_commit, Worksheet::commit),
             (b_rollback, Worksheet::rollback),
             (b_unshared, |_| {
@@ -624,20 +626,36 @@ impl Worksheet {
         });
     }
 
-    pub fn explain_plan(&self) {
+    /// The selection, or the statement under the caret, substituted.
+    fn current_sql(&self) -> Option<String> {
         let sel = self.editor.get_selected_text();
         let sql = if sel.trim().is_empty() {
             let text = self.editor.get_text();
             let items = script::split(&text, self.kind());
-            match script::statement_at(&items, self.editor.get_current_pos() as usize) {
-                Some(i) => i.text.clone(),
-                None => return,
-            }
+            script::statement_at(&items, self.editor.get_current_pos() as usize)?.text.clone()
         } else {
             sel
         };
-        let Some(sql) = self.substitute(&sql) else { return };
+        self.substitute(&sql)
+    }
+
+    pub fn explain_plan(&self) {
+        let Some(sql) = self.current_sql() else { return };
         let ex = dialect::explain(self.kind(), &sql);
+        self.bottom.set_selection(P_EXPLAIN);
+        self.explain.reset();
+        self.set_busy(true);
+        self.explain_step(ex.stmts, ex.show, 0);
+    }
+
+    /// Run the query and show the plan with actual rows / time (Oracle ALLSTATS LAST,
+    /// EXPLAIN ANALYZE elsewhere) in the Explain Plan pane.
+    pub fn autotrace(&self) {
+        let Some(sql) = self.current_sql() else { return };
+        let tag = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        let Some(ex) = dialect::autotrace(self.kind(), &sql, tag) else {
+            return crate::ui::info(&self.panel, "Autotrace runs the statement, so it is offered for queries only (SELECT / WITH without DML or FOR UPDATE), on Oracle, PostgreSQL, MySQL and DuckDB.");
+        };
         self.bottom.set_selection(P_EXPLAIN);
         self.explain.reset();
         self.set_busy(true);

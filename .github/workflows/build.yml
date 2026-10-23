@@ -46,13 +46,14 @@ jobs:
         shell: pwsh
         run: |
           $out = "rsqldev-windows-x64"
-          New-Item -ItemType Directory $out | Out-Null
+          # -Force: a zip or folder left in the workspace (restored cache) must not fail the build.
+          New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item target/release/rsqldev.exe $out
           foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
             $p = Join-Path $env:WINDIR "System32\$dll"
             if (Test-Path $p) { Copy-Item $p $out }
           }
-          Compress-Archive -Path $out -DestinationPath "$out.zip"
+          Compress-Archive -Force -Path $out -DestinationPath "$out.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: windows

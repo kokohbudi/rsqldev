@@ -88,6 +88,7 @@ const ID_BRACE: i32 = ID_HIGHEST + 39;
 const ID_BOOKMARK: i32 = ID_HIGHEST + 40;
 const ID_BOOKMARK_NEXT: i32 = ID_HIGHEST + 41;
 const ID_BOOKMARK_PREV: i32 = ID_HIGHEST + 42;
+const ID_AUTOTRACE: i32 = ID_HIGHEST + 43;
 
 enum Page {
     Sheet(SheetRef),
@@ -735,12 +736,13 @@ impl App {
                     if id == ID_SNIPPET { snippets::insert(&self.frame, s.editor) } else { snippets::save_selection(&self.frame, s.editor) }
                 }
             }
-            ID_RUN | ID_SCRIPT | ID_EXPLAIN | ID_COMMIT | ID_ROLLBACK | ID_CANCEL_STMT | ID_HISTORY | ID_CLEAR => {
+            ID_RUN | ID_SCRIPT | ID_EXPLAIN | ID_AUTOTRACE | ID_COMMIT | ID_ROLLBACK | ID_CANCEL_STMT | ID_HISTORY | ID_CLEAR => {
                 let Some(s) = sheet else { return true };
                 match id {
                     ID_RUN => s.run_statement(),
                     ID_SCRIPT => s.run_script(),
                     ID_EXPLAIN => s.explain_plan(),
+                    ID_AUTOTRACE => s.autotrace(),
                     ID_COMMIT => s.commit(),
                     ID_ROLLBACK => s.rollback(),
                     ID_CANCEL_STMT => s.cancel(),
@@ -919,6 +921,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_RUN, "Run &Statement\tCtrl+Enter", "")
         .append_item(ID_SCRIPT, "Run S&cript\tF5", "")
         .append_item(ID_EXPLAIN, "&Explain Plan\tF10", "")
+        .append_item(ID_AUTOTRACE, "&Autotrace\tF6", "Run the query and show its plan with actual rows and time")
         .append_separator()
         .append_item(ID_COMMIT, "C&ommit\tF11", "")
         .append_item(ID_ROLLBACK, "&Rollback\tF12", "")
@@ -985,6 +988,7 @@ const SHORTCUTS: &str = "Worksheet
   Run Statement            Ctrl/Cmd+Enter
   Run Script               F5
   Explain Plan             F10
+  Autotrace                F6
   Commit / Rollback        F11 / F12
   Cancel                   Ctrl/Cmd+.
   SQL History              F8

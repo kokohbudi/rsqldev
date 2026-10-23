@@ -601,6 +601,73 @@ pub fn explain(db: Db, sql: &str) -> Explain {
     }
 }
 
+/// Autotrace: run the query and show its plan with actual rows and timings. Queries only (the
+/// statement really runs). `tag` makes the Oracle cursor findable in v$sql even when DBMS
+/// output or another call ran on the session in between. None = engine not supported.
+pub fn autotrace(db: Db, sql: &str, tag: u64) -> Option<Explain> {
+    let sql = sql.trim().trim_end_matches(';');
+    // Read-only: starts with SELECT / WITH and no top-level DML (PostgreSQL `WITH ... DELETE`,
+    // `INSERT ... SELECT`). `FOR UPDATE` is refused too, it would lock rows.
+    let words = top_words(sql);
+    if !words.first().is_some_and(|(_, w)| w == "SELECT" || w == "WITH") || words.iter().any(|(_, w)| matches!(w.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")) {
+        return None;
+    }
+    let one = |p: &str| Some(Explain { stmts: vec![format!("{p} {sql}")], show: 0 });
+    match db {
+        Db::Oracle => {
+            let at = words.iter().find(|(_, w)| w == "SELECT")?.0;
+            let marker = format!("rsqldev-autotrace-{tag}");
+            let traced = format!("{} /*+ gather_plan_statistics */ /* {marker} */{}", &sql[..at + 6], &sql[at + 6..]);
+            let show = format!(
+                "SELECT t.plan_table_output FROM (SELECT sql_id, child_number FROM v$sql WHERE sql_text LIKE '%{marker}%' AND sql_text NOT LIKE '%v$sql%' ORDER BY last_active_time DESC FETCH FIRST 1 ROW ONLY) s, TABLE(DBMS_XPLAN.DISPLAY_CURSOR(s.sql_id, s.child_number, 'ALLSTATS LAST')) t"
+            );
+            Some(Explain { stmts: vec![traced, show], show: 1 })
+        }
+        Db::Postgres => one("EXPLAIN (ANALYZE, BUFFERS)"),
+        Db::Mysql | Db::Duckdb => one("EXPLAIN ANALYZE"),
+        _ => None,
+    }
+}
+
+/// Words outside parentheses, strings and comments, upper case, with their byte offsets.
+fn top_words(sql: &str) -> Vec<(usize, String)> {
+    let b = sql.as_bytes();
+    let (mut i, mut depth, mut out) = (0, 0i32, vec![]);
+    while i < b.len() {
+        let rest = &sql[i..];
+        if rest.starts_with("--") {
+            i = rest.find('\n').map_or(b.len(), |n| i + n);
+        } else if rest.starts_with("/*") {
+            i = rest[2..].find("*/").map_or(b.len(), |n| i + 2 + n + 2);
+        } else if b[i] == b'\'' || b[i] == b'"' {
+            let q = b[i];
+            i += 1;
+            while i < b.len() && !(b[i] == q && b.get(i + 1) != Some(&q)) {
+                i += if b[i] == q { 2 } else { 1 };
+            }
+            i += 1;
+        } else if b[i] == b'(' {
+            depth += 1;
+            i += 1;
+        } else if b[i] == b')' {
+            depth -= 1;
+            i += 1;
+        } else if b[i].is_ascii_alphabetic() {
+            let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '#')).map_or(b.len(), |n| i + n);
+            if depth == 0 {
+                out.push((i, sql[i..end].to_ascii_uppercase()));
+            }
+            i = end;
+        } else {
+            i += 1;
+            while i < b.len() && !sql.is_char_boundary(i) {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Columns query for DESCRIBE in the script runner.
 pub fn describe_sql(db: Db, owner: &str, name: &str) -> Option<String> {
     children_sql(db, TABLE).map(|s| fill(db, &s, owner, name))
@@ -618,6 +685,18 @@ pub fn fold(db: Db, ident: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autotrace_hint() {
+        let a = autotrace(Db::Oracle, "with q as (select 1 x from dual) select * from q;", 7).unwrap();
+        assert_eq!(a.stmts[0], "with q as (select 1 x from dual) select /*+ gather_plan_statistics */ /* rsqldev-autotrace-7 */ * from q");
+        assert!(a.stmts[1].contains("rsqldev-autotrace-7") && a.show == 1);
+        assert!(autotrace(Db::Oracle, "update t set x = 1", 1).is_none());
+        assert!(autotrace(Db::Oracle, "insert into t select * from s", 1).is_none());
+        assert!(autotrace(Db::Postgres, "with d as (select 1) delete from t", 1).is_none());
+        assert!(autotrace(Db::Postgres, "select * from t where s = 'delete'", 1).is_some());
+        assert_eq!(autotrace(Db::Postgres, "select 1", 1).unwrap().stmts, vec!["EXPLAIN (ANALYZE, BUFFERS) select 1"]);
+    }
 
     #[test]
     fn session_kill() {
