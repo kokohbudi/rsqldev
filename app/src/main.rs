@@ -17,6 +17,7 @@ mod object_view;
 mod prefs;
 mod sessions;
 mod snippets;
+mod topsql;
 mod ui;
 mod value;
 mod worksheet;
@@ -92,11 +93,13 @@ const ID_BOOKMARK_PREV: i32 = ID_HIGHEST + 42;
 const ID_AUTOTRACE: i32 = ID_HIGHEST + 43;
 const ID_COMPARE: i32 = ID_HIGHEST + 44;
 const ID_RUN_PLSQL: i32 = ID_HIGHEST + 45;
+const ID_TOPSQL: i32 = ID_HIGHEST + 46;
 
 enum Page {
     Sheet(SheetRef),
     Obj(Rc<ObjectView>),
     Sessions(Rc<sessions::Sessions>),
+    TopSql(Rc<topsql::TopSql>),
 }
 
 impl Page {
@@ -105,6 +108,7 @@ impl Page {
             Page::Sheet(s) => s.panel,
             Page::Obj(o) => o.panel,
             Page::Sessions(s) => s.panel,
+            Page::TopSql(s) => s.panel,
         }
     }
 }
@@ -321,6 +325,7 @@ impl App {
                 Page::Sheet(s) => s.conn().borrow().cfg.name == name,
                 Page::Obj(o) => o.key.starts_with(&format!("{name}|")),
                 Page::Sessions(s) => s.conn_name == name,
+                Page::TopSql(s) => s.conn_name == name,
             };
             if mine {
                 let idx = self.nb.get_page_index(&pages[i].panel());
@@ -625,6 +630,12 @@ impl App {
                 let title = format!("Sessions: {}", c.borrow().cfg.name);
                 let s = sessions::Sessions::new(&a.nb, c);
                 a.add_page(Page::Sessions(s), &title);
+            }),
+            ID_TOPSQL => self.pick_conn(|c| {
+                let a = app();
+                let title = format!("Top SQL: {}", c.borrow().cfg.name);
+                let s = topsql::TopSql::new(&a.nb, c);
+                a.add_page(Page::TopSql(s), &title);
             }),
             ID_UPDATES => check_updates(true),
             ID_OPEN => {
@@ -941,6 +952,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_UNSHARED, "&Unshared SQL Worksheet\tCtrl+Shift+N", "")
         .append_separator()
         .append_item(ID_SESSIONS, "S&essions…", "Sessions and locks of a connection: who blocks whom, kill session")
+        .append_item(ID_TOPSQL, "&Top SQL…", "Heaviest statements on the server: elapsed, CPU, reads, executions, cost")
         .append_item(ID_COMPARE, "Schema &Compare…", "Compare two schemas and open a script that brings the target in line")
         .append_item(ID_DRIVERS, "&Drivers…", "Download or locate native client drivers")
         .append_item(ID_PREFERENCES, "&Preferences…", "")

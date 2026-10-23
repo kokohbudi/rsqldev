@@ -78,6 +78,99 @@ pub fn sessions_sql(db: Db) -> Option<Vec<&'static str>> {
     })
 }
 
+/// Top SQL sort orders: (key, label). Engines without a metric fall back to total time.
+pub const TOP_ORDERS: &[(&str, &str)] = &[
+    ("elapsed", "Elapsed time (total)"),
+    ("avg", "Elapsed time per execution"),
+    ("cpu", "CPU time"),
+    ("gets", "Logical reads / buffer gets"),
+    ("disk", "Disk reads"),
+    ("execs", "Executions"),
+];
+
+/// Marker kept out of the Top SQL list (the monitor's own statements).
+const TOP_TAG: &str = "rsqldev-topsql";
+
+/// Top SQL monitor: the heaviest statements in the server's statement cache, ordered by `order`
+/// (a [`TOP_ORDERS`] key), optionally only those whose text contains `filter`. Tried in order
+/// (later ones for older versions). Column 0 = statement id; Oracle column 1 = child number.
+/// Oracle reads V$SQL (no Diagnostics Pack needed, unlike AWR / ASH). None = no statement
+/// statistics (file databases).
+pub fn top_sql(db: Db, order: &str, filter: &str) -> Option<Vec<String>> {
+    let mut f = lit(&filter.trim().to_uppercase());
+    if matches!(db, Db::Mysql | Db::Clickhouse) {
+        f = f.replace('\\', "\\\\");
+    }
+    let like = |col: &str| if f.is_empty() { String::new() } else { format!(" AND UPPER({col}) LIKE '%{f}%'") };
+    let pick = |m: &[(&str, &str)]| m.iter().find(|(k, _)| *k == order).or(m.first()).map_or("1", |x| x.1).to_string();
+    Some(match db {
+        Db::Oracle => {
+            let by = pick(&[("elapsed", "elapsed_time"), ("avg", "elapsed_time / NULLIF(executions, 0)"), ("cpu", "cpu_time"), ("gets", "buffer_gets"), ("disk", "disk_reads"), ("execs", "executions")]);
+            vec![format!(
+                "SELECT /* {TOP_TAG} */ * FROM (SELECT sql_id, child_number AS child, parsing_schema_name AS schema, executions AS execs, ROUND(elapsed_time / 1e6, 3) AS elapsed_s, ROUND(elapsed_time / NULLIF(executions, 0) / 1e3, 2) AS avg_ms, ROUND(cpu_time / 1e6, 3) AS cpu_s, ROUND(user_io_wait_time / 1e6, 3) AS io_wait_s, buffer_gets, disk_reads, rows_processed AS rows_out, optimizer_cost AS cost, plan_hash_value AS plan_hash, module, TO_CHAR(last_active_time, 'YYYY-MM-DD HH24:MI:SS') AS last_active, sql_text FROM v$sql WHERE executions > 0 AND parsing_schema_name <> 'SYS' AND sql_text NOT LIKE '%{TOP_TAG}%'{} ORDER BY {by} DESC NULLS LAST) WHERE ROWNUM <= 100",
+                like("sql_text")
+            )]
+        }
+        Db::Postgres => {
+            // PostgreSQL 13 renamed total_time / mean_time.
+            let q = |total: &str, mean: &str| {
+                let by = pick(&[("elapsed", total), ("avg", mean), ("cpu", total), ("gets", "shared_blks_hit + shared_blks_read"), ("disk", "shared_blks_read"), ("execs", "calls")]);
+                format!(
+                    "SELECT /* {TOP_TAG} */ s.queryid::text AS query_id, r.rolname AS username, s.calls AS execs, round(({total} / 1000)::numeric, 3) AS elapsed_s, round(({mean})::numeric, 2) AS avg_ms, s.rows AS rows_out, s.shared_blks_hit + s.shared_blks_read AS buffer_gets, s.shared_blks_read AS disk_reads, s.temp_blks_written AS temp_blocks, s.query AS sql_text FROM pg_stat_statements s LEFT JOIN pg_roles r ON r.oid = s.userid WHERE s.query NOT LIKE '%{TOP_TAG}%'{} ORDER BY {by} DESC NULLS LAST LIMIT 100",
+                    like("s.query")
+                )
+            };
+            vec![q("s.total_exec_time", "s.mean_exec_time"), q("s.total_time", "s.mean_time")]
+        }
+        Db::Mysql => {
+            // SUM_CPU_TIME arrived in MySQL 8.0.28; timers are picoseconds.
+            let q = |cpu: bool| {
+                let by = pick(&[("elapsed", "SUM_TIMER_WAIT"), ("avg", "AVG_TIMER_WAIT"), ("cpu", if cpu { "SUM_CPU_TIME" } else { "SUM_TIMER_WAIT" }), ("gets", "SUM_ROWS_EXAMINED"), ("disk", "SUM_ROWS_EXAMINED"), ("execs", "COUNT_STAR")]);
+                format!(
+                    "SELECT /* {TOP_TAG} */ DIGEST AS digest, SCHEMA_NAME AS db, COUNT_STAR AS execs, ROUND(SUM_TIMER_WAIT / 1e12, 3) AS elapsed_s, ROUND(AVG_TIMER_WAIT / 1e9, 2) AS avg_ms, {} SUM_ROWS_EXAMINED AS rows_examined, SUM_ROWS_SENT AS rows_out, SUM_NO_INDEX_USED AS no_index, LAST_SEEN AS last_active, DIGEST_TEXT AS sql_text FROM performance_schema.events_statements_summary_by_digest WHERE DIGEST_TEXT IS NOT NULL AND DIGEST_TEXT NOT LIKE '%{TOP_TAG}%'{} ORDER BY {by} DESC LIMIT 100",
+                    if cpu { "ROUND(SUM_CPU_TIME / 1e12, 3) AS cpu_s," } else { "" },
+                    like("DIGEST_TEXT")
+                )
+            };
+            vec![q(true), q(false)]
+        }
+        Db::Mssql => {
+            let by = pick(&[("elapsed", "qs.total_elapsed_time"), ("avg", "qs.total_elapsed_time / qs.execution_count"), ("cpu", "qs.total_worker_time"), ("gets", "qs.total_logical_reads"), ("disk", "qs.total_physical_reads"), ("execs", "qs.execution_count")]);
+            let text = "SUBSTRING(t.text, qs.statement_start_offset / 2 + 1, (CASE qs.statement_end_offset WHEN -1 THEN DATALENGTH(t.text) ELSE qs.statement_end_offset END - qs.statement_start_offset) / 2 + 1)";
+            vec![format!(
+                "SELECT /* {TOP_TAG} */ TOP 100 CONVERT(varchar(64), qs.query_hash, 1) AS query_hash, DB_NAME(t.dbid) AS db, qs.execution_count AS execs, CAST(qs.total_elapsed_time / 1e6 AS decimal(18, 3)) AS elapsed_s, CAST(qs.total_elapsed_time / qs.execution_count / 1e3 AS decimal(18, 2)) AS avg_ms, CAST(qs.total_worker_time / 1e6 AS decimal(18, 3)) AS cpu_s, qs.total_logical_reads AS buffer_gets, qs.total_physical_reads AS disk_reads, qs.total_rows AS rows_out, qs.last_execution_time AS last_active, {text} AS sql_text FROM sys.dm_exec_query_stats qs CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) t WHERE t.text NOT LIKE '%{TOP_TAG}%'{} ORDER BY {by} DESC",
+                like("t.text")
+            )]
+        }
+        Db::Clickhouse => {
+            let q = |cpu: bool| {
+                let cpu_col = if cpu { "round(sum(ProfileEvents['OSCPUVirtualTimeMicroseconds']) / 1e6, 3) AS cpu_s, " } else { "" };
+                let by = pick(&[("elapsed", "elapsed_s"), ("avg", "avg_ms"), ("cpu", if cpu { "cpu_s" } else { "elapsed_s" }), ("gets", "rows_read"), ("disk", "bytes_read"), ("execs", "execs")]);
+                format!(
+                    "SELECT /* {TOP_TAG} */ toString(normalized_query_hash) AS query_hash, any(user) AS username, count() AS execs, round(sum(query_duration_ms) / 1000, 3) AS elapsed_s, round(avg(query_duration_ms), 2) AS avg_ms, {cpu_col}sum(read_rows) AS rows_read, formatReadableSize(sum(read_bytes)) AS read_size, sum(read_bytes) AS bytes_read, sum(result_rows) AS rows_out, max(event_time) AS last_active, any(query) AS sql_text FROM system.query_log WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 1 DAY AND query NOT LIKE '%{TOP_TAG}%'{} GROUP BY normalized_query_hash ORDER BY {by} DESC LIMIT 100",
+                    like("query")
+                )
+            };
+            vec![q(true), q(false)]
+        }
+        Db::Sqlite | Db::Duckdb => return None,
+    })
+}
+
+/// Oracle: full text and plan of a cursor from [`top_sql`] (id = SQL_ID, child number).
+/// Ids must look like a SQL_ID / number, so a grid value cannot inject SQL.
+pub fn top_sql_text(sql_id: &str) -> Option<String> {
+    let id = sql_id.trim();
+    (id.len() <= 13 && !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric())).then(|| format!("SELECT sql_fulltext FROM v$sql WHERE sql_id = '{id}' AND ROWNUM = 1"))
+}
+
+pub fn top_sql_plan(sql_id: &str, child: &str) -> Option<String> {
+    let id = sql_id.trim();
+    let child = child.trim().parse::<u32>().ok()?;
+    top_sql_text(id)?;
+    Some(format!("SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('{id}', {child}, 'TYPICAL +COST +PEEKED_BINDS'))"))
+}
+
 /// Statement that ends the session in `row` (as returned by [`sessions_sql`]). Ids must be
 /// plain numbers (ClickHouse: a UUID-like query id), so a grid value cannot inject SQL.
 pub fn kill_sql(db: Db, row: &[Option<String>]) -> Option<String> {
@@ -789,6 +882,17 @@ pub fn fold(db: Db, ident: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_sql_queries() {
+        let q = &top_sql(Db::Oracle, "cpu", "o'x").unwrap()[0];
+        assert!(q.contains("ORDER BY cpu_time DESC") && q.contains("LIKE '%O''X%'") && q.contains("FROM v$sql"));
+        assert_eq!(top_sql(Db::Postgres, "avg", "").unwrap().len(), 2);
+        assert!(top_sql(Db::Mysql, "nope", "").unwrap()[0].contains("ORDER BY SUM_TIMER_WAIT DESC"));
+        assert!(top_sql(Db::Sqlite, "elapsed", "").is_none());
+        assert!(top_sql_plan("abc123', 1) --", "0").is_none());
+        assert!(top_sql_plan("0w2qpuc6u2zsp", "1").unwrap().contains("DISPLAY_CURSOR('0w2qpuc6u2zsp', 1,"));
+    }
 
     #[test]
     fn fill_single_pass() {
