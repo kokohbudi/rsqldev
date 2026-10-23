@@ -4,6 +4,7 @@
 mod autosave;
 mod compare;
 mod complete;
+mod copy;
 mod conn;
 mod connections;
 mod driver_manager;
@@ -704,6 +705,10 @@ impl App {
                 }
             }
             ID_EXIT => self.frame.close(false),
+            // Outside the worksheet editor, Copy takes the last selected grid, tree node or text.
+            ID_COPY if !editor_focus => {
+                copy::copy();
+            }
             ID_UNDO | ID_REDO | ID_CUT | ID_COPY | ID_PASTE | ID_SELECTALL if editor_focus => {
                 let e = sheet.unwrap().editor;
                 match id {

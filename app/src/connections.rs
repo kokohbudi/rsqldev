@@ -83,6 +83,20 @@ impl Navigator {
                 nav.context_menu(&i);
             }
         });
+        // Ctrl+C / Cmd+C copies the selected node's name (connection, table, column, ...).
+        let copy_target = move || {
+            crate::copy::set(move || {
+                if !tree.is_valid() {
+                    return false;
+                }
+                if let Some(t) = tree.get_selection().and_then(|i| tree.get_item_text(&i)).filter(|t| !t.is_empty()) {
+                    Clipboard::get().set_text(&t);
+                }
+                true
+            })
+        };
+        tree.on_set_focus(move |_| copy_target());
+        tree.on_selection_changed(move |_| copy_target());
         nav
     }
 

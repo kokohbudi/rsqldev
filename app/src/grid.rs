@@ -147,6 +147,21 @@ impl ResultGrid {
         });
         let me = g.clone();
         grid.on_cell_right_click(move |e| me.context_menu(Some(e.get_position()), (e.get_row(), e.get_col())));
+        // Ctrl+C / Cmd+C copies the selected cells (the menu accelerator never reaches the grid).
+        let st = Rc::downgrade(&g.st);
+        let target = move || {
+            let st = st.clone();
+            crate::copy::set(move || match st.upgrade() {
+                Some(st) if grid.is_valid() => {
+                    ResultGrid { grid, st }.menu(ID_COPY);
+                    true
+                }
+                _ => false,
+            })
+        };
+        let t2 = target.clone();
+        grid.on_select_cell(move |_| target());
+        grid.on_range_selected(move |_| t2());
         g
     }
 

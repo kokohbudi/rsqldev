@@ -450,6 +450,7 @@ impl DataTab {
         let import = mk("open", "Import Data from CSV / Excel…");
         let fl = StaticText::builder(&p).with_label("Filter:").build();
         let filter = TextCtrl::builder(&p).with_style(TextCtrlStyle::ProcessEnter).build();
+        crate::copy::text(filter);
         filter.set_tooltip("WHERE clause, press Enter");
         bar.add(&fl, 0, SizerFlag::AlignCenterVertical | SizerFlag::Left, 10);
         bar.add(&filter, 1, SizerFlag::All, 2);

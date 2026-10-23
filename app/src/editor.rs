@@ -60,6 +60,7 @@ pub fn new_editor(parent: &dyn WxWidget, font_face: &str, font_size: i32) -> Sty
     // Bookmark symbols.
     stc.set_margin_width(1, 12);
     stc.on_stc_update_ui(move |_| brace_light(&stc));
+    crate::copy::editor(stc);
     stc.set_tab_width(4);
     stc.set_use_tabs(false);
     stc.set_caret_line_visible(true);

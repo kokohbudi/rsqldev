@@ -33,6 +33,7 @@ impl TopSql {
         order.set_selection(0);
         let filter_label = StaticText::builder(&panel).with_label("SQL text contains:").build();
         let filter = TextCtrl::builder(&panel).with_style(TextCtrlStyle::ProcessEnter).build();
+        crate::copy::text(filter);
         filter.set_min_size(Size::new(200, -1));
         let open = Button::builder(&panel).with_label("Open SQL").build();
         let plan = Button::builder(&panel).with_label("Show Plan").build();

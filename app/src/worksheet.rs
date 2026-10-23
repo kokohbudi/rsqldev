@@ -119,6 +119,7 @@ impl Worksheet {
         let bottom = AuiNotebook::builder(&split).with_style(AuiNotebookStyle::from_bits_retain(0x1 | 0x20 | 0x100)).build();
         let mono = |p: &Panel| {
             let t = TextCtrl::builder(p).with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::DontWrap).build();
+            crate::copy::text(t);
             if let Some(f) = Font::new_with_details(prefs.editor_font_size, FontFamily::Teletype as i32, 0, 400, false, &prefs.editor_font) {
                 t.set_font(&f);
             }
