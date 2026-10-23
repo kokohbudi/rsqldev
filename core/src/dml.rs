@@ -114,6 +114,8 @@ fn cond(db: Db, cols: &[Column], key: &Key, row: &[Cell]) -> String {
             match &row[i] {
                 None => format!("{name} IS NULL"),
                 v if db == Db::Postgres && c.name == "ctid" => format!("{name} = {}::tid", literal(db, c, v)),
+                // Index-organized tables have logical UROWIDs (`*BAEB...`), which CHARTOROWID rejects.
+                Some(v) if db == Db::Oracle && c.name.eq_ignore_ascii_case("ROWID") && v.starts_with('*') => format!("{name} = '{}'", v.replace('\'', "''")),
                 v if db == Db::Oracle && c.name.eq_ignore_ascii_case("ROWID") => format!("{name} = CHARTOROWID({})", literal(db, c, v)),
                 v => format!("{name} = {}", literal(db, c, v)),
             }
@@ -194,6 +196,9 @@ mod tests {
             "UPDATE \"HR\".\"EMP\" SET \"NAME\" = 'Bob', \"HIRED\" = '02-JAN-26' WHERE ROWID = CHARTOROWID('AAA')"
         );
         assert_eq!(insert(Db::Oracle, "T", &cols, Some(0), &old, &[]), "INSERT INTO T (\"ID\", \"NAME\") VALUES (1, 'O''Neil')");
+        // An index-organized table's logical ROWID is compared as text, without CHARTOROWID.
+        let iot = vec![Some("*BAEBwPUCwQL+".into()), Some("1".into()), None, None];
+        assert_eq!(delete(Db::Oracle, "T", &cols, &key, &iot), "DELETE FROM T WHERE ROWID = '*BAEBwPUCwQL+'");
         // Staged BLOBs bind as parameters, even when the cell text did not change.
         assert_eq!(
             update(Db::Oracle, "T", &cols, &key, Some(0), &old, &old, &[3]).unwrap(),

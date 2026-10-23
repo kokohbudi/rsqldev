@@ -2,12 +2,14 @@
 //! so it can be shown before it runs and unit-tested. Names typed by the user are either
 //! validated by [`valid_name`] or turned into escaped literals, never pasted raw.
 //!
-//! The encryption password is never in the text: blocks use the `:password` bind placeholder.
+//! The encryption password is never in the text: blocks use the `:password` bind placeholder, and
+//! [`without_password`] drops even that for Copy to Worksheet.
 
 use crate::config::config_root;
 use crate::dialect::{lit, quote};
 use crate::registry::Kind;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
@@ -96,12 +98,12 @@ pub fn valid_name(s: &str) -> bool {
     !s.is_empty() && !s.contains("..") && s.chars().all(|c| c.is_ascii_alphanumeric() || "_.$#%-".contains(c))
 }
 
-/// `X_%U.dmp` -> `X_01.dmp` .. `X_<max>.dmp`; a name without `%U` is the only candidate.
+/// `X_%U.dmp` (or `%u`) -> `X_01.dmp` .. `X_<max>.dmp`; a name without `%U` is the only candidate.
 pub fn percent_u_candidates(dump_file: &str, max: usize) -> Vec<String> {
-    if !dump_file.contains("%U") {
+    if !dump_file.contains("%U") && !dump_file.contains("%u") {
         return vec![dump_file.to_string()];
     }
-    (1..=max).map(|i| dump_file.replace("%U", &format!("{i:02}"))).collect()
+    (1..=max).map(|i| dump_file.replace("%U", &format!("{i:02}")).replace("%u", &format!("{i:02}"))).collect()
 }
 
 fn check(what: &str, s: &str) -> Result<(), String> {
@@ -151,16 +153,51 @@ fn mode_parts(mode: &Mode) -> Result<(&'static str, Vec<String>), String> {
     })
 }
 
-fn wrap(body: Vec<String>) -> String {
-    let mut s = String::from("DECLARE\n  h NUMBER;\nBEGIN\n");
+/// Handler of a block that opened a new job: a job that failed to start is stopped.
+const STOP_ON_ERROR: &str = "EXCEPTION WHEN OTHERS THEN\n  IF h IS NOT NULL THEN\n    DBMS_DATAPUMP.STOP_JOB(h);\n  END IF;\n  RAISE;\nEND;";
+
+/// Handler of a block attached to an existing job (stop, kill, resume): only let go of it, since
+/// STOP_JOB would end a resumable job and drop its master table.
+const DETACH_ON_ERROR: &str = "EXCEPTION WHEN OTHERS THEN\n  IF h IS NOT NULL THEN\n    DBMS_DATAPUMP.DETACH(h);\n  END IF;\n  RAISE;\nEND;";
+
+/// The password arrives as a bind (a CLOB); a typed local keeps the overloaded SET_PARAMETER unambiguous.
+const PW_DECL: &str = "pw VARCHAR2(128) := :password;";
+const PW_SET: &str = "  DBMS_DATAPUMP.SET_PARAMETER(h, 'ENCRYPTION_PASSWORD', pw);";
+
+/// `DECLARE h NUMBER; <decls> BEGIN <body> <handler>`.
+fn wrap(decls: &[&str], body: Vec<String>, handler: &str) -> String {
+    let mut s = String::from("DECLARE\n  h NUMBER;\n");
+    for d in decls {
+        s.push_str("  ");
+        s.push_str(d);
+        s.push('\n');
+    }
+    s.push_str("BEGIN\n");
     for l in body {
         s.push_str(&l);
         s.push('\n');
     }
-    s.push_str(
-        "EXCEPTION WHEN OTHERS THEN\n  IF h IS NOT NULL THEN\n    DBMS_DATAPUMP.STOP_JOB(h);\n  END IF;\n  RAISE;\nEND;",
-    );
+    s.push_str(handler);
     s
+}
+
+/// The block for Copy to Worksheet: no `:password` bind left (the worksheet would paste the value
+/// as a literal into its history, Script Output and V$SQL). The ENCRYPTION_PASSWORD call is
+/// commented out under a note; a block without encryption comes back unchanged.
+pub fn without_password(block: &str) -> String {
+    let mut out = vec![];
+    for l in block.lines() {
+        if l.trim() == PW_DECL {
+            continue;
+        }
+        if l.contains("'ENCRYPTION_PASSWORD'") {
+            out.push("  -- set the encryption password with SET_PARAMETER(h, 'ENCRYPTION_PASSWORD', '...') yourself; rsqldev never writes it into a worksheet".to_string());
+            out.push(format!("  -- {}", l.trim().replace(", pw)", ", '...')")));
+            continue;
+        }
+        out.push(l.to_string());
+    }
+    out.join("\n")
 }
 
 fn start(body: &mut Vec<String>) {
@@ -216,7 +253,7 @@ pub fn export_block(s: &ExportSpec) -> Result<String, String> {
     b.push(format!("  DBMS_DATAPUMP.SET_PARAMETER(h, 'COMPRESSION', '{comp}');"));
     if s.encrypt {
         b.push("  DBMS_DATAPUMP.SET_PARAMETER(h, 'ENCRYPTION', 'ALL');".into());
-        b.push("  DBMS_DATAPUMP.SET_PARAMETER(h, 'ENCRYPTION_PASSWORD', :password);".into());
+        b.push(PW_SET.into());
     }
     if s.estimate_only {
         b.push("  DBMS_DATAPUMP.SET_PARAMETER(h, 'ESTIMATE_ONLY', 1);".into());
@@ -225,7 +262,7 @@ pub fn export_block(s: &ExportSpec) -> Result<String, String> {
         b.push(format!("  DBMS_DATAPUMP.SET_PARALLEL(h, {});", s.parallel));
     }
     start(&mut b);
-    Ok(wrap(b))
+    Ok(wrap(if s.encrypt { &[PW_DECL] } else { &[] }, b, STOP_ON_ERROR))
 }
 
 pub fn import_block(s: &ImportSpec) -> Result<String, String> {
@@ -279,13 +316,13 @@ pub fn import_block(s: &ImportSpec) -> Result<String, String> {
     };
     b.push(format!("  DBMS_DATAPUMP.SET_PARAMETER(h, 'TABLE_EXISTS_ACTION', '{act}');"));
     if s.encrypted {
-        b.push("  DBMS_DATAPUMP.SET_PARAMETER(h, 'ENCRYPTION_PASSWORD', :password);".into());
+        b.push(PW_SET.into());
     }
     if s.parallel > 1 {
         b.push(format!("  DBMS_DATAPUMP.SET_PARALLEL(h, {});", s.parallel));
     }
     start(&mut b);
-    Ok(wrap(b))
+    Ok(wrap(if s.encrypted { &[PW_DECL] } else { &[] }, b, STOP_ON_ERROR))
 }
 
 fn jobs_select(dba: bool, percent: bool) -> String {
@@ -340,7 +377,7 @@ pub fn job_running_sql_user(job: &str) -> String {
 fn attach_block(owner: &str, job: &str, body: &[String]) -> String {
     let mut v = vec![format!("  h := DBMS_DATAPUMP.ATTACH({}, {});", q(job), q(owner))];
     v.extend(body.iter().cloned());
-    wrap(v)
+    wrap(&[], v, DETACH_ON_ERROR)
 }
 
 /// Stop keeps the master table (resumable): `STOP_JOB(h, 0, 1)`; immediate (kill) drops it: `STOP_JOB(h, 1, 0)`.
@@ -405,9 +442,11 @@ DBMS_LOB.FILECLOSE(src);\n  :6 := dst;\nEXCEPTION WHEN OTHERS THEN\n  IF DBMS_LO
 pub const UPLOAD_CHUNK: usize = 4 * 1024 * 1024;
 
 /// Binds (positional): `:1` directory, `:2` file, `:3` open mode (`wb` first chunk, `ab` after), `:4` BLOB chunk.
-/// `:4` is assigned after `FOPEN` so the binds appear in order 1, 2, 3, 4.
-pub const UPLOAD_BLOCK: &str = "DECLARE\n  f UTL_FILE.FILE_TYPE;\n  b BLOB;\n  pos PLS_INTEGER := 1;\n  len PLS_INTEGER;\nBEGIN\n  \
-    f := UTL_FILE.FOPEN(:1, :2, :3, 32767);\n  b := :4;\n  len := DBMS_LOB.GETLENGTH(b);\n  \
+/// Text binds arrive as CLOBs: typed VARCHAR2 locals keep the FOPEN call unambiguous. `:4` is
+/// assigned after them so the binds appear in order 1, 2, 3, 4.
+pub const UPLOAD_BLOCK: &str = "DECLARE\n  d VARCHAR2(128) := :1;\n  n VARCHAR2(512) := :2;\n  m VARCHAR2(4) := :3;\n  \
+    f UTL_FILE.FILE_TYPE;\n  b BLOB;\n  pos PLS_INTEGER := 1;\n  len PLS_INTEGER;\nBEGIN\n  \
+    f := UTL_FILE.FOPEN(d, n, m, 32767);\n  b := :4;\n  len := DBMS_LOB.GETLENGTH(b);\n  \
     WHILE pos <= len LOOP\n    UTL_FILE.PUT_RAW(f, DBMS_LOB.SUBSTR(b, 32767, pos), TRUE);\n    pos := pos + 32767;\n  END LOOP;\n  \
     UTL_FILE.FCLOSE(f);\nEXCEPTION WHEN OTHERS THEN\n  IF UTL_FILE.IS_OPEN(f) THEN\n    UTL_FILE.FCLOSE(f);\n  END IF;\n  RAISE;\nEND;";
 
@@ -436,6 +475,9 @@ pub enum FileKind {
     Log,
     SqlFile,
     Upload,
+    /// A kind this version does not know (a newer one wrote it): the record still loads.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -458,24 +500,86 @@ struct Files {
 
 const FILES_TOML: &str = "datapump.toml";
 
-/// Empty on a missing or unreadable file.
-pub fn load_files() -> Vec<FileRecord> {
-    std::fs::read_to_string(config_root().join(FILES_TOML))
-        .ok()
-        .and_then(|s| toml::from_str::<Files>(&s).ok())
-        .map(|f| f.file)
-        .unwrap_or_default()
+fn files_path() -> PathBuf {
+    config_root().join(FILES_TOML)
 }
 
-pub fn save_files(v: &[FileRecord]) -> anyhow::Result<()> {
-    std::fs::create_dir_all(config_root())?;
-    std::fs::write(config_root().join(FILES_TOML), toml::to_string_pretty(&Files { file: v.to_vec() })?)?;
-    Ok(())
+/// The recorded files; empty when the list does not exist yet. A list that cannot be read or
+/// parsed is an error, so that nothing is saved over it.
+pub fn load_files() -> Result<Vec<FileRecord>, String> {
+    load_from(&files_path())
 }
 
-/// Same database identity, or the same connection name when `db` is empty.
+fn load_from(p: &Path) -> Result<Vec<FileRecord>, String> {
+    let s = match std::fs::read_to_string(p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(format!("Cannot read {}: {e}", p.display())),
+    };
+    toml::from_str::<Files>(&s).map(|f| f.file).map_err(|e| format!("Cannot parse {}: {e}", p.display()))
+}
+
+/// Written to a temporary file in the same folder, then renamed over the list: an interrupted
+/// save leaves the old list whole.
+pub fn save_files(v: &[FileRecord]) -> Result<(), String> {
+    save_to(&files_path(), v)
+}
+
+fn save_to(p: &Path, v: &[FileRecord]) -> Result<(), String> {
+    let fail = |e: String| format!("Cannot save {}: {e}", p.display());
+    let text = toml::to_string_pretty(&Files { file: v.to_vec() }).map_err(|e| fail(e.to_string()))?;
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d).map_err(|e| fail(e.to_string()))?;
+    }
+    let tmp = p.with_extension("toml.tmp");
+    std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, p)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        fail(e.to_string())
+    })
+}
+
+/// Load, change, save. Refuses (and saves nothing) when the list could not be loaded.
+pub fn update_files(f: impl FnOnce(&mut Vec<FileRecord>)) -> Result<(), String> {
+    let mut all = load_files()?;
+    f(&mut all);
+    save_files(&all)
+}
+
+/// Whether record `r` belongs to this database: the same identity, or the same connection name
+/// when either identity is unknown.
+pub fn same_target(r: &FileRecord, conn: &str, db: &str) -> bool {
+    if db.is_empty() || r.db.is_empty() { r.conn == conn } else { r.db == db }
+}
+
+/// The records of this database (see [`same_target`]).
 pub fn files_for<'a>(all: &'a [FileRecord], conn: &str, db: &str) -> Vec<&'a FileRecord> {
-    all.iter().filter(|r| if db.is_empty() { r.conn == conn } else { r.db == db }).collect()
+    all.iter().filter(|r| same_target(r, conn, db)).collect()
+}
+
+/// Sidecar of a partial download (`<file>.part.json`): where its bytes came from.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PartInfo {
+    /// The connection's server (driver, host, port, service / TNS).
+    pub source: String,
+    pub directory: String,
+    pub file: String,
+    /// Server file length when the download started; None until the first chunk.
+    pub len: Option<u64>,
+}
+
+impl PartInfo {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn from_json(s: &str) -> Option<PartInfo> {
+        serde_json::from_str(s).ok()
+    }
+
+    /// A part resumes only from the same file of the same directory on the same server.
+    pub fn matches(&self, source: &str, directory: &str, file: &str) -> bool {
+        self.source == source && self.directory == directory && self.file == file
+    }
 }
 
 pub fn rename_conn(all: &mut [FileRecord], old: &str, new: &str) {
@@ -531,9 +635,30 @@ mod tests {
         assert!(b.contains("'SCHEMA_EXPR', 'IN (''HR'', ''O''''X'')'"));
         assert!(b.contains("'EXCLUDE_PATH_EXPR', 'IN (''STATISTICS'')'"));
         assert!(b.contains("filesize => '2G'") && b.contains("DBMS_DATAPUMP.SET_PARALLEL(h, 4)"));
-        assert!(b.contains("'FLASHBACK_TIME', 'SYSTIMESTAMP'") && b.contains("'ENCRYPTION_PASSWORD', :password"));
+        assert!(b.contains("'FLASHBACK_TIME', 'SYSTIMESTAMP'") && b.contains("'ENCRYPTION_PASSWORD', pw);"));
+        // The password bind goes into a typed local declared before BEGIN.
+        assert!(b.find("pw VARCHAR2(128) := :password;").unwrap() < b.find("BEGIN").unwrap());
+        assert_eq!(b.matches(":password").count(), 1);
         assert!(b.contains("START_JOB(h, cluster_ok => 0)") && b.contains("DBMS_DATAPUMP.DETACH(h)"));
-        assert!(b.contains("EXCEPTION WHEN OTHERS THEN") && b.trim_end().ends_with("END;"));
+        assert!(b.contains("EXCEPTION WHEN OTHERS THEN") && b.contains("DBMS_DATAPUMP.STOP_JOB(h);") && b.trim_end().ends_with("END;"));
+        let mut plain = spec();
+        plain.encrypt = false;
+        assert!(!export_block(&plain).unwrap().contains("pw VARCHAR2"));
+    }
+
+    #[test]
+    fn copy_to_worksheet_drops_the_password_bind() {
+        let b = export_block(&spec()).unwrap();
+        let w = without_password(&b);
+        assert!(!w.contains(":password") && !w.contains("pw VARCHAR2"));
+        assert!(w.contains("  -- set the encryption password with SET_PARAMETER(h, 'ENCRYPTION_PASSWORD', '...') yourself; rsqldev never writes it into a worksheet\n  -- DBMS_DATAPUMP.SET_PARAMETER(h, 'ENCRYPTION_PASSWORD', '...');"));
+        // Every line naming the password is a comment; the rest of the block is intact.
+        assert!(w.lines().filter(|l| l.contains("ENCRYPTION_PASSWORD")).all(|l| l.trim_start().starts_with("--")));
+        assert!(w.contains("'ENCRYPTION', 'ALL'") && w.starts_with("DECLARE\n  h NUMBER;\nBEGIN\n") && w.ends_with("END;"));
+        let mut plain = spec();
+        plain.encrypt = false;
+        let p = export_block(&plain).unwrap();
+        assert_eq!(without_password(&p), p);
     }
 
     #[test]
@@ -554,6 +679,10 @@ mod tests {
         let b = import_block(&s).unwrap();
         assert!(b.contains("'IMPORT', job_mode => 'FULL'") && b.contains("'REMAP_SCHEMA', 'HR', 'HR2'") && b.contains("'TABLE_EXISTS_ACTION', 'TRUNCATE'"));
         assert!(!b.contains(":password"));
+        s.encrypted = true;
+        let e = import_block(&s).unwrap();
+        assert!(e.contains("pw VARCHAR2(128) := :password;") && e.contains("'ENCRYPTION_PASSWORD', pw);"));
+        assert!(!without_password(&e).contains(":password"));
         s.sql_file = "a.sql".into();
         assert!(import_block(&s).unwrap().contains("'SQL_FILE'"));
     }
@@ -570,6 +699,7 @@ mod tests {
     fn percent_u_candidates() {
         assert_eq!(super::percent_u_candidates("X_%U.dmp", 3), vec!["X_01.dmp", "X_02.dmp", "X_03.dmp"]);
         assert_eq!(super::percent_u_candidates("X.dmp", 3), vec!["X.dmp"]);
+        assert_eq!(super::percent_u_candidates("x_%u.dmp", 2), vec!["x_01.dmp", "x_02.dmp"]);
         assert_eq!(
             job_name("RSQ_EXP", chrono::NaiveDate::from_ymd_opt(2026, 10, 23).unwrap().and_hms_opt(10, 15, 0).unwrap()),
             "RSQ_EXP_20261023_101500"
@@ -581,6 +711,11 @@ mod tests {
         assert!(stop_block("HR", "RSQ_EXP_1", false).contains("DBMS_DATAPUMP.ATTACH('RSQ_EXP_1', 'HR')"));
         assert!(stop_block("HR", "J", false).contains("STOP_JOB(h, 0, 1)") && stop_block("HR", "J", true).contains("STOP_JOB(h, 1, 0)"));
         assert!(resume_block("HR", "J", Some(2)).contains("SET_PARALLEL(h, 2)"));
+        // A failed stop / kill / resume only detaches: STOP_JOB in the handler would end a resumable job.
+        for b in [stop_block("HR", "J", false), stop_block("HR", "J", true), resume_block("HR", "J", None)] {
+            let handler = &b[b.find("EXCEPTION").unwrap()..];
+            assert!(handler.contains("DBMS_DATAPUMP.DETACH(h);") && !handler.contains("STOP_JOB") && handler.contains("RAISE;"), "{b}");
+        }
         assert_eq!(cleanup_sql("HR", "J"), "DROP TABLE \"HR\".\"J\" PURGE");
         assert!(jobs_sql(true).contains("dba_datapump_jobs") && jobs_sql(false).contains("user_datapump_jobs"));
         assert!(is_enterprise("Oracle Database 19c Enterprise Edition Release 19.0.0.0.0") && !is_enterprise("Oracle Database 19c Standard Edition 2"));
@@ -602,7 +737,9 @@ mod tests {
 
     #[test]
     fn upload_and_file_sql_bind_names() {
-        assert!(UPLOAD_BLOCK.contains("UTL_FILE.FOPEN(:1, :2, :3, 32767)") && UPLOAD_BLOCK.contains("DBMS_LOB.SUBSTR(b, 32767, pos)"));
+        assert!(UPLOAD_BLOCK.contains("UTL_FILE.FOPEN(d, n, m, 32767)") && UPLOAD_BLOCK.contains("DBMS_LOB.SUBSTR(b, 32767, pos)"));
+        assert!(UPLOAD_BLOCK.contains("d VARCHAR2(128) := :1;\n  n VARCHAR2(512) := :2;\n  m VARCHAR2(4) := :3;"));
+        assert!(UPLOAD_BLOCK.find(":3").unwrap() < UPLOAD_BLOCK.find("BEGIN").unwrap() && UPLOAD_BLOCK.find(":4").unwrap() > UPLOAD_BLOCK.find("BEGIN").unwrap());
         assert!(file_exists_sql("D", "x.dmp").unwrap().contains("BFILENAME('D', 'x.dmp')"));
         assert!(file_exists_sql("D", "x'.dmp").is_err() && delete_block("D", "../x").is_err());
     }
@@ -612,10 +749,44 @@ mod tests {
         let r = |c: &str, db: &str| FileRecord { conn: c.into(), db: db.into(), directory: "D".into(), file: "a.dmp".into(), kind: FileKind::Dump, job: "J".into(), created: "2026-10-23 10:00".into() };
         let mut all = vec![r("prod", "ORCL/PDB1"), r("prod2", "ORCL/PDB1"), r("dev", "DEV/DEV")];
         assert_eq!(files_for(&all, "x", "ORCL/PDB1").len(), 2);
+        // A record saved before the identity was known still shows for its connection.
+        all.push(r("prod", ""));
+        assert_eq!(files_for(&all, "prod", "ORCL/PDB1").len(), 3);
+        assert_eq!(files_for(&all, "prod", "").len(), 2);
+        assert_eq!(files_for(&all, "dev", "ORCL/PDB1").len(), 2);
+        all.pop();
         rename_conn(&mut all, "dev", "dev-new");
         assert_eq!(all[2].conn, "dev-new");
         let t = toml::to_string(&Files { file: all.clone() }).unwrap();
         assert_eq!(toml::from_str::<Files>(&t).unwrap().file, all);
+    }
+
+    #[test]
+    fn file_list_load_save() {
+        let d = std::env::temp_dir().join(format!("rsq-dpfiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let p = d.join(FILES_TOML);
+        assert_eq!(load_from(&p), Ok(vec![]), "missing list = empty");
+        let rec = FileRecord { conn: "c".into(), db: String::new(), directory: "D".into(), file: "a.dmp".into(), kind: FileKind::Dump, job: "J".into(), created: "x".into() };
+        save_to(&p, std::slice::from_ref(&rec)).unwrap();
+        assert!(!p.with_extension("toml.tmp").exists());
+        assert_eq!(load_from(&p).unwrap(), vec![rec.clone()]);
+        // An unknown kind (newer version) keeps the file readable.
+        std::fs::write(&p, "[[file]]\nconn = \"c\"\ndb = \"\"\ndirectory = \"D\"\nfile = \"b\"\nkind = \"future\"\njob = \"J\"\ncreated = \"x\"\n").unwrap();
+        assert_eq!(load_from(&p).unwrap()[0].kind, FileKind::Other);
+        // A broken file is an error, not an empty list that a save would write over.
+        std::fs::write(&p, "[[file]\nconn =").unwrap();
+        assert!(load_from(&p).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn part_sidecar_matches_its_source() {
+        let p = PartInfo { source: "oracle|db1|1521|ORCL|".into(), directory: "D".into(), file: "a.dmp".into(), len: Some(10) };
+        assert_eq!(PartInfo::from_json(&p.to_json()), Some(p.clone()));
+        assert!(p.matches("oracle|db1|1521|ORCL|", "D", "a.dmp"));
+        assert!(!p.matches("oracle|db2|1521|ORCL|", "D", "a.dmp") && !p.matches("oracle|db1|1521|ORCL|", "E", "a.dmp") && !p.matches("oracle|db1|1521|ORCL|", "D", "b.dmp"));
+        assert_eq!(PartInfo::from_json("not json"), None);
     }
 
     #[test]
