@@ -160,7 +160,19 @@ impl ResultGrid {
             })
         };
         let t2 = target.clone();
-        grid.on_select_cell(move |_| target());
+        grid.on_select_cell(move |e| {
+            target();
+            // The cursor cell only gets a border: select it too so it is filled like a
+            // selection. Next tick, once wx has finished the click or key, and only when
+            // nothing else is selected (shift / drag selections stay as they are).
+            let (r, c) = (e.get_row(), e.get_col());
+            crate::hub::every_tick(move || {
+                if grid.is_valid() && !grid.is_selection() && (grid.get_grid_cursor_row(), grid.get_grid_cursor_col()) == (r, c) {
+                    grid.select_block(r, c, r, c, false);
+                }
+                false
+            });
+        });
         grid.on_range_selected(move |_| t2());
         g
     }
@@ -436,8 +448,15 @@ impl ResultGrid {
         self.grid.go_to_cell(start as i32, self.st.borrow().hidden as i32);
     }
 
+    /// Marks every row touched by the selection (whole rows, and cell blocks dragged or
+    /// shift / ctrl-clicked across several rows), or the cursor row when nothing is selected.
     pub fn delete_selected_rows(&self) {
         let mut rows: Vec<i32> = self.grid.get_selected_rows();
+        for b in self.grid.get_selected_blocks() {
+            rows.extend(b.top_row..=b.bottom_row);
+        }
+        rows.sort_unstable();
+        rows.dedup();
         if rows.is_empty() {
             rows.push(self.grid.get_grid_cursor_row());
         }
