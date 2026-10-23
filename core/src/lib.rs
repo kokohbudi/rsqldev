@@ -85,6 +85,20 @@ pub trait Backend: Send {
     fn execute_binds(&mut self, _sql: &str, _binds: &[Bind]) -> Result<Option<u64>> {
         anyhow::bail!("bind parameters are not supported for this database")
     }
+
+    /// Stream a file of a server directory object (Oracle BFILE) into `out`, starting at byte
+    /// `offset`. `progress(done_total, file_len)` runs after each read; `false` cancels.
+    /// Returns the bytes written.
+    fn read_server_file(
+        &mut self,
+        _dir: &str,
+        _file: &str,
+        _offset: u64,
+        _out: &mut dyn std::io::Write,
+        _progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<u64> {
+        anyhow::bail!("server files are only available on Oracle")
+    }
 }
 
 /// BLOB / BYTEA / (VAR)BINARY / RAW / IMAGE column, as each backend names it.

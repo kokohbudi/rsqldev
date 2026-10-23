@@ -380,6 +380,8 @@ pub fn hint(err: &str, user: &str, dir: &str) -> Option<String> {
 }
 
 /// Upload chunk size: one round trip carries this many bytes.
+/// Bytes per BFILE read when downloading a dump.
+pub const DOWNLOAD_READ: usize = 1024 * 1024;
 pub const UPLOAD_CHUNK: usize = 4 * 1024 * 1024;
 
 /// Binds (positional): `:1` directory, `:2` file, `:3` open mode (`wb` first chunk, `ab` after), `:4` BLOB chunk.

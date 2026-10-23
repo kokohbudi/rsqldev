@@ -281,6 +281,40 @@ impl Backend for Oracle {
         }
     }
 
+    fn read_server_file(
+        &mut self,
+        dir: &str,
+        file: &str,
+        offset: u64,
+        out: &mut dyn std::io::Write,
+        progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<u64> {
+        use oracle::sql_type::{Bfile, Lob};
+        use std::io::{Read, Seek, SeekFrom};
+        let mut st = self.c.statement("SELECT BFILENAME(:1, :2) FROM dual").lob_locator().build()?;
+        let mut bf = st.query_row_as::<Bfile>(&[&dir, &file])?;
+        bf.open_resource()?;
+        let r = (|| -> Result<u64> {
+            let len = bf.size()?;
+            bf.seek(SeekFrom::Start(offset))?;
+            let mut buf = vec![0u8; crate::datapump::DOWNLOAD_READ];
+            let mut written = 0u64;
+            loop {
+                let n = bf.read(&mut buf)?;
+                if n == 0 {
+                    return Ok(written);
+                }
+                out.write_all(&buf[..n])?;
+                written += n as u64;
+                if !progress(offset + written, len) {
+                    anyhow::bail!("cancelled");
+                }
+            }
+        })();
+        let _ = bf.close_resource();
+        r
+    }
+
     fn execute_binds(&mut self, sql: &str, binds: &[Bind]) -> Result<Option<u64>> {
         use oracle::sql_type::{Blob, Clob, ToSql};
         use std::io::Write;

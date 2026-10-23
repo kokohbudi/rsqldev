@@ -6,7 +6,8 @@
 use crate::config::{ConnConfig, Prefs};
 use crate::{Backend, Bind, Canceller, Event};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,17 @@ pub enum Cmd {
     Exec { id: u64, sql: String, fetch: usize, rows: SyncSender<Event> },
     /// DML with bind values (BLOB upload, long text). Replies `Done`.
     ExecBinds { id: u64, sql: String, binds: Vec<Bind> },
+    /// Stream a server file into `path` (opened for append, written from `offset`). Replies
+    /// `Done` with the bytes written; `progress` gets `(done_total, file_len)`. Never retried.
+    Download {
+        id: u64,
+        dir: String,
+        file: String,
+        path: PathBuf,
+        offset: u64,
+        progress: Sender<(u64, u64)>,
+        cancel: Arc<AtomicBool>,
+    },
     Commit,
     Rollback,
     Autocommit(bool),
@@ -100,7 +112,7 @@ impl Session {
                         let mut r = run(b.as_mut(), cmd.clone(), &mut sent);
                         // The server or a firewall dropped an idle session: reconnect once and
                         // retry, unless rows already reached the UI. Uncommitted work is lost with it.
-                        if !sent && lost(&r) {
+                        if !sent && lost(&r) && !matches!(cmd, Cmd::Download { .. }) {
                             if let Ok(mut nb) = crate::backend::connect(&cfg, &password, &prefs) {
                                 let _ = nb.set_autocommit(autocommit);
                                 if output {
@@ -137,6 +149,17 @@ impl Session {
         self.next_id += 1;
         let _ = self.tx.send(Cmd::ExecBinds { id, sql: sql.into(), binds });
         id
+    }
+
+    /// Start a download of a server file to `path` from byte `offset`. Returns its id, the
+    /// progress receiver and the flag that cancels it.
+    pub fn download(&mut self, dir: &str, file: &str, path: PathBuf, offset: u64) -> (u64, Receiver<(u64, u64)>, Arc<AtomicBool>) {
+        let (progress, rx) = channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let id = self.next_id;
+        self.next_id += 1;
+        let _ = self.tx.send(Cmd::Download { id, dir: dir.into(), file: file.into(), path, offset, progress, cancel: cancel.clone() });
+        (id, rx, cancel)
     }
 
     pub fn send(&self, c: Cmd) {
@@ -181,9 +204,43 @@ fn run(b: &mut dyn Backend, cmd: Cmd, sent: &mut bool) -> Reply {
             let result = b.execute_binds(&sql, &binds).map_err(|e| format!("{e:#}"));
             Reply::Done { id, result, output: vec![], elapsed: t.elapsed() }
         }
+        Cmd::Download { id, dir, file, path, offset, progress, cancel } => {
+            let t = Instant::now();
+            let result = (|| -> crate::Result<u64> {
+                let mut out = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+                let n = b.read_server_file(&dir, &file, offset, &mut out, &mut |done, len| {
+                    let _ = progress.send((done, len));
+                    !cancel.load(Ordering::Relaxed)
+                })?;
+                out.sync_all()?;
+                Ok(n)
+            })()
+            .map(Some)
+            .map_err(|e| format!("{e:#}"));
+            Reply::Done { id, result, output: vec![], elapsed: t.elapsed() }
+        }
         Cmd::Commit => tx(b.commit(), "Commit complete."),
         Cmd::Rollback => tx(b.rollback(), "Rollback complete."),
         Cmd::Autocommit(on) => tx(b.set_autocommit(on), "Autocommit changed."),
         Cmd::Output(on) => tx(b.enable_output(on), if on { "Server output enabled." } else { "Server output disabled." }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_needs_oracle() {
+        let cfg = ConnConfig { driver: "sqlite".into(), database: ":memory:".into(), ..Default::default() };
+        let mut s = Session::open(cfg, String::new(), Prefs::default());
+        assert!(matches!(s.replies.recv().unwrap(), Reply::Connected));
+        let part = std::env::temp_dir().join(format!("rsq-dl-{}.part", std::process::id()));
+        let (_, _rx, _cancel) = s.download("D", "x.dmp", part.clone(), 0);
+        match s.replies.recv().unwrap() {
+            Reply::Done { result: Err(e), .. } => assert!(e.contains("only available on Oracle")),
+            r => panic!("{r:?}"),
+        }
+        let _ = std::fs::remove_file(part);
     }
 }
