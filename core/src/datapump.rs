@@ -4,7 +4,8 @@
 //!
 //! The encryption password is never in the text: blocks use the `:password` bind placeholder.
 
-use crate::dialect::lit;
+use crate::dialect::{lit, quote};
+use crate::registry::Kind;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
@@ -285,6 +286,97 @@ pub fn import_block(s: &ImportSpec) -> Result<String, String> {
     Ok(wrap(b))
 }
 
+fn jobs_select(dba: bool, percent: bool) -> String {
+    let (owner, view) = if dba { ("j.owner_name", "dba_datapump_jobs") } else { ("USER", "user_datapump_jobs") };
+    let (pct, join) = if percent {
+        (
+            "l.percent",
+            format!(
+                " LEFT JOIN (SELECT opname, ROUND(sofar / NULLIF(totalwork, 0) * 100) AS percent, \
+                 ROW_NUMBER() OVER (PARTITION BY opname ORDER BY last_update_time DESC) AS rn \
+                 FROM v$session_longops WHERE totalwork > 0) l ON l.opname = j.job_name AND l.rn = 1"
+            ),
+        )
+    } else {
+        ("CAST(NULL AS NUMBER)", String::new())
+    };
+    format!(
+        "SELECT {owner} AS owner, j.job_name, j.operation, j.job_mode, j.state, j.degree, j.attached_sessions, {pct} AS percent \
+         FROM {view} j{join} ORDER BY 1, 2"
+    )
+}
+
+/// Jobs list with percent from `V$SESSION_LONGOPS` (latest row per job).
+pub fn jobs_sql(dba: bool) -> String {
+    jobs_select(dba, true)
+}
+
+/// Same list without the longops join (percent NULL), for users who cannot read `V$SESSION_LONGOPS`.
+pub fn jobs_sql_basic(dba: bool) -> String {
+    jobs_select(dba, false)
+}
+
+/// One row, column 0 = state; no row when the job is gone.
+pub fn job_running_sql(owner: &str, job: &str) -> String {
+    format!(
+        "SELECT state FROM dba_datapump_jobs WHERE owner_name = '{}' AND job_name = '{}'",
+        lit(owner),
+        lit(job)
+    )
+}
+
+fn attach_block(owner: &str, job: &str, body: &[String]) -> String {
+    let mut v = vec![format!("  h := DBMS_DATAPUMP.ATTACH({}, {});", q(job), q(owner))];
+    v.extend(body.iter().cloned());
+    wrap(v)
+}
+
+/// Stop keeps the master table (resumable): `STOP_JOB(h, 0, 1)`; immediate (kill) drops it: `STOP_JOB(h, 1, 0)`.
+pub fn stop_block(owner: &str, job: &str, immediate: bool) -> String {
+    let call = if immediate { "  DBMS_DATAPUMP.STOP_JOB(h, 1, 0);" } else { "  DBMS_DATAPUMP.STOP_JOB(h, 0, 1);" };
+    attach_block(owner, job, &[call.to_string()])
+}
+
+pub fn resume_block(owner: &str, job: &str, parallel: Option<u32>) -> String {
+    let mut body = vec![];
+    if let Some(p) = parallel {
+        body.push(format!("  DBMS_DATAPUMP.SET_PARALLEL(h, {p});"));
+    }
+    start(&mut body);
+    attach_block(owner, job, &body)
+}
+
+/// Drops the master table of a NOT RUNNING job.
+pub fn cleanup_sql(owner: &str, job: &str) -> String {
+    format!("DROP TABLE {}.{} PURGE", quote(Kind::Oracle, owner), quote(Kind::Oracle, job))
+}
+
+/// One row: banner, DB_UNIQUE_NAME, CON_NAME, USER.
+pub const ENV_SQL: &str = "SELECT (SELECT banner FROM v$version WHERE ROWNUM = 1), \
+    SYS_CONTEXT('USERENV','DB_UNIQUE_NAME'), SYS_CONTEXT('USERENV','CON_NAME'), USER FROM dual";
+
+pub fn is_enterprise(banner: &str) -> bool {
+    banner.contains("Enterprise")
+}
+
+pub const DIRECTORIES_SQL: &str = "SELECT directory_name, directory_path FROM all_directories ORDER BY 1";
+
+/// One-line hint with the GRANT to ask for, for the usual Data Pump / UTL_FILE errors.
+pub fn hint(err: &str, user: &str, dir: &str) -> Option<String> {
+    let has = |c: &str| err.contains(c);
+    if has("PLS-00201") && has("UTL_FILE") {
+        Some(format!("UTL_FILE is not visible: ask a DBA for GRANT EXECUTE ON SYS.UTL_FILE TO {user}"))
+    } else if has("ORA-29283") || has("ORA-39070") || has("ORA-39087") || (has("ORA-39002") && has("ORA-39070")) {
+        Some(format!("No access to the directory: ask a DBA for GRANT READ, WRITE ON DIRECTORY {dir} TO {user}"))
+    } else if has("ORA-31631") || has("ORA-39181") {
+        Some("Privileges are required: ask a DBA for GRANT DATAPUMP_EXP_FULL_DATABASE (export) / DATAPUMP_IMP_FULL_DATABASE (import)".into())
+    } else if has("ORA-22285") || has("ORA-29280") {
+        Some(format!("File or directory does not exist: check that {dir} exists and the file name is right"))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +451,29 @@ mod tests {
             job_name("RSQ_EXP", chrono::NaiveDate::from_ymd_opt(2026, 10, 23).unwrap().and_hms_opt(10, 15, 0).unwrap()),
             "RSQ_EXP_20261023_101500"
         );
+    }
+
+    #[test]
+    fn job_control_sql() {
+        assert!(stop_block("HR", "RSQ_EXP_1", false).contains("DBMS_DATAPUMP.ATTACH('RSQ_EXP_1', 'HR')"));
+        assert!(stop_block("HR", "J", false).contains("STOP_JOB(h, 0, 1)") && stop_block("HR", "J", true).contains("STOP_JOB(h, 1, 0)"));
+        assert!(resume_block("HR", "J", Some(2)).contains("SET_PARALLEL(h, 2)"));
+        assert_eq!(cleanup_sql("HR", "J"), "DROP TABLE \"HR\".\"J\" PURGE");
+        assert!(jobs_sql(true).contains("dba_datapump_jobs") && jobs_sql(false).contains("user_datapump_jobs"));
+        assert!(is_enterprise("Oracle Database 19c Enterprise Edition Release 19.0.0.0.0") && !is_enterprise("Oracle Database 19c Standard Edition 2"));
+    }
+
+    #[test]
+    fn job_running_check_sql() {
+        assert!(job_running_sql("HR", "O'X").contains("job_name = 'O''X'"));
+    }
+
+    #[test]
+    fn hints_name_the_grant() {
+        assert!(hint("ORA-29283: invalid file operation", "SCOTT", "DATA_PUMP_DIR").unwrap().contains("GRANT READ, WRITE ON DIRECTORY DATA_PUMP_DIR TO SCOTT"));
+        assert!(hint("PLS-00201: identifier 'UTL_FILE' must be declared", "SCOTT", "D").unwrap().contains("GRANT EXECUTE ON SYS.UTL_FILE TO SCOTT"));
+        assert!(hint("ORA-31631: privileges are required", "SCOTT", "D").unwrap().contains("DATAPUMP_EXP_FULL_DATABASE"));
+        assert!(hint("ORA-22285: non-existent directory or file for FILEOPEN operation", "SCOTT", "D").unwrap().contains("does not exist"));
+        assert!(hint("ORA-00001", "SCOTT", "D").is_none());
     }
 }
