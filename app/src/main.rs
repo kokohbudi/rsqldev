@@ -79,6 +79,8 @@ const ID_UPDATES: i32 = ID_HIGHEST + 30;
 const ID_SESSIONS: i32 = ID_HIGHEST + 31;
 const ID_SNIPPET: i32 = ID_HIGHEST + 32;
 const ID_SNIPPET_SAVE: i32 = ID_HIGHEST + 33;
+const ID_NEW_SHEET: i32 = ID_HIGHEST + 34;
+const ID_FIND_OBJECT: i32 = ID_HIGHEST + 35;
 
 enum Page {
     Sheet(SheetRef),
@@ -396,6 +398,37 @@ impl App {
         self.add_page(Page::Obj(v), name);
     }
 
+    /// View ▸ Find DB Object: name search across all schemas, open the pick in the object viewer.
+    fn find_object(&self, c: ConnRef) {
+        let Some(pat) = ui::ask(&self.frame, "Object name contains (* = any):", "Find DB Object", "").filter(|p| !p.trim().is_empty()) else { return };
+        let (db, conn) = (c.borrow().kind, c.borrow().cfg.name.clone());
+        Conn::meta_query(&c, &dialect::find_sql(db, &pat), move |r| {
+            let app = app();
+            let rows: Vec<(String, String, &'static str)> = match r {
+                Ok(r) => r
+                    .rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        let mut it = row.into_iter().map(Option::unwrap_or_default);
+                        let (owner, name, kind) = (it.next()?, it.next()?, it.next()?);
+                        Some((owner, name, dialect::kind_const(&kind)?))
+                    })
+                    .collect(),
+                Err(e) => return ui::error(&app.frame, &e),
+            };
+            if rows.is_empty() {
+                return ui::info(&app.frame, &format!("No objects match \"{pat}\"."));
+            }
+            let labels: Vec<String> = rows.iter().map(|(o, n, k)| format!("{n}    {k} · {o}")).collect();
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let d = SingleChoiceDialog::builder(&app.frame, &format!("{} object(s) found (max 200):", rows.len()), "Find DB Object", &refs).build();
+            if d.show_modal() == ID_OK && d.get_selection() >= 0 {
+                let (o, n, k) = &rows[d.get_selection() as usize];
+                app.open_object(&conn, o, k, n);
+            }
+        });
+    }
+
     pub fn ddl_to_worksheet(&self, conn: &str, owner: &str, kind: &'static str, name: &str) {
         let Some(c) = self.open_conn(conn) else { return };
         let db = c.borrow().kind;
@@ -688,7 +721,8 @@ impl App {
                     _ => s.clear(),
                 }
             }
-            ID_WORKSHEET => self.pick_conn(|c| app().open_worksheet(c)),
+            ID_WORKSHEET | ID_NEW_SHEET => self.pick_conn(|c| app().open_worksheet(c)),
+            ID_FIND_OBJECT => self.pick_conn(|c| app().find_object(c)),
             ID_UNSHARED => {
                 if let Some(s) = sheet {
                     let (cfg, prefs) = (s.conn().borrow().cfg.clone(), self.prefs());
@@ -788,6 +822,7 @@ fn menus(frame: &Frame) {
     let file = Menu::builder()
         .append_item(ID_NEW_CONN, "New Connection…\tCtrl+Shift+C", "Create a database connection")
         .append_item(ID_IMPORT_CONNS, "&Import Connections…", "Import connections from Oracle SQL Developer or DBeaver")
+        .append_item(ID_NEW_SHEET, "New SQL &Worksheet\tCtrl+N", "Open a SQL worksheet on a connection")
         .append_item(ID_OPEN, "&Open…\tCtrl+O", "Open a SQL file in a worksheet")
         .append_item(ID_SAVE, "&Save\tCtrl+S", "")
         .append_item(ID_SAVEAS, "Save &As…", "")
@@ -818,6 +853,7 @@ fn menus(frame: &Frame) {
         .build();
     let view = Menu::builder()
         .append_item(ID_TOGGLE_NAV, "&Connections\tCtrl+Shift+L", "Show or hide the Connections navigator")
+        .append_item(ID_FIND_OBJECT, "Find DB &Object…\tCtrl+Shift+O", "Find tables, views, packages… by name in every schema")
         .append_separator()
         .append_radio_item(ID_THEME_LIGHT, "&Light Appearance", "SQL Developer's default look")
         .append_radio_item(ID_THEME_DARK, "&Dark Appearance", "")
@@ -911,7 +947,8 @@ Files and tabs
   Open / Save / Save All   Ctrl/Cmd+O / S / Shift+S
   Close Tab                Ctrl/Cmd+W
   Recover Worksheet        Ctrl/Cmd+Shift+T
-  SQL Worksheet            Alt+F10
+  New SQL Worksheet        Ctrl/Cmd+N (also Alt+F10)
+  Find DB Object           Ctrl/Cmd+Shift+O
 
 Grid
   Copy / Copy with Headers  right-click a cell
@@ -951,14 +988,19 @@ fn start_page(parent: &AuiNotebook, recover: &[autosave::Slot]) -> Panel {
     let link = |icon: &str, label: &str, on: Box<dyn Fn()>| {
         let row = BoxSizer::builder(Orientation::Horizontal).build();
         let ic = icons::tool(&p, icon, label);
-        let l = HyperlinkCtrl::builder(&p).with_label(label).with_url("").build();
-        l.set_normal_colour(theme::c(pal.link));
-        l.set_visited_colour(theme::c(pal.link));
-        l.set_hover_colour(theme::c(pal.accent));
+        // Not a HyperlinkCtrl: wxDragon cannot mark its click handled, so wx also opened the
+        // label as a URL in the browser.
+        let l = StaticText::builder(&p).with_label(label).build();
+        l.set_foreground_color(theme::c(pal.link));
+        if let Some(mut f) = l.get_font() {
+            f.set_underlined(true);
+            l.set_font(&f);
+        }
+        l.set_cursor(wxdragon::cursor::Cursor::from_stock(wxdragon::cursor::StockCursor::Hand).as_ref());
         let on = std::rc::Rc::new(on);
         let o2 = on.clone();
         ic.on_click(move |_| o2());
-        l.on_clicked(move |_| on());
+        l.on_mouse_left_up(move |_| on());
         row.add(&ic, 0, SizerFlag::AlignCenterVertical, 0);
         row.add(&l, 0, SizerFlag::AlignCenterVertical | SizerFlag::Left, 6);
         s.add_sizer(&row, 0, SizerFlag::Left, 40);
@@ -981,7 +1023,7 @@ fn start_page(parent: &AuiNotebook, recover: &[autosave::Slot]) -> Panel {
         section("Recover Unsaved Worksheets");
         for slot in recover.iter().take(8).cloned() {
             let label = autosave::label(&slot);
-            let cell: std::rc::Rc<std::cell::Cell<Option<(HyperlinkCtrl, BitmapButton)>>> = Default::default();
+            let cell: std::rc::Rc<std::cell::Cell<Option<(StaticText, BitmapButton)>>> = Default::default();
             let c2 = cell.clone();
             let (_, l, ic) = link("worksheet", &label, Box::new(move || {
                 if let Some((l, ic)) = c2.take() {

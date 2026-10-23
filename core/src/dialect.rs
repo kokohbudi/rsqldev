@@ -248,6 +248,42 @@ pub fn list_sql(db: Db, kind: &str, owner: &str) -> Option<String> {
     Some(fill(db, &tpl, owner, ""))
 }
 
+/// Find DB Object: objects in every schema whose name contains `pattern` (case-insensitive).
+/// Columns: owner, name, kind (one of the folder kinds). At most 200 rows.
+pub fn find_sql(db: Db, pattern: &str) -> String {
+    let mut p = lit(&pattern.trim().to_uppercase().replace('*', "%"));
+    // MySQL / ClickHouse strings take backslash escapes: a typed backslash must stay literal.
+    if matches!(db, Db::Mysql | Db::Clickhouse) {
+        p = p.replace('\\', "\\\\");
+    }
+    match db {
+        Db::Oracle => format!(
+            "SELECT * FROM (SELECT owner, object_name, object_type FROM all_objects WHERE UPPER(object_name) LIKE '%{p}%' AND object_type IN ('TABLE', 'VIEW', 'MATERIALIZED VIEW', 'INDEX', 'PACKAGE', 'PROCEDURE', 'FUNCTION', 'TRIGGER', 'TYPE', 'SEQUENCE', 'SYNONYM') ORDER BY CASE WHEN owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') THEN 0 ELSE 1 END, object_name, owner) WHERE ROWNUM <= 200"
+        ),
+        Db::Postgres => format!(
+            "SELECT n.nspname, c.relname, CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'i' THEN 'INDEX' WHEN 'I' THEN 'INDEX' WHEN 'S' THEN 'SEQUENCE' ELSE 'TABLE' END FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE UPPER(c.relname) LIKE '%{p}%' AND c.relkind IN ('r', 'p', 'f', 'v', 'm', 'i', 'I', 'S') AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema' \
+             UNION ALL SELECT n.nspname, quote_ident(p.proname) || '(' || pg_get_function_identity_arguments(p.oid) || ')', CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE UPPER(p.proname) LIKE '%{p}%' AND p.prokind IN ('f', 'p') AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema' ORDER BY 2, 1 LIMIT 200"
+        ),
+        Db::Mysql => format!(
+            "SELECT table_schema, table_name, CASE table_type WHEN 'VIEW' THEN 'VIEW' ELSE 'TABLE' END FROM information_schema.tables WHERE UPPER(table_name) LIKE '%{p}%' \
+             UNION ALL SELECT routine_schema, routine_name, routine_type FROM information_schema.routines WHERE UPPER(routine_name) LIKE '%{p}%' ORDER BY 2, 1 LIMIT 200"
+        ),
+        Db::Mssql => format!(
+            "SELECT TOP 200 SCHEMA_NAME(schema_id), name, CASE WHEN type = 'U' THEN 'TABLE' WHEN type = 'V' THEN 'VIEW' WHEN type = 'P' THEN 'PROCEDURE' WHEN type IN ('FN', 'IF', 'TF') THEN 'FUNCTION' WHEN type = 'TR' THEN 'TRIGGER' WHEN type = 'SN' THEN 'SYNONYM' ELSE 'SEQUENCE' END FROM sys.objects WHERE UPPER(name) LIKE '%{p}%' AND type IN ('U', 'V', 'P', 'FN', 'IF', 'TF', 'TR', 'SN', 'SO') ORDER BY name"
+        ),
+        Db::Sqlite => format!("SELECT 'main', name, UPPER(type) FROM sqlite_master WHERE UPPER(name) LIKE '%{p}%' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name LIMIT 200"),
+        Db::Duckdb => format!(
+            "SELECT schema_name, table_name, 'TABLE' FROM duckdb_tables() WHERE UPPER(table_name) LIKE '%{p}%' UNION ALL SELECT schema_name, view_name, 'VIEW' FROM duckdb_views() WHERE NOT internal AND UPPER(view_name) LIKE '%{p}%' ORDER BY 2 LIMIT 200"
+        ),
+        Db::Clickhouse => format!("SELECT database, name, if(engine LIKE '%View', 'VIEW', 'TABLE') FROM system.tables WHERE upper(name) LIKE '%{p}%' AND database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema') ORDER BY name LIMIT 200"),
+    }
+}
+
+/// Folder kind constant for a kind name from [`find_sql`].
+pub fn kind_const(kind: &str) -> Option<&'static str> {
+    [TABLE, VIEW, MVIEW, INDEX, PACKAGE, PROCEDURE, FUNCTION, TRIGGER, TYPE, SEQUENCE, SYNONYM, DBLINK].into_iter().find(|k| k.eq_ignore_ascii_case(kind.trim()))
+}
+
 // ---------- Oracle ----------
 const ORA_COLUMNS: &str = "SELECT c.column_name, c.data_type || CASE WHEN c.data_type IN ('VARCHAR2', 'NVARCHAR2', 'CHAR', 'NCHAR') THEN '(' || c.char_length || CASE c.char_used WHEN 'C' THEN ' CHAR' ELSE ' BYTE' END || ')' WHEN c.data_type = 'RAW' THEN '(' || c.data_length || ')' WHEN c.data_type = 'NUMBER' AND c.data_precision IS NOT NULL THEN '(' || c.data_precision || ',' || c.data_scale || ')' END AS data_type, CASE c.nullable WHEN 'Y' THEN 'Yes' ELSE 'No' END AS nullable, c.data_default, c.column_id, CASE WHEN EXISTS (SELECT 1 FROM all_constraints k JOIN all_cons_columns kc ON kc.owner = k.owner AND kc.constraint_name = k.constraint_name WHERE k.owner = c.owner AND k.table_name = c.table_name AND k.constraint_type = 'P' AND kc.column_name = c.column_name) THEN 'Y' END AS primary_key, cc.comments FROM all_tab_columns c LEFT JOIN all_col_comments cc ON cc.owner = c.owner AND cc.table_name = c.table_name AND cc.column_name = c.column_name WHERE c.owner = '{o}' AND c.table_name = '{n}' ORDER BY c.column_id";
 const ORA_DEPENDS: &str = "SELECT owner, name, type, 'Referenced by' AS relation FROM all_dependencies WHERE referenced_owner = '{o}' AND referenced_name = '{n}' UNION ALL SELECT referenced_owner, referenced_name, referenced_type, 'References' FROM all_dependencies WHERE owner = '{o}' AND name = '{n}' ORDER BY 4, 1, 2";
