@@ -4,8 +4,10 @@
 //!
 //! The encryption password is never in the text: blocks use the `:password` bind placeholder.
 
+use crate::config::config_root;
 use crate::dialect::{lit, quote};
 use crate::registry::Kind;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
@@ -377,6 +379,89 @@ pub fn hint(err: &str, user: &str, dir: &str) -> Option<String> {
     }
 }
 
+/// Upload chunk size: one round trip carries this many bytes.
+pub const UPLOAD_CHUNK: usize = 4 * 1024 * 1024;
+
+/// Binds (positional): `:1` directory, `:2` file, `:3` open mode (`wb` first chunk, `ab` after), `:4` BLOB chunk.
+/// `:4` is assigned after `FOPEN` so the binds appear in order 1, 2, 3, 4.
+pub const UPLOAD_BLOCK: &str = "DECLARE\n  f UTL_FILE.FILE_TYPE;\n  b BLOB;\n  pos PLS_INTEGER := 1;\n  len PLS_INTEGER;\nBEGIN\n  \
+    f := UTL_FILE.FOPEN(:1, :2, :3, 32767);\n  b := :4;\n  len := DBMS_LOB.GETLENGTH(b);\n  \
+    WHILE pos <= len LOOP\n    UTL_FILE.PUT_RAW(f, DBMS_LOB.SUBSTR(b, 32767, pos), TRUE);\n    pos := pos + 32767;\n  END LOOP;\n  \
+    UTL_FILE.FCLOSE(f);\nEXCEPTION WHEN OTHERS THEN\n  IF UTL_FILE.IS_OPEN(f) THEN\n    UTL_FILE.FCLOSE(f);\n  END IF;\n  RAISE;\nEND;";
+
+/// One row: FILEEXISTS (0/1), length in bytes (NULL when the file is missing).
+pub fn file_exists_sql(dir: &str, file: &str) -> Result<String, String> {
+    check("directory", dir)?;
+    check("file", file)?;
+    Ok(format!(
+        "WITH f AS (SELECT BFILENAME({}, {}) AS b FROM dual) \
+         SELECT DBMS_LOB.FILEEXISTS(b), CASE WHEN DBMS_LOB.FILEEXISTS(b) = 1 THEN DBMS_LOB.GETLENGTH(b) END FROM f",
+        q(dir),
+        q(file)
+    ))
+}
+
+pub fn delete_block(dir: &str, file: &str) -> Result<String, String> {
+    check("directory", dir)?;
+    check("file", file)?;
+    Ok(format!("BEGIN UTL_FILE.FREMOVE({}, {}); END;", q(dir), q(file)))
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FileKind {
+    Dump,
+    Log,
+    SqlFile,
+    Upload,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct FileRecord {
+    pub conn: String,
+    /// `DB_UNIQUE_NAME/CON_NAME`; empty when unknown.
+    pub db: String,
+    pub directory: String,
+    pub file: String,
+    pub kind: FileKind,
+    pub job: String,
+    pub created: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct Files {
+    #[serde(default)]
+    file: Vec<FileRecord>,
+}
+
+const FILES_TOML: &str = "datapump.toml";
+
+/// Empty on a missing or unreadable file.
+pub fn load_files() -> Vec<FileRecord> {
+    std::fs::read_to_string(config_root().join(FILES_TOML))
+        .ok()
+        .and_then(|s| toml::from_str::<Files>(&s).ok())
+        .map(|f| f.file)
+        .unwrap_or_default()
+}
+
+pub fn save_files(v: &[FileRecord]) -> anyhow::Result<()> {
+    std::fs::create_dir_all(config_root())?;
+    std::fs::write(config_root().join(FILES_TOML), toml::to_string_pretty(&Files { file: v.to_vec() })?)?;
+    Ok(())
+}
+
+/// Same database identity, or the same connection name when `db` is empty.
+pub fn files_for<'a>(all: &'a [FileRecord], conn: &str, db: &str) -> Vec<&'a FileRecord> {
+    all.iter().filter(|r| if db.is_empty() { r.conn == conn } else { r.db == db }).collect()
+}
+
+pub fn rename_conn(all: &mut [FileRecord], old: &str, new: &str) {
+    for r in all.iter_mut().filter(|r| r.conn == old) {
+        r.conn = new.to_string();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +560,23 @@ mod tests {
         assert!(hint("ORA-31631: privileges are required", "SCOTT", "D").unwrap().contains("DATAPUMP_EXP_FULL_DATABASE"));
         assert!(hint("ORA-22285: non-existent directory or file for FILEOPEN operation", "SCOTT", "D").unwrap().contains("does not exist"));
         assert!(hint("ORA-00001", "SCOTT", "D").is_none());
+    }
+
+    #[test]
+    fn upload_and_file_sql_bind_names() {
+        assert!(UPLOAD_BLOCK.contains("UTL_FILE.FOPEN(:1, :2, :3, 32767)") && UPLOAD_BLOCK.contains("DBMS_LOB.SUBSTR(b, 32767, pos)"));
+        assert!(file_exists_sql("D", "x.dmp").unwrap().contains("BFILENAME('D', 'x.dmp')"));
+        assert!(file_exists_sql("D", "x'.dmp").is_err() && delete_block("D", "../x").is_err());
+    }
+
+    #[test]
+    fn file_records() {
+        let r = |c: &str, db: &str| FileRecord { conn: c.into(), db: db.into(), directory: "D".into(), file: "a.dmp".into(), kind: FileKind::Dump, job: "J".into(), created: "2026-10-23 10:00".into() };
+        let mut all = vec![r("prod", "ORCL/PDB1"), r("prod2", "ORCL/PDB1"), r("dev", "DEV/DEV")];
+        assert_eq!(files_for(&all, "x", "ORCL/PDB1").len(), 2);
+        rename_conn(&mut all, "dev", "dev-new");
+        assert_eq!(all[2].conn, "dev-new");
+        let t = toml::to_string(&Files { file: all.clone() }).unwrap();
+        assert_eq!(toml::from_str::<Files>(&t).unwrap().file, all);
     }
 }
