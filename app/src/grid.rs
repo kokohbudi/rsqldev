@@ -118,7 +118,8 @@ impl ResultGrid {
         grid.set_default_cell_text_colour(&c(p.text));
         grid.set_selection_background(&c(p.select_bg));
         grid.set_selection_foreground(&c(p.select_fg));
-        grid.set_default_row_size(20, true);
+        // From the font, not fixed pixels: Windows at 125-150% scaling has taller text.
+        grid.set_default_row_size((grid.get_char_height() + 6).max(20), true);
         let g = ResultGrid { grid, st: Rc::default() };
         let weak = Rc::downgrade(&g.st);
         let me = g.clone_weak();
