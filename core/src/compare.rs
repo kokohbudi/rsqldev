@@ -77,37 +77,25 @@ fn add_column(db: Db, table: &str, col: &str, ty: &str) -> String {
     }
 }
 
+/// Oracle: DBMS_METADATA writes the terminators itself (`;` after SQL, `/` after each PL/SQL
+/// unit) while this is on, so package spec + body or trigger + ALTER TRIGGER come out runnable
+/// without splitting the text. Run before fetching DDL, [`ORA_TERMINATORS_OFF`] after.
+pub const ORA_TERMINATORS_ON: &str = "BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SQLTERMINATOR', TRUE); END;";
+pub const ORA_TERMINATORS_OFF: &str = "BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SQLTERMINATOR', FALSE); END;";
+
 /// DDL fetched from the source, pointed at the target schema and terminated for Run Script.
-/// Oracle code DDL can hold several units (package spec and body, trigger + ALTER TRIGGER).
-fn statement(db: Db, kind: &str, ddl: &str, src_owner: &str, tgt_owner: &str) -> String {
+fn statement(db: Db, ddl: &str, src_owner: &str, tgt_owner: &str) -> String {
     let mut ddl = ddl.trim().to_string();
     if !src_owner.is_empty() && !tgt_owner.is_empty() && src_owner != tgt_owner {
         ddl = ddl.replace(&format!("{}.", dialect::quote(db, src_owner)), &format!("{}.", dialect::quote(db, tgt_owner)));
     }
-    if db != Db::Oracle || !is_code(kind) {
-        return if ddl.ends_with(';') { ddl } else { format!("{ddl};") };
-    }
-    let mut out = String::new();
-    let mut unit: Vec<&str> = vec![];
-    let flush = |unit: &mut Vec<&str>, out: &mut String| {
-        let u = unit.join("\n");
-        let u = u.trim();
-        if !u.is_empty() {
-            let block = u.to_uppercase().starts_with("CREATE");
-            out.push_str(u);
-            out.push_str(if block { "\n/\n" } else if u.ends_with(';') { "\n" } else { ";\n" });
-        }
-        unit.clear();
-    };
-    for line in ddl.lines() {
-        let t = line.trim_start().to_uppercase();
-        if t.starts_with("CREATE OR REPLACE") || t.starts_with("ALTER ") {
-            flush(&mut unit, &mut out);
-        }
-        unit.push(line);
-    }
-    flush(&mut unit, &mut out);
-    out.trim_end().to_string()
+    if ddl.ends_with(';') || (db == Db::Oracle && ddl.ends_with('/')) { ddl } else { format!("{ddl};") }
+}
+
+/// Identifiers and notes go into `--` comments: a newline in a (database-supplied) name must
+/// not end the comment and leave the rest of the name as a statement in the script.
+fn safe(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() || c == '\u{2028}' || c == '\u{2029}' { '?' } else { c }).collect()
 }
 
 pub struct Side<'a> {
@@ -121,8 +109,8 @@ pub fn script(db: Db, src: &Side, tgt: &Side, diffs: &[((&'static str, String), 
     let count = |f: fn(&Diff) -> bool| diffs.iter().filter(|d| f(&d.1)).count();
     let mut out = format!(
         "-- Schema Compare: {} → {}\n-- {} only in source, {} different, {} only in target. Review before running (F5).\n",
-        src.label,
-        tgt.label,
+        safe(src.label),
+        safe(tgt.label),
         count(|d| *d == Diff::OnlySource),
         count(|d| matches!(d, Diff::Changed(_))),
         count(|d| *d == Diff::OnlyTarget),
@@ -132,18 +120,19 @@ pub fn script(db: Db, src: &Side, tgt: &Side, diffs: &[((&'static str, String), 
     section(&mut out, "Missing in target");
     for ((kind, name), d) in diffs {
         if *d == Diff::OnlySource {
+            let n = safe(name);
             match ddl.get(&(*kind, name.clone())) {
-                Some(t) => out.push_str(&format!("\n-- {kind} {name}\n{}\n", statement(db, kind, t, src.owner, tgt.owner))),
-                None => out.push_str(&format!("\n-- {kind} {name}: no DDL available, create it by hand\n")),
+                Some(t) => out.push_str(&format!("\n-- {kind} {n}\n{}\n", statement(db, t, src.owner, tgt.owner))),
+                None => out.push_str(&format!("\n-- {kind} {n}: no DDL available, create it by hand\n")),
             }
         }
     }
     section(&mut out, "Different");
     for ((kind, name), d) in diffs {
         let Diff::Changed(notes) = d else { continue };
-        out.push_str(&format!("\n-- {kind} {name}\n"));
+        out.push_str(&format!("\n-- {kind} {}\n", safe(name)));
         for n in notes {
-            out.push_str(&format!("--   {n}\n"));
+            out.push_str(&format!("--   {}\n", safe(n)));
         }
         if *kind == TABLE {
             let tcols = &tgt.schema.get(&(*kind, name.clone())).map(|o| o.columns.clone()).unwrap_or_default();
@@ -154,14 +143,14 @@ pub fn script(db: Db, src: &Side, tgt: &Side, diffs: &[((&'static str, String), 
                 }
             }
         } else if let Some(t) = ddl.get(&(*kind, name.clone())) {
-            out.push_str(&statement(db, kind, t, src.owner, tgt.owner));
+            out.push_str(&statement(db, t, src.owner, tgt.owner));
             out.push('\n');
         }
     }
     section(&mut out, "Only in target (commented out)");
     for ((kind, name), d) in diffs {
         if *d == Diff::OnlyTarget {
-            out.push_str(&format!("-- DROP {kind} {};\n", q(name)));
+            out.push_str(&format!("-- DROP {kind} {};\n", safe(&q(name))));
         }
     }
     out
@@ -198,9 +187,13 @@ mod tests {
     }
 
     #[test]
-    fn oracle_code_units() {
-        let ddl = "\n  CREATE OR REPLACE PACKAGE \"HR\".\"P\" AS\n  x number;\nEND p;\n  CREATE OR REPLACE PACKAGE BODY \"HR\".\"P\" AS\nEND p;\nALTER TRIGGER \"HR\".\"T\" ENABLE";
-        let s = statement(Db::Oracle, PACKAGE, ddl, "HR", "HR");
-        assert_eq!(s, "CREATE OR REPLACE PACKAGE \"HR\".\"P\" AS\n  x number;\nEND p;\n/\nCREATE OR REPLACE PACKAGE BODY \"HR\".\"P\" AS\nEND p;\n/\nALTER TRIGGER \"HR\".\"T\" ENABLE;");
+    fn names_stay_in_comments() {
+        let mut t = Schema::new();
+        t.insert((TABLE, "X\nDROP TABLE EMP".into()), Obj::default());
+        let d = diff(&Schema::new(), &t);
+        let out = script(Db::Oracle, &Side { label: "a", owner: "HR", schema: &Schema::new() }, &Side { label: "b", owner: "QA", schema: &t }, &d, &BTreeMap::new());
+        assert!(out.lines().all(|l| l.is_empty() || l.starts_with("--")), "{out}");
+        // DBMS_METADATA terminators are kept as they come.
+        assert_eq!(statement(Db::Oracle, "CREATE OR REPLACE PACKAGE \"HR\".\"P\" AS\nEND;\n/\n", "HR", "QA"), "CREATE OR REPLACE PACKAGE \"QA\".\"P\" AS\nEND;\n/");
     }
 }

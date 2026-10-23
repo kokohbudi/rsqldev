@@ -150,13 +150,20 @@ fn run(s: ConnRef, so: String, t: ConnRef, to: String) {
             let jobs: Vec<(String, usize, (&'static str, String))> = need.into_iter().filter_map(|(k, n)| dialect::ddl_sql(db, k, &so, &n).map(|(q, c)| (q, c, (k, n)))).collect();
             let ddl = std::rc::Rc::new(std::cell::RefCell::new(BTreeMap::new()));
             let d2 = ddl.clone();
-            let sqls: Vec<String> = jobs.iter().map(|j| j.0.clone()).collect();
+            // Oracle: DBMS_METADATA adds the ; and / terminators itself while fetching.
+            let ora = db == rsqldev_core::registry::Kind::Oracle;
+            let mut sqls: Vec<String> = jobs.iter().map(|j| j.0.clone()).collect();
+            if ora {
+                sqls.insert(0, compare::ORA_TERMINATORS_ON.into());
+                sqls.push(compare::ORA_TERMINATORS_OFF.into());
+            }
             chain(
                 s2,
                 sqls,
                 move |i, r| {
+                    let Some(j) = (if ora { i.checked_sub(1) } else { Some(i) }).and_then(|i| jobs.get(i)) else { return };
                     if let Ok(r) = r {
-                        d2.borrow_mut().insert(jobs[i].2.clone(), text(r, jobs[i].1));
+                        d2.borrow_mut().insert(j.2.clone(), text(r, j.1));
                     }
                 },
                 move || {

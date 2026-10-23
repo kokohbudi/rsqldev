@@ -126,7 +126,10 @@ pub fn qualified(db: Db, owner: &str, name: &str) -> String {
 
 pub fn fill(db: Db, tpl: &str, owner: &str, name: &str) -> String {
     let q = qualified(db, owner, name);
-    tpl.replace("{lq}", &lit(&q)).replace("{q}", &q).replace("{o}", &lit(owner)).replace("{n}", &lit(name))
+    // MySQL / ClickHouse strings also take backslash escapes: a name ending in `\` would
+    // otherwise escape the closing quote.
+    let l = |s: &str| if matches!(db, Db::Mysql | Db::Clickhouse) { lit(&s.replace('\\', "\\\\")) } else { lit(s) };
+    tpl.replace("{lq}", &l(&q)).replace("{q}", &q).replace("{o}", &l(owner)).replace("{n}", &l(name))
 }
 
 /// Folders under a connection / schema node, in SQL Developer order.
