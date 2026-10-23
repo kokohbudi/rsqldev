@@ -118,7 +118,7 @@ fn dialog(conn: ConnRef, env: Env, dirs: Vec<String>) {
     let log = TextCtrl::builder(&sp).with_value(&format!("{job_name}.log")).build();
     let lrow = BoxSizer::builder(Orientation::Horizontal).build();
     lrow.add(&local, 1, SizerFlag::Expand | SizerFlag::Right, 6);
-    lrow.add(&browse, 0, 0, 0);
+    lrow.add(&browse, 0, SizerFlag::empty(), 0);
     let fg = FlexGridSizer::builder(0, 2).with_vgap(8).with_hgap(10).build();
     fg.add_growable_col(1, 1);
     let ll = StaticText::builder(&sp).with_label("Local file:").build();
