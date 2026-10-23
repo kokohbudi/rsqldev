@@ -6,7 +6,8 @@
 use crate::config::{ConnConfig, Prefs};
 use crate::{Backend, Bind, Canceller, Event};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,10 +40,22 @@ impl Drop for Busy {
     }
 }
 
+#[derive(Clone)]
 pub enum Cmd {
     Exec { id: u64, sql: String, fetch: usize, rows: SyncSender<Event> },
     /// DML with bind values (BLOB upload, long text). Replies `Done`.
     ExecBinds { id: u64, sql: String, binds: Vec<Bind> },
+    /// Stream a server file into `path` (opened for append, written from `offset`). Replies
+    /// `Done` with the bytes written; `progress` gets `(done_total, file_len)`. Never retried.
+    Download {
+        id: u64,
+        dir: String,
+        file: String,
+        path: PathBuf,
+        offset: u64,
+        progress: Sender<(u64, u64)>,
+        cancel: Arc<AtomicBool>,
+    },
     Commit,
     Rollback,
     Autocommit(bool),
@@ -86,10 +99,32 @@ impl Session {
                 drop(connecting);
                 *c2.lock().unwrap() = b.canceller();
                 let _ = rtx.send(Reply::Connected);
+                let (mut autocommit, mut output) = (prefs.autocommit, false);
                 for cmd in rx {
+                    match cmd {
+                        Cmd::Autocommit(on) => autocommit = on,
+                        Cmd::Output(on) => output = on,
+                        _ => {}
+                    }
                     let r = {
                         let _busy = Busy::new();
-                        run(b.as_mut(), cmd)
+                        let mut sent = false;
+                        let mut r = run(b.as_mut(), cmd.clone(), &mut sent);
+                        // The server or a firewall dropped an idle session: reconnect once and
+                        // retry, unless rows already reached the UI. Uncommitted work is lost with it.
+                        let query = matches!(&cmd, Cmd::Exec { sql, .. } if crate::is_query(sql));
+                        if !sent && lost(&r, query) && !matches!(cmd, Cmd::Download { .. }) {
+                            if let Ok(mut nb) = crate::backend::connect(&cfg, &password, &prefs) {
+                                let _ = nb.set_autocommit(autocommit);
+                                if output {
+                                    let _ = nb.enable_output(true);
+                                }
+                                *c2.lock().unwrap() = nb.canceller();
+                                b = nb;
+                                r = run(b.as_mut(), cmd, &mut sent);
+                            }
+                        }
+                        r
                     };
                     if rtx.send(r).is_err() {
                         break;
@@ -117,6 +152,17 @@ impl Session {
         id
     }
 
+    /// Start a download of a server file to `path` from byte `offset`. Returns its id, the
+    /// progress receiver and the flag that cancels it.
+    pub fn download(&mut self, dir: &str, file: &str, path: PathBuf, offset: u64) -> (u64, Receiver<(u64, u64)>, Arc<AtomicBool>) {
+        let (progress, rx) = channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let id = self.next_id;
+        self.next_id += 1;
+        let _ = self.tx.send(Cmd::Download { id, dir: dir.into(), file: file.into(), path, offset, progress, cancel: cancel.clone() });
+        (id, rx, cancel)
+    }
+
     pub fn send(&self, c: Cmd) {
         let _ = self.tx.send(c);
     }
@@ -128,7 +174,21 @@ impl Session {
     }
 }
 
-fn run(b: &mut dyn Backend, cmd: Cmd) -> Reply {
+/// Error text of a dead connection worth one reconnect and retry. Statements only: a retried
+/// Commit would report success on a fresh session whose transaction is empty.
+/// DPI-1010 / ORA-03114 (not connected) and ORA-02396 (idle timeout) are raised before the
+/// statement reaches the server, so any statement may run again. ORA-03113 / ORA-03135
+/// (end-of-file, lost contact) and DPI-1080 can come mid-call, after the server already ran it:
+/// only a query (`query`) is safe to repeat then; DML under autocommit or a UTL_FILE upload
+/// chunk would run twice.
+fn lost(r: &Reply, query: bool) -> bool {
+    let Reply::Done { result: Err(e), .. } = r else { return false };
+    let before_send = ["DPI-1010", "ORA-03114", "ORA-02396"];
+    let mid_call = ["DPI-1080", "ORA-03113", "ORA-03135"];
+    before_send.iter().any(|c| e.contains(c)) || (query && mid_call.iter().any(|c| e.contains(c)))
+}
+
+fn run(b: &mut dyn Backend, cmd: Cmd, sent: &mut bool) -> Reply {
     let tx = |r: crate::Result<()>, ok: &'static str| Reply::TxDone(r.map(|_| ok).map_err(|e| format!("{e:#}")));
     match cmd {
         Cmd::Exec { id, sql, fetch, rows } => {
@@ -136,6 +196,7 @@ fn run(b: &mut dyn Backend, cmd: Cmd) -> Reply {
             // Idle while the UI holds the next batch back (fetch-on-scroll).
             let result = b
                 .execute(&sql, fetch, &mut |e| {
+                    *sent = true;
                     BUSY.fetch_sub(1, Ordering::Relaxed);
                     let ok = rows.send(e).is_ok();
                     BUSY.fetch_add(1, Ordering::Relaxed);
@@ -150,9 +211,55 @@ fn run(b: &mut dyn Backend, cmd: Cmd) -> Reply {
             let result = b.execute_binds(&sql, &binds).map_err(|e| format!("{e:#}"));
             Reply::Done { id, result, output: vec![], elapsed: t.elapsed() }
         }
+        Cmd::Download { id, dir, file, path, offset, progress, cancel } => {
+            let t = Instant::now();
+            let result = (|| -> crate::Result<u64> {
+                let mut out = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+                let n = b.read_server_file(&dir, &file, offset, &mut out, &mut |done, len| {
+                    let _ = progress.send((done, len));
+                    !cancel.load(Ordering::Relaxed)
+                })?;
+                out.sync_all()?;
+                Ok(n)
+            })()
+            .map(Some)
+            .map_err(|e| format!("{e:#}"));
+            Reply::Done { id, result, output: vec![], elapsed: t.elapsed() }
+        }
         Cmd::Commit => tx(b.commit(), "Commit complete."),
         Cmd::Rollback => tx(b.rollback(), "Rollback complete."),
         Cmd::Autocommit(on) => tx(b.set_autocommit(on), "Autocommit changed."),
         Cmd::Output(on) => tx(b.enable_output(on), if on { "Server output enabled." } else { "Server output disabled." }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_only_when_safe() {
+        let err = |e: &str| Reply::Done { id: 1, result: Err(e.into()), output: vec![], elapsed: Duration::ZERO };
+        assert!(lost(&err("DPI-1010: not connected"), false));
+        assert!(lost(&err("ORA-02396: exceeded maximum idle time"), false));
+        // Mid-call loss: the server may have run it already, so only a query repeats.
+        assert!(!lost(&err("ORA-03113: end-of-file on communication channel"), false));
+        assert!(lost(&err("ORA-03113: end-of-file on communication channel"), true));
+        assert!(!lost(&err("ORA-00942: table or view does not exist"), true));
+        assert!(!lost(&Reply::TxDone(Err("DPI-1010".into())), true));
+    }
+
+    #[test]
+    fn download_needs_oracle() {
+        let cfg = ConnConfig { driver: "sqlite".into(), database: ":memory:".into(), ..Default::default() };
+        let mut s = Session::open(cfg, String::new(), Prefs::default());
+        assert!(matches!(s.replies.recv().unwrap(), Reply::Connected));
+        let part = std::env::temp_dir().join(format!("rsq-dl-{}.part", std::process::id()));
+        let (_, _rx, _cancel) = s.download("D", "x.dmp", part.clone(), 0);
+        match s.replies.recv().unwrap() {
+            Reply::Done { result: Err(e), .. } => assert!(e.contains("only available on Oracle")),
+            r => panic!("{r:?}"),
+        }
+        let _ = std::fs::remove_file(part);
     }
 }

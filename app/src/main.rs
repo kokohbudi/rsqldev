@@ -2,9 +2,14 @@
 //! rsqldev: a native SQL Developer. wxWidgets gives Cocoa widgets on macOS and Win32 on Windows.
 
 mod autosave;
+mod compare;
 mod complete;
+mod copy;
 mod conn;
 mod connections;
+mod datapump_export;
+mod datapump_tab;
+mod datapump_import;
 mod driver_manager;
 mod editor;
 mod find;
@@ -15,6 +20,10 @@ mod theme;
 mod object_view;
 mod prefs;
 mod sessions;
+mod snippets;
+mod table_editor;
+mod topsql;
+mod transfer;
 mod ui;
 mod value;
 mod worksheet;
@@ -76,11 +85,31 @@ const ID_FORMAT: i32 = ID_HIGHEST + 28;
 const ID_IMPORT_CONNS: i32 = ID_HIGHEST + 29;
 const ID_UPDATES: i32 = ID_HIGHEST + 30;
 const ID_SESSIONS: i32 = ID_HIGHEST + 31;
+const ID_SNIPPET: i32 = ID_HIGHEST + 32;
+const ID_SNIPPET_SAVE: i32 = ID_HIGHEST + 33;
+const ID_NEW_SHEET: i32 = ID_HIGHEST + 34;
+const ID_FIND_OBJECT: i32 = ID_HIGHEST + 35;
+const ID_DUP_LINES: i32 = ID_HIGHEST + 36;
+const ID_LINES_UP: i32 = ID_HIGHEST + 37;
+const ID_LINES_DOWN: i32 = ID_HIGHEST + 38;
+const ID_BRACE: i32 = ID_HIGHEST + 39;
+const ID_BOOKMARK: i32 = ID_HIGHEST + 40;
+const ID_BOOKMARK_NEXT: i32 = ID_HIGHEST + 41;
+const ID_BOOKMARK_PREV: i32 = ID_HIGHEST + 42;
+const ID_AUTOTRACE: i32 = ID_HIGHEST + 43;
+const ID_COMPARE: i32 = ID_HIGHEST + 44;
+const ID_RUN_PLSQL: i32 = ID_HIGHEST + 45;
+const ID_TOPSQL: i32 = ID_HIGHEST + 46;
+const ID_DP_EXPORT: i32 = ID_HIGHEST + 47;
+const ID_DP_IMPORT: i32 = ID_HIGHEST + 48;
+const ID_DP_JOBS: i32 = ID_HIGHEST + 49;
 
 enum Page {
     Sheet(SheetRef),
     Obj(Rc<ObjectView>),
     Sessions(Rc<sessions::Sessions>),
+    TopSql(Rc<topsql::TopSql>),
+    DataPump(Rc<datapump_tab::DataPumpTab>),
 }
 
 impl Page {
@@ -89,6 +118,8 @@ impl Page {
             Page::Sheet(s) => s.panel,
             Page::Obj(o) => o.panel,
             Page::Sessions(s) => s.panel,
+            Page::TopSql(s) => s.panel,
+            Page::DataPump(s) => s.panel,
         }
     }
 }
@@ -305,6 +336,8 @@ impl App {
                 Page::Sheet(s) => s.conn().borrow().cfg.name == name,
                 Page::Obj(o) => o.key.starts_with(&format!("{name}|")),
                 Page::Sessions(s) => s.conn_name == name,
+                Page::TopSql(s) => s.conn_name == name,
+                Page::DataPump(s) => s.conn_name == name,
             };
             if mine {
                 let idx = self.nb.get_page_index(&pages[i].panel());
@@ -374,6 +407,24 @@ impl App {
         self.nb.add_page(&panel, title, true);
     }
 
+    /// Data Pump Jobs & Files tab of a connection: focus it if open, else create it.
+    pub fn open_datapump(&self, conn: ConnRef) {
+        let name = conn.borrow().cfg.name.clone();
+        let found = self.pages.borrow().iter().find_map(|p| match p {
+            Page::DataPump(t) if t.conn_name == name => Some(t.clone()),
+            _ => None,
+        });
+        if let Some(t) = found {
+            let i = self.nb.get_page_index(&t.panel);
+            if i >= 0 {
+                self.nb.set_selection(i as usize);
+            }
+            return t.refresh();
+        }
+        let t = datapump_tab::DataPumpTab::new(&self.nb, conn);
+        self.add_page(Page::DataPump(t), &format!("Data Pump: {name}"));
+    }
+
     pub fn open_worksheet(&self, c: ConnRef) {
         let title = c.borrow().cfg.name.clone();
         let ws = Worksheet::new(&self.nb, c);
@@ -391,6 +442,47 @@ impl App {
         }
         let v = ObjectView::new(&self.nb, c, owner, kind, name);
         self.add_page(Page::Obj(v), name);
+    }
+
+    /// View ▸ Find DB Object: name search across all schemas, open the pick in the object viewer.
+    fn find_object(&self, c: ConnRef) {
+        let Some(pat) = ui::ask(&self.frame, "Object name contains (* = any):", "Find DB Object", "").filter(|p| !p.trim().is_empty()) else { return };
+        let conn = c.borrow().cfg.name.clone();
+        found_objects(&c, &pat.clone(), move |rows| {
+            let app = app();
+            if rows.is_empty() {
+                return ui::info(&app.frame, &format!("No objects match \"{pat}\"."));
+            }
+            let labels: Vec<String> = rows.iter().map(|(o, n, k)| format!("{n}    {k} · {o}")).collect();
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let d = SingleChoiceDialog::builder(&app.frame, &format!("{} object(s) found (max 200):", rows.len()), "Find DB Object", &refs).build();
+            if d.show_modal() == ID_OK && d.get_selection() >= 0 {
+                let (o, n, k) = &rows[d.get_selection() as usize];
+                app.open_object(&conn, o, k, n);
+            }
+        });
+    }
+
+    /// Ctrl/Cmd+Click in the editor: open `[owner.]name` in the object viewer. An exact name
+    /// match wins, in the given owner or else the current schema first.
+    pub fn goto_object(&self, c: ConnRef, ident: &str) {
+        let db = c.borrow().kind;
+        let (owner, name) = match ident.rsplit_once('.') {
+            Some((o, n)) => (Some(dialect::fold(db, o.trim_matches('"'))), dialect::fold(db, n.trim_matches('"'))),
+            None => (None, dialect::fold(db, ident.trim_matches('"'))),
+        };
+        let (conn, schema) = (c.borrow().cfg.name.clone(), c.borrow().schema.clone());
+        let n2 = name.clone();
+        found_objects(&c, &name, move |rows| {
+            // PostgreSQL functions are listed as name(args).
+            let base = |n: &str| n.split('(').next().unwrap_or(n).trim_matches('"').to_string();
+            let hits: Vec<_> = rows.into_iter().filter(|(o, n, _)| base(n).eq_ignore_ascii_case(&n2) && owner.as_ref().is_none_or(|w| w.eq_ignore_ascii_case(o))).collect();
+            let pick = hits.iter().find(|(o, _, _)| o.eq_ignore_ascii_case(&schema)).or(hits.first());
+            match pick {
+                Some((o, n, k)) => app().open_object(&conn, o, k, n),
+                None => app().status(0, &format!("No object named {n2}")),
+            }
+        });
     }
 
     pub fn ddl_to_worksheet(&self, conn: &str, owner: &str, kind: &'static str, name: &str) {
@@ -569,6 +661,33 @@ impl App {
                 let s = sessions::Sessions::new(&a.nb, c);
                 a.add_page(Page::Sessions(s), &title);
             }),
+            ID_DP_EXPORT => self.pick_conn(|c| {
+                if c.borrow().kind == rsqldev_core::registry::Kind::Oracle {
+                    datapump_export::show(c);
+                } else {
+                    ui::info(&app().frame, "Data Pump is available on Oracle connections");
+                }
+            }),
+            ID_DP_IMPORT => self.pick_conn(|c| {
+                if c.borrow().kind == rsqldev_core::registry::Kind::Oracle {
+                    datapump_import::show(c);
+                } else {
+                    ui::info(&app().frame, "Data Pump is available on Oracle connections");
+                }
+            }),
+            ID_DP_JOBS => self.pick_conn(|c| {
+                if c.borrow().kind == rsqldev_core::registry::Kind::Oracle {
+                    app().open_datapump(c);
+                } else {
+                    ui::info(&app().frame, "Data Pump is available on Oracle connections");
+                }
+            }),
+            ID_TOPSQL => self.pick_conn(|c| {
+                let a = app();
+                let title = format!("Top SQL: {}", c.borrow().cfg.name);
+                let s = topsql::TopSql::new(&a.nb, c);
+                a.add_page(Page::TopSql(s), &title);
+            }),
             ID_UPDATES => check_updates(true),
             ID_OPEN => {
                 let d = FileDialog::builder(&self.frame).with_message("Open SQL file").with_style(FileDialogStyle::Open).with_wildcard("SQL files (*.sql)|*.sql|All files (*)|*").build();
@@ -635,6 +754,10 @@ impl App {
                 }
             }
             ID_EXIT => self.frame.close(false),
+            // Outside the worksheet editor, Copy takes the last selected grid, tree node or text.
+            ID_COPY if !editor_focus => {
+                copy::copy();
+            }
             ID_UNDO | ID_REDO | ID_CUT | ID_COPY | ID_PASTE | ID_SELECTALL if editor_focus => {
                 let e = sheet.unwrap().editor;
                 match id {
@@ -667,12 +790,29 @@ impl App {
                     complete::show(s.editor, &s.conn(), true);
                 }
             }
-            ID_RUN | ID_SCRIPT | ID_EXPLAIN | ID_COMMIT | ID_ROLLBACK | ID_CANCEL_STMT | ID_HISTORY | ID_CLEAR => {
+            ID_DUP_LINES | ID_LINES_UP | ID_LINES_DOWN | ID_BRACE | ID_BOOKMARK | ID_BOOKMARK_NEXT | ID_BOOKMARK_PREV => {
+                let Some(e) = sheet.map(|s| s.editor) else { return true };
+                match id {
+                    ID_DUP_LINES => editor::duplicate_lines(e),
+                    ID_LINES_UP | ID_LINES_DOWN => editor::move_lines(e, id == ID_LINES_UP),
+                    ID_BRACE => editor::goto_brace(e),
+                    ID_BOOKMARK => editor::toggle_bookmark(e),
+                    _ => editor::goto_bookmark(e, id == ID_BOOKMARK_NEXT),
+                }
+            }
+            ID_SNIPPET | ID_SNIPPET_SAVE => {
+                if let Some(s) = sheet {
+                    if id == ID_SNIPPET { snippets::insert(&self.frame, s.editor) } else { snippets::save_selection(&self.frame, s.editor) }
+                }
+            }
+            ID_RUN | ID_SCRIPT | ID_EXPLAIN | ID_AUTOTRACE | ID_RUN_PLSQL | ID_COMMIT | ID_ROLLBACK | ID_CANCEL_STMT | ID_HISTORY | ID_CLEAR => {
                 let Some(s) = sheet else { return true };
                 match id {
                     ID_RUN => s.run_statement(),
                     ID_SCRIPT => s.run_script(),
                     ID_EXPLAIN => s.explain_plan(),
+                    ID_AUTOTRACE => s.autotrace(),
+                    ID_RUN_PLSQL => s.run_plsql(),
                     ID_COMMIT => s.commit(),
                     ID_ROLLBACK => s.rollback(),
                     ID_CANCEL_STMT => s.cancel(),
@@ -680,7 +820,8 @@ impl App {
                     _ => s.clear(),
                 }
             }
-            ID_WORKSHEET => self.pick_conn(|c| app().open_worksheet(c)),
+            ID_WORKSHEET | ID_NEW_SHEET => self.pick_conn(|c| app().open_worksheet(c)),
+            ID_FIND_OBJECT => self.pick_conn(|c| app().find_object(c)),
             ID_UNSHARED => {
                 if let Some(s) = sheet {
                     let (cfg, prefs) = (s.conn().borrow().cfg.clone(), self.prefs());
@@ -703,6 +844,7 @@ impl App {
                 }
             }
             ID_DRIVERS => driver_manager::show(&self.frame),
+            ID_COMPARE => compare::show(&self.frame),
             ID_PREFERENCES => prefs::show(&self.frame),
             ID_ABOUT => ui::info(
                 &self.frame,
@@ -712,6 +854,26 @@ impl App {
         }
         true
     }
+}
+
+/// Run [`dialect::find_sql`] on the metadata session: (owner, name, kind) rows, or an error
+/// dialog.
+// ponytail: "contains" search capped at 200 rows; an exact-name lookup can fall outside it in
+// very large catalogs. Add an exact query per engine if that bites.
+fn found_objects(c: &ConnRef, pattern: &str, cb: impl FnOnce(Vec<(String, String, &'static str)>) + 'static) {
+    let db = c.borrow().kind;
+    Conn::meta_query(c, &dialect::find_sql(db, pattern), move |r| match r {
+        Ok(r) => cb(r
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                let mut it = row.into_iter().map(Option::unwrap_or_default);
+                let (owner, name, kind) = (it.next()?, it.next()?, it.next()?);
+                Some((owner, name, dialect::kind_const(&kind)?))
+            })
+            .collect()),
+        Err(e) => ui::error(&app().frame, &e),
+    });
 }
 
 /// Status bar activity: an animated bar and elapsed time whenever a connection is connecting,
@@ -780,6 +942,7 @@ fn menus(frame: &Frame) {
     let file = Menu::builder()
         .append_item(ID_NEW_CONN, "New Connection…\tCtrl+Shift+C", "Create a database connection")
         .append_item(ID_IMPORT_CONNS, "&Import Connections…", "Import connections from Oracle SQL Developer or DBeaver")
+        .append_item(ID_NEW_SHEET, "New SQL &Worksheet\tCtrl+N", "Open a SQL worksheet on a connection")
         .append_item(ID_OPEN, "&Open…\tCtrl+O", "Open a SQL file in a worksheet")
         .append_item(ID_SAVE, "&Save\tCtrl+S", "")
         .append_item(ID_SAVEAS, "Save &As…", "")
@@ -800,6 +963,17 @@ fn menus(frame: &Frame) {
         .append_separator()
         .append_item(ID_COMPLETE, "Completion &Insight\tRawCtrl+Space", "Complete keywords, tables and columns")
         .append_item(ID_FORMAT, "F&ormat SQL\tCtrl+F7", "Format the selection, or the whole worksheet")
+        .append_item(ID_SNIPPET, "Insert S&nippet…\tCtrl+Shift+J", "Insert a SQL template at the caret")
+        .append_item(ID_SNIPPET_SAVE, "Save Selection as Snippet…", "Keep the selected SQL as one of your snippets")
+        .append_separator()
+        .append_item(ID_DUP_LINES, "&Duplicate Lines\tCtrl+Shift+D", "")
+        .append_item(ID_LINES_UP, "Move Lines &Up\tAlt+Up", "")
+        .append_item(ID_LINES_DOWN, "Move Lines Do&wn\tAlt+Down", "")
+        .append_item(ID_BRACE, "Go to &Matching Bracket\tCtrl+]", "")
+        .append_separator()
+        .append_item(ID_BOOKMARK, "Toggle &Bookmark\tCtrl+K", "")
+        .append_item(ID_BOOKMARK_NEXT, "Ne&xt Bookmark\tF2", "")
+        .append_item(ID_BOOKMARK_PREV, "Previous Bookmar&k\tShift+F2", "")
         .append_separator()
         .append_item(ID_FIND, "&Find…\tCtrl+F", "")
         .append_item(ID_REPLACE, "R&eplace…\tCtrl+R", "")
@@ -808,6 +982,7 @@ fn menus(frame: &Frame) {
         .build();
     let view = Menu::builder()
         .append_item(ID_TOGGLE_NAV, "&Connections\tCtrl+Shift+L", "Show or hide the Connections navigator")
+        .append_item(ID_FIND_OBJECT, "Find DB &Object…\tCtrl+Shift+O", "Find tables, views, packages… by name in every schema")
         .append_separator()
         .append_radio_item(ID_THEME_LIGHT, "&Light Appearance", "SQL Developer's default look")
         .append_radio_item(ID_THEME_DARK, "&Dark Appearance", "")
@@ -817,6 +992,8 @@ fn menus(frame: &Frame) {
         .append_item(ID_RUN, "Run &Statement\tCtrl+Enter", "")
         .append_item(ID_SCRIPT, "Run S&cript\tF5", "")
         .append_item(ID_EXPLAIN, "&Explain Plan\tF10", "")
+        .append_item(ID_AUTOTRACE, "&Autotrace\tF6", "Run the query and show its plan with actual rows and time")
+        .append_item(ID_RUN_PLSQL, "Run &PL/SQL…\tCtrl+F10", "Open an anonymous block calling the procedure or function under the caret")
         .append_separator()
         .append_item(ID_COMMIT, "C&ommit\tF11", "")
         .append_item(ID_ROLLBACK, "&Rollback\tF12", "")
@@ -830,6 +1007,11 @@ fn menus(frame: &Frame) {
         .append_item(ID_UNSHARED, "&Unshared SQL Worksheet\tCtrl+Shift+N", "")
         .append_separator()
         .append_item(ID_SESSIONS, "S&essions…", "Sessions and locks of a connection: who blocks whom, kill session")
+        .append_item(ID_TOPSQL, "&Top SQL…", "Heaviest statements on the server: elapsed, CPU, reads, executions, cost")
+        .append_item(ID_DP_EXPORT, "Data Pump &Export…", "Export schemas, tables or the whole database with Oracle Data Pump (Oracle only)")
+        .append_item(ID_DP_IMPORT, "Data Pump &Import…", "Import a dump file, uploading it first if it is on this computer (Oracle only)")
+        .append_item(ID_DP_JOBS, "Data Pump &Jobs && Files…", "Running Data Pump jobs and the dump and log files on the server (Oracle only)")
+        .append_item(ID_COMPARE, "Schema &Compare…", "Compare two schemas and open a script that brings the target in line")
         .append_item(ID_DRIVERS, "&Drivers…", "Download or locate native client drivers")
         .append_item(ID_PREFERENCES, "&Preferences…", "")
         .build();
@@ -883,6 +1065,8 @@ const SHORTCUTS: &str = "Worksheet
   Run Statement            Ctrl/Cmd+Enter
   Run Script               F5
   Explain Plan             F10
+  Autotrace                F6
+  Run PL/SQL               Ctrl/Cmd+F10
   Commit / Rollback        F11 / F12
   Cancel                   Ctrl/Cmd+.
   SQL History              F8
@@ -892,6 +1076,13 @@ const SHORTCUTS: &str = "Worksheet
 Editor
   Completion Insight       Ctrl+Space (also after typing alias.)
   Format SQL               Ctrl/Cmd+F7
+  Insert Snippet           Ctrl/Cmd+Shift+J
+  Duplicate Lines          Ctrl/Cmd+Shift+D
+  Move Lines Up / Down     Alt+Up / Alt+Down
+  Matching Bracket         Ctrl/Cmd+]
+  Bookmark: toggle         Ctrl/Cmd+K
+  Bookmark: next / prev    F2 / Shift+F2
+  Go to Definition         Ctrl+Click (Cmd+Click on macOS)
   Find / Replace           Ctrl/Cmd+F / Ctrl/Cmd+R
   Find Next / Previous     F3 / Shift+F3
 
@@ -900,7 +1091,8 @@ Files and tabs
   Open / Save / Save All   Ctrl/Cmd+O / S / Shift+S
   Close Tab                Ctrl/Cmd+W
   Recover Worksheet        Ctrl/Cmd+Shift+T
-  SQL Worksheet            Alt+F10
+  New SQL Worksheet        Ctrl/Cmd+N (also Alt+F10)
+  Find DB Object           Ctrl/Cmd+Shift+O
 
 Grid
   Copy / Copy with Headers  right-click a cell
@@ -940,14 +1132,19 @@ fn start_page(parent: &AuiNotebook, recover: &[autosave::Slot]) -> Panel {
     let link = |icon: &str, label: &str, on: Box<dyn Fn()>| {
         let row = BoxSizer::builder(Orientation::Horizontal).build();
         let ic = icons::tool(&p, icon, label);
-        let l = HyperlinkCtrl::builder(&p).with_label(label).with_url("").build();
-        l.set_normal_colour(theme::c(pal.link));
-        l.set_visited_colour(theme::c(pal.link));
-        l.set_hover_colour(theme::c(pal.accent));
+        // Not a HyperlinkCtrl: wxDragon cannot mark its click handled, so wx also opened the
+        // label as a URL in the browser.
+        let l = StaticText::builder(&p).with_label(label).build();
+        l.set_foreground_color(theme::c(pal.link));
+        if let Some(mut f) = l.get_font() {
+            f.set_underlined(true);
+            l.set_font(&f);
+        }
+        l.set_cursor(wxdragon::cursor::Cursor::from_stock(wxdragon::cursor::StockCursor::Hand).as_ref());
         let on = std::rc::Rc::new(on);
         let o2 = on.clone();
         ic.on_click(move |_| o2());
-        l.on_clicked(move |_| on());
+        l.on_mouse_left_up(move |_| on());
         row.add(&ic, 0, SizerFlag::AlignCenterVertical, 0);
         row.add(&l, 0, SizerFlag::AlignCenterVertical | SizerFlag::Left, 6);
         s.add_sizer(&row, 0, SizerFlag::Left, 40);
@@ -970,7 +1167,7 @@ fn start_page(parent: &AuiNotebook, recover: &[autosave::Slot]) -> Panel {
         section("Recover Unsaved Worksheets");
         for slot in recover.iter().take(8).cloned() {
             let label = autosave::label(&slot);
-            let cell: std::rc::Rc<std::cell::Cell<Option<(HyperlinkCtrl, BitmapButton)>>> = Default::default();
+            let cell: std::rc::Rc<std::cell::Cell<Option<(StaticText, BitmapButton)>>> = Default::default();
             let c2 = cell.clone();
             let (_, l, ic) = link("worksheet", &label, Box::new(move || {
                 if let Some((l, ic)) = c2.take() {

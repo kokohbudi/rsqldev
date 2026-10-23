@@ -32,6 +32,8 @@ pub struct Worksheet {
     task: StaticText,
     elapsed: StaticText,
     defines: RefCell<Defines>,
+    /// Last value typed per bind name (upper case), offered again next run.
+    binds: RefCell<std::collections::HashMap<String, String>>,
     pub path: RefCell<Option<PathBuf>>,
     last: RefCell<Option<String>>,
     spool: RefCell<Option<PathBuf>>,
@@ -90,6 +92,7 @@ impl Worksheet {
         let b_script = mk("script", "Run Script (F5)");
         sep();
         let b_explain = mk("explain", "Explain Plan (F10)");
+        let b_autotrace = mk("autotrace", "Autotrace (F6)");
         sep();
         let b_commit = mk("commit", "Commit (F11)");
         let b_rollback = mk("rollback", "Rollback (F12)");
@@ -116,6 +119,7 @@ impl Worksheet {
         let bottom = AuiNotebook::builder(&split).with_style(AuiNotebookStyle::from_bits_retain(0x1 | 0x20 | 0x100)).build();
         let mono = |p: &Panel| {
             let t = TextCtrl::builder(p).with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::DontWrap).build();
+            crate::copy::text(t);
             if let Some(f) = Font::new_with_details(prefs.editor_font_size, FontFamily::Teletype as i32, 0, 400, false, &prefs.editor_font) {
                 t.set_font(&f);
             }
@@ -171,6 +175,7 @@ impl Worksheet {
             task,
             elapsed,
             defines: RefCell::default(),
+            binds: RefCell::default(),
             path: RefCell::default(),
             last: RefCell::default(),
             spool: RefCell::default(),
@@ -186,6 +191,7 @@ impl Worksheet {
             (b_run, Worksheet::run_statement),
             (b_script, Worksheet::run_script),
             (b_explain, Worksheet::explain_plan),
+            (b_autotrace, Worksheet::autotrace),
             (b_commit, Worksheet::commit),
             (b_rollback, Worksheet::rollback),
             (b_unshared, |_| {
@@ -245,6 +251,18 @@ impl Worksheet {
                 } else if let Some(c) = char::from_u32(k as u32) {
                     crate::complete::typed(w.editor, &w.conn(), c);
                 }
+            }
+        });
+        // Ctrl+Click (Cmd+Click on macOS): open the object under the caret.
+        let w = Rc::downgrade(&ws);
+        ws.editor.on_mouse_left_up(move |_| {
+            let Some(w) = w.upgrade() else { return };
+            if !wxdragon::utils::get_key_state(wxdragon::keycode::WXK_COMMAND) {
+                return;
+            }
+            let ident = ident_at(&w.editor.get_text(), w.editor.get_current_pos() as usize);
+            if !ident.is_empty() {
+                crate::app().goto_object(w.conn(), &ident);
             }
         });
         let w3 = Rc::downgrade(&ws);
@@ -372,9 +390,24 @@ impl Worksheet {
         if sel.trim().is_empty() { (self.editor.get_text(), 0) } else { (sel, self.editor.get_selection_start() as usize) }
     }
 
+    /// `&name` substitution, then `:name` binds (asked with the last value typed for that name).
     fn substitute(&self, sql: &str) -> Option<String> {
         let p = self.panel;
-        self.defines.borrow_mut().substitute(sql, &mut |name| crate::ui::ask(&p, &format!("Enter value for {name}:"), "Enter Substitution Variable", ""))
+        let sql = self.defines.borrow_mut().substitute(sql, &mut |name| crate::ui::ask(&p, &format!("Enter value for {name}:"), "Enter Substitution Variable", ""))?;
+        let mut last = self.binds.borrow_mut();
+        script::bind_literals(&sql, &mut |name| {
+            let key = name.to_uppercase();
+            let v = crate::ui::ask(&p, &format!("Value for :{name} (empty = NULL):"), "Enter Binds", last.get(&key).map_or("", String::as_str))?;
+            last.insert(key, v.clone());
+            Some(v)
+        })
+    }
+
+    /// DELETE / UPDATE without WHERE: ask before it touches every row.
+    fn allow(&self, sql: &str) -> bool {
+        let Some(verb) = script::unbounded_dml(sql) else { return true };
+        let head: String = sql.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
+        crate::ui::confirm(&self.panel, &format!("{verb} without WHERE changes every row of the table:\n\n{head}\n\nRun it anyway?"))
     }
 
     /// Tint editor lines named in a compile-error report (`LINE/COL  ERROR` rows, numbered from
@@ -408,6 +441,9 @@ impl Worksheet {
             return;
         }
         let Some(sql) = self.substitute(&item.text) else { return };
+        if !self.allow(&sql) {
+            return;
+        }
         crate::app().add_history(&sql);
         let line = self.line_of(item.start);
         let sql = if item.kind == script::Kind::Block { format!("\u{1}{sql}") } else { sql };
@@ -559,6 +595,11 @@ impl Worksheet {
             self.running.set(false);
             return;
         };
+        if !self.allow(&sql) {
+            self.out(&format!("\nScript stopped at line {}: not confirmed.\n", self.line_of(item.start)));
+            self.running.set(false);
+            return next(items);
+        }
         self.script_sql(sql, item.start, items, i, Box::new(next));
     }
 
@@ -586,20 +627,62 @@ impl Worksheet {
         });
     }
 
-    pub fn explain_plan(&self) {
+    /// The selection, or the statement under the caret, substituted.
+    fn current_sql(&self) -> Option<String> {
         let sel = self.editor.get_selected_text();
         let sql = if sel.trim().is_empty() {
             let text = self.editor.get_text();
             let items = script::split(&text, self.kind());
-            match script::statement_at(&items, self.editor.get_current_pos() as usize) {
-                Some(i) => i.text.clone(),
-                None => return,
-            }
+            script::statement_at(&items, self.editor.get_current_pos() as usize)?.text.clone()
         } else {
             sel
         };
-        let Some(sql) = self.substitute(&sql) else { return };
+        self.substitute(&sql)
+    }
+
+    pub fn explain_plan(&self) {
+        let Some(sql) = self.current_sql() else { return };
         let ex = dialect::explain(self.kind(), &sql);
+        self.bottom.set_selection(P_EXPLAIN);
+        self.explain.reset();
+        self.set_busy(true);
+        self.explain_step(ex.stmts, ex.show, 0);
+    }
+
+    /// Run ▸ Run PL/SQL (Oracle): a worksheet with an anonymous block calling the procedure or
+    /// function under the caret, its arguments declared to fill in.
+    pub fn run_plsql(&self) {
+        if self.kind() != Kind::Oracle {
+            return crate::ui::info(&self.panel, "Run PL/SQL is available on Oracle connections.");
+        }
+        let sel = self.editor.get_selected_text();
+        let guess = if sel.trim().is_empty() { ident_at(&self.editor.get_text(), self.editor.get_current_pos() as usize) } else { sel.trim().to_string() };
+        let Some(name) = crate::ui::ask(&self.panel, "Procedure or function ([owner.][package.]name):", "Run PL/SQL", &guess).filter(|n| !n.trim().is_empty()) else { return };
+        let c = self.conn();
+        let c2 = c.clone();
+        Conn::meta_query(&c, &dialect::plsql_args_sql(name.trim()), move |r| {
+            let app = crate::app();
+            match r.map(|r| dialect::plsql_block(&r.rows)) {
+                Ok(Some(block)) => {
+                    app.open_worksheet(c2);
+                    if let Some(ws) = app.current_sheet() {
+                        ws.editor.set_text(&block);
+                    }
+                }
+                Ok(None) => crate::ui::info(&app.frame, &format!("No procedure or function {} visible to this user.", name.trim())),
+                Err(e) => crate::ui::error(&app.frame, &e),
+            }
+        });
+    }
+
+    /// Run the query and show the plan with actual rows / time (Oracle ALLSTATS LAST,
+    /// EXPLAIN ANALYZE elsewhere) in the Explain Plan pane.
+    pub fn autotrace(&self) {
+        let Some(sql) = self.current_sql() else { return };
+        let tag = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        let Some(ex) = dialect::autotrace(self.kind(), &sql, tag) else {
+            return crate::ui::info(&self.panel, "Autotrace runs the statement, so it is offered for queries only (SELECT / WITH without DML or FOR UPDATE), on Oracle, PostgreSQL, MySQL and DuckDB.");
+        };
         self.bottom.set_selection(P_EXPLAIN);
         self.explain.reset();
         self.set_busy(true);
@@ -717,6 +800,16 @@ impl Worksheet {
             Err(e) => crate::ui::error(&self.panel, &format!("Save failed: {e}")),
         }
     }
+}
+
+/// `[owner.]name` around byte offset `pos` (letters, digits, `_ $ #`, dots, double quotes).
+fn ident_at(text: &str, pos: usize) -> String {
+    let ok = |c: char| c.is_alphanumeric() || "_$#.\"".contains(c);
+    let pos = pos.min(text.len());
+    let Some((a, b)) = text.get(..pos).zip(text.get(pos..)) else { return String::new() };
+    let start = a.char_indices().rev().take_while(|(_, c)| ok(*c)).last().map_or(pos, |(i, _)| i);
+    let end = pos + b.char_indices().find(|(_, c)| !ok(*c)).map_or(b.len(), |(i, _)| i);
+    text[start..end].trim_matches('.').to_string()
 }
 
 fn save_text(parent: &Panel, text: &str) {

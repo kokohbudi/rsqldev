@@ -78,6 +78,99 @@ pub fn sessions_sql(db: Db) -> Option<Vec<&'static str>> {
     })
 }
 
+/// Top SQL sort orders: (key, label). Engines without a metric fall back to total time.
+pub const TOP_ORDERS: &[(&str, &str)] = &[
+    ("elapsed", "Elapsed time (total)"),
+    ("avg", "Elapsed time per execution"),
+    ("cpu", "CPU time"),
+    ("gets", "Logical reads / buffer gets"),
+    ("disk", "Disk reads"),
+    ("execs", "Executions"),
+];
+
+/// Marker kept out of the Top SQL list (the monitor's own statements).
+const TOP_TAG: &str = "rsqldev-topsql";
+
+/// Top SQL monitor: the heaviest statements in the server's statement cache, ordered by `order`
+/// (a [`TOP_ORDERS`] key), optionally only those whose text contains `filter`. Tried in order
+/// (later ones for older versions). Column 0 = statement id; Oracle column 1 = child number.
+/// Oracle reads V$SQL (no Diagnostics Pack needed, unlike AWR / ASH). None = no statement
+/// statistics (file databases).
+pub fn top_sql(db: Db, order: &str, filter: &str) -> Option<Vec<String>> {
+    let mut f = lit(&filter.trim().to_uppercase());
+    if matches!(db, Db::Mysql | Db::Clickhouse) {
+        f = f.replace('\\', "\\\\");
+    }
+    let like = |col: &str| if f.is_empty() { String::new() } else { format!(" AND UPPER({col}) LIKE '%{f}%'") };
+    let pick = |m: &[(&str, &str)]| m.iter().find(|(k, _)| *k == order).or(m.first()).map_or("1", |x| x.1).to_string();
+    Some(match db {
+        Db::Oracle => {
+            let by = pick(&[("elapsed", "elapsed_time"), ("avg", "elapsed_time / NULLIF(executions, 0)"), ("cpu", "cpu_time"), ("gets", "buffer_gets"), ("disk", "disk_reads"), ("execs", "executions")]);
+            vec![format!(
+                "SELECT /* {TOP_TAG} */ * FROM (SELECT sql_id, child_number AS child, parsing_schema_name AS schema, executions AS execs, ROUND(elapsed_time / 1e6, 3) AS elapsed_s, ROUND(elapsed_time / NULLIF(executions, 0) / 1e3, 2) AS avg_ms, ROUND(cpu_time / 1e6, 3) AS cpu_s, ROUND(user_io_wait_time / 1e6, 3) AS io_wait_s, buffer_gets, disk_reads, rows_processed AS rows_out, optimizer_cost AS cost, plan_hash_value AS plan_hash, module, TO_CHAR(last_active_time, 'YYYY-MM-DD HH24:MI:SS') AS last_active, sql_text FROM v$sql WHERE executions > 0 AND parsing_schema_name <> 'SYS' AND sql_text NOT LIKE '%{TOP_TAG}%'{} ORDER BY {by} DESC NULLS LAST) WHERE ROWNUM <= 100",
+                like("sql_text")
+            )]
+        }
+        Db::Postgres => {
+            // PostgreSQL 13 renamed total_time / mean_time.
+            let q = |total: &str, mean: &str| {
+                let by = pick(&[("elapsed", total), ("avg", mean), ("cpu", total), ("gets", "shared_blks_hit + shared_blks_read"), ("disk", "shared_blks_read"), ("execs", "calls")]);
+                format!(
+                    "SELECT /* {TOP_TAG} */ s.queryid::text AS query_id, r.rolname AS username, s.calls AS execs, round(({total} / 1000)::numeric, 3) AS elapsed_s, round(({mean})::numeric, 2) AS avg_ms, s.rows AS rows_out, s.shared_blks_hit + s.shared_blks_read AS buffer_gets, s.shared_blks_read AS disk_reads, s.temp_blks_written AS temp_blocks, s.query AS sql_text FROM pg_stat_statements s LEFT JOIN pg_roles r ON r.oid = s.userid WHERE s.query NOT LIKE '%{TOP_TAG}%'{} ORDER BY {by} DESC NULLS LAST LIMIT 100",
+                    like("s.query")
+                )
+            };
+            vec![q("s.total_exec_time", "s.mean_exec_time"), q("s.total_time", "s.mean_time")]
+        }
+        Db::Mysql => {
+            // SUM_CPU_TIME arrived in MySQL 8.0.28; timers are picoseconds.
+            let q = |cpu: bool| {
+                let by = pick(&[("elapsed", "SUM_TIMER_WAIT"), ("avg", "AVG_TIMER_WAIT"), ("cpu", if cpu { "SUM_CPU_TIME" } else { "SUM_TIMER_WAIT" }), ("gets", "SUM_ROWS_EXAMINED"), ("disk", "SUM_ROWS_EXAMINED"), ("execs", "COUNT_STAR")]);
+                format!(
+                    "SELECT /* {TOP_TAG} */ DIGEST AS digest, SCHEMA_NAME AS db, COUNT_STAR AS execs, ROUND(SUM_TIMER_WAIT / 1e12, 3) AS elapsed_s, ROUND(AVG_TIMER_WAIT / 1e9, 2) AS avg_ms, {} SUM_ROWS_EXAMINED AS rows_examined, SUM_ROWS_SENT AS rows_out, SUM_NO_INDEX_USED AS no_index, LAST_SEEN AS last_active, DIGEST_TEXT AS sql_text FROM performance_schema.events_statements_summary_by_digest WHERE DIGEST_TEXT IS NOT NULL AND DIGEST_TEXT NOT LIKE '%{TOP_TAG}%'{} ORDER BY {by} DESC LIMIT 100",
+                    if cpu { "ROUND(SUM_CPU_TIME / 1e12, 3) AS cpu_s," } else { "" },
+                    like("DIGEST_TEXT")
+                )
+            };
+            vec![q(true), q(false)]
+        }
+        Db::Mssql => {
+            let by = pick(&[("elapsed", "qs.total_elapsed_time"), ("avg", "qs.total_elapsed_time / qs.execution_count"), ("cpu", "qs.total_worker_time"), ("gets", "qs.total_logical_reads"), ("disk", "qs.total_physical_reads"), ("execs", "qs.execution_count")]);
+            let text = "SUBSTRING(t.text, qs.statement_start_offset / 2 + 1, (CASE qs.statement_end_offset WHEN -1 THEN DATALENGTH(t.text) ELSE qs.statement_end_offset END - qs.statement_start_offset) / 2 + 1)";
+            vec![format!(
+                "SELECT /* {TOP_TAG} */ TOP 100 CONVERT(varchar(64), qs.query_hash, 1) AS query_hash, DB_NAME(t.dbid) AS db, qs.execution_count AS execs, CAST(qs.total_elapsed_time / 1e6 AS decimal(18, 3)) AS elapsed_s, CAST(qs.total_elapsed_time / qs.execution_count / 1e3 AS decimal(18, 2)) AS avg_ms, CAST(qs.total_worker_time / 1e6 AS decimal(18, 3)) AS cpu_s, qs.total_logical_reads AS buffer_gets, qs.total_physical_reads AS disk_reads, qs.total_rows AS rows_out, qs.last_execution_time AS last_active, {text} AS sql_text FROM sys.dm_exec_query_stats qs CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) t WHERE t.text NOT LIKE '%{TOP_TAG}%'{} ORDER BY {by} DESC",
+                like("t.text")
+            )]
+        }
+        Db::Clickhouse => {
+            let q = |cpu: bool| {
+                let cpu_col = if cpu { "round(sum(ProfileEvents['OSCPUVirtualTimeMicroseconds']) / 1e6, 3) AS cpu_s, " } else { "" };
+                let by = pick(&[("elapsed", "elapsed_s"), ("avg", "avg_ms"), ("cpu", if cpu { "cpu_s" } else { "elapsed_s" }), ("gets", "rows_read"), ("disk", "bytes_read"), ("execs", "execs")]);
+                format!(
+                    "SELECT /* {TOP_TAG} */ toString(normalized_query_hash) AS query_hash, any(user) AS username, count() AS execs, round(sum(query_duration_ms) / 1000, 3) AS elapsed_s, round(avg(query_duration_ms), 2) AS avg_ms, {cpu_col}sum(read_rows) AS rows_read, formatReadableSize(sum(read_bytes)) AS read_size, sum(read_bytes) AS bytes_read, sum(result_rows) AS rows_out, max(event_time) AS last_active, any(query) AS sql_text FROM system.query_log WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 1 DAY AND query NOT LIKE '%{TOP_TAG}%'{} GROUP BY normalized_query_hash ORDER BY {by} DESC LIMIT 100",
+                    like("query")
+                )
+            };
+            vec![q(true), q(false)]
+        }
+        Db::Sqlite | Db::Duckdb => return None,
+    })
+}
+
+/// Oracle: full text and plan of a cursor from [`top_sql`] (id = SQL_ID, child number).
+/// Ids must look like a SQL_ID / number, so a grid value cannot inject SQL.
+pub fn top_sql_text(sql_id: &str) -> Option<String> {
+    let id = sql_id.trim();
+    (id.len() <= 13 && !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric())).then(|| format!("SELECT sql_fulltext FROM v$sql WHERE sql_id = '{id}' AND ROWNUM = 1"))
+}
+
+pub fn top_sql_plan(sql_id: &str, child: &str) -> Option<String> {
+    let id = sql_id.trim();
+    let child = child.trim().parse::<u32>().ok()?;
+    top_sql_text(id)?;
+    Some(format!("SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('{id}', {child}, 'TYPICAL +COST +PEEKED_BINDS'))"))
+}
+
 /// Statement that ends the session in `row` (as returned by [`sessions_sql`]). Ids must be
 /// plain numbers (ClickHouse: a UUID-like query id), so a grid value cannot inject SQL.
 pub fn kill_sql(db: Db, row: &[Option<String>]) -> Option<String> {
@@ -126,7 +219,30 @@ pub fn qualified(db: Db, owner: &str, name: &str) -> String {
 
 pub fn fill(db: Db, tpl: &str, owner: &str, name: &str) -> String {
     let q = qualified(db, owner, name);
-    tpl.replace("{lq}", &lit(&q)).replace("{q}", &q).replace("{o}", &lit(owner)).replace("{n}", &lit(name))
+    // MySQL / ClickHouse strings also take backslash escapes: a name ending in `\` would
+    // otherwise escape the closing quote.
+    let l = |s: &str| if matches!(db, Db::Mysql | Db::Clickhouse) { lit(&s.replace('\\', "\\\\")) } else { lit(s) };
+    let subs = [("{lq}", l(&q)), ("{q}", q.clone()), ("{o}", l(owner)), ("{n}", l(name))];
+    // One pass over the template: placeholder-like text inside a substituted name is never
+    // scanned again (chained replace() would turn a name's "{q}" into an unescaped name).
+    let mut out = String::with_capacity(tpl.len() + 64);
+    let mut rest = tpl;
+    while let Some(i) = rest.find('{') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        match subs.iter().find(|(k, _)| rest.starts_with(k)) {
+            Some((k, v)) => {
+                out.push_str(v);
+                rest = &rest[k.len()..];
+            }
+            None => {
+                out.push('{');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Folders under a connection / schema node, in SQL Developer order.
@@ -246,6 +362,42 @@ pub fn list_sql(db: Db, kind: &str, owner: &str) -> Option<String> {
         _ => return None,
     };
     Some(fill(db, &tpl, owner, ""))
+}
+
+/// Find DB Object: objects in every schema whose name contains `pattern` (case-insensitive).
+/// Columns: owner, name, kind (one of the folder kinds). At most 200 rows.
+pub fn find_sql(db: Db, pattern: &str) -> String {
+    let mut p = lit(&pattern.trim().to_uppercase().replace('*', "%"));
+    // MySQL / ClickHouse strings take backslash escapes: a typed backslash must stay literal.
+    if matches!(db, Db::Mysql | Db::Clickhouse) {
+        p = p.replace('\\', "\\\\");
+    }
+    match db {
+        Db::Oracle => format!(
+            "SELECT * FROM (SELECT owner, object_name, object_type FROM all_objects WHERE UPPER(object_name) LIKE '%{p}%' AND object_type IN ('TABLE', 'VIEW', 'MATERIALIZED VIEW', 'INDEX', 'PACKAGE', 'PROCEDURE', 'FUNCTION', 'TRIGGER', 'TYPE', 'SEQUENCE', 'SYNONYM') ORDER BY CASE WHEN owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') THEN 0 ELSE 1 END, object_name, owner) WHERE ROWNUM <= 200"
+        ),
+        Db::Postgres => format!(
+            "SELECT n.nspname, c.relname, CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'i' THEN 'INDEX' WHEN 'I' THEN 'INDEX' WHEN 'S' THEN 'SEQUENCE' ELSE 'TABLE' END FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE UPPER(c.relname) LIKE '%{p}%' AND c.relkind IN ('r', 'p', 'f', 'v', 'm', 'i', 'I', 'S') AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema' \
+             UNION ALL SELECT n.nspname, quote_ident(p.proname) || '(' || pg_get_function_identity_arguments(p.oid) || ')', CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE UPPER(p.proname) LIKE '%{p}%' AND p.prokind IN ('f', 'p') AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema' ORDER BY 2, 1 LIMIT 200"
+        ),
+        Db::Mysql => format!(
+            "SELECT table_schema, table_name, CASE table_type WHEN 'VIEW' THEN 'VIEW' ELSE 'TABLE' END FROM information_schema.tables WHERE UPPER(table_name) LIKE '%{p}%' \
+             UNION ALL SELECT routine_schema, routine_name, routine_type FROM information_schema.routines WHERE UPPER(routine_name) LIKE '%{p}%' ORDER BY 2, 1 LIMIT 200"
+        ),
+        Db::Mssql => format!(
+            "SELECT TOP 200 SCHEMA_NAME(schema_id), name, CASE WHEN type = 'U' THEN 'TABLE' WHEN type = 'V' THEN 'VIEW' WHEN type = 'P' THEN 'PROCEDURE' WHEN type IN ('FN', 'IF', 'TF') THEN 'FUNCTION' WHEN type = 'TR' THEN 'TRIGGER' WHEN type = 'SN' THEN 'SYNONYM' ELSE 'SEQUENCE' END FROM sys.objects WHERE UPPER(name) LIKE '%{p}%' AND type IN ('U', 'V', 'P', 'FN', 'IF', 'TF', 'TR', 'SN', 'SO') ORDER BY name"
+        ),
+        Db::Sqlite => format!("SELECT 'main', name, UPPER(type) FROM sqlite_master WHERE UPPER(name) LIKE '%{p}%' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name LIMIT 200"),
+        Db::Duckdb => format!(
+            "SELECT schema_name, table_name, 'TABLE' FROM duckdb_tables() WHERE UPPER(table_name) LIKE '%{p}%' UNION ALL SELECT schema_name, view_name, 'VIEW' FROM duckdb_views() WHERE NOT internal AND UPPER(view_name) LIKE '%{p}%' ORDER BY 2 LIMIT 200"
+        ),
+        Db::Clickhouse => format!("SELECT database, name, if(engine LIKE '%View', 'VIEW', 'TABLE') FROM system.tables WHERE upper(name) LIKE '%{p}%' AND database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema') ORDER BY name LIMIT 200"),
+    }
+}
+
+/// Folder kind constant for a kind name from [`find_sql`].
+pub fn kind_const(kind: &str) -> Option<&'static str> {
+    [TABLE, VIEW, MVIEW, INDEX, PACKAGE, PROCEDURE, FUNCTION, TRIGGER, TYPE, SEQUENCE, SYNONYM, DBLINK].into_iter().find(|k| k.eq_ignore_ascii_case(kind.trim()))
 }
 
 // ---------- Oracle ----------
@@ -565,6 +717,154 @@ pub fn explain(db: Db, sql: &str) -> Explain {
     }
 }
 
+/// Autotrace: run the query and show its plan with actual rows and timings. Queries only (the
+/// statement really runs). `tag` makes the Oracle cursor findable in v$sql even when DBMS
+/// output or another call ran on the session in between. None = engine not supported.
+pub fn autotrace(db: Db, sql: &str, tag: u64) -> Option<Explain> {
+    let sql = sql.trim().trim_end_matches(';');
+    // Read-only: starts with SELECT / WITH and no top-level DML (PostgreSQL `WITH ... DELETE`,
+    // `INSERT ... SELECT`). `FOR UPDATE` is refused too, it would lock rows.
+    let words = top_words(sql);
+    if !words.first().is_some_and(|(_, w)| w == "SELECT" || w == "WITH") || words.iter().any(|(_, w)| matches!(w.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")) {
+        return None;
+    }
+    let one = |p: &str| Some(Explain { stmts: vec![format!("{p} {sql}")], show: 0 });
+    match db {
+        Db::Oracle => {
+            let at = words.iter().find(|(_, w)| w == "SELECT")?.0;
+            let marker = format!("rsqldev-autotrace-{tag}");
+            let traced = format!("{} /*+ gather_plan_statistics */ /* {marker} */{}", &sql[..at + 6], &sql[at + 6..]);
+            let show = format!(
+                "SELECT t.plan_table_output FROM (SELECT sql_id, child_number FROM v$sql WHERE sql_text LIKE '%{marker}%' AND sql_text NOT LIKE '%v$sql%' ORDER BY last_active_time DESC FETCH FIRST 1 ROW ONLY) s, TABLE(DBMS_XPLAN.DISPLAY_CURSOR(s.sql_id, s.child_number, 'ALLSTATS LAST')) t"
+            );
+            Some(Explain { stmts: vec![traced, show], show: 1 })
+        }
+        Db::Postgres => one("EXPLAIN (ANALYZE, BUFFERS)"),
+        Db::Mysql | Db::Duckdb => one("EXPLAIN ANALYZE"),
+        _ => None,
+    }
+}
+
+/// Words outside parentheses, strings and comments, upper case, with their byte offsets.
+fn top_words(sql: &str) -> Vec<(usize, String)> {
+    let b = sql.as_bytes();
+    let (mut i, mut depth, mut out) = (0, 0i32, vec![]);
+    while i < b.len() {
+        let rest = &sql[i..];
+        if rest.starts_with("--") {
+            i = rest.find('\n').map_or(b.len(), |n| i + n);
+        } else if rest.starts_with("/*") {
+            i = rest[2..].find("*/").map_or(b.len(), |n| i + 2 + n + 2);
+        } else if b[i] == b'\'' || b[i] == b'"' {
+            let q = b[i];
+            i += 1;
+            while i < b.len() && !(b[i] == q && b.get(i + 1) != Some(&q)) {
+                i += if b[i] == q { 2 } else { 1 };
+            }
+            i += 1;
+        } else if b[i] == b'(' {
+            depth += 1;
+            i += 1;
+        } else if b[i] == b')' {
+            depth -= 1;
+            i += 1;
+        } else if b[i].is_ascii_alphabetic() {
+            let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '#')).map_or(b.len(), |n| i + n);
+            if depth == 0 {
+                out.push((i, sql[i..end].to_ascii_uppercase()));
+            }
+            i = end;
+        } else {
+            i += 1;
+            while i < b.len() && !sql.is_char_boundary(i) {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Query for an object's DDL: (sql, column), column `usize::MAX` = concatenate column 0 of
+/// every row (source text). Oracle uses DBMS_METADATA for every kind.
+pub fn ddl_sql(db: Db, kind: &str, owner: &str, name: &str) -> Option<(String, usize)> {
+    let view = if db == Db::Oracle { ora_ddl(kind) } else { tabs(db, kind).into_iter().map(|t| t.view).find(|v| matches!(v, View::Ddl(..) | View::Code(_)))? };
+    match view {
+        View::Ddl(s, col) => Some((fill(db, &s, owner, name), col)),
+        View::Code(s) => Some((fill(db, &s, owner, name), usize::MAX)),
+        _ => None,
+    }
+}
+
+/// Query for an object's source text to compare (cheaper than DDL where a Code view exists).
+pub fn code_sql(db: Db, kind: &str, owner: &str, name: &str) -> Option<(String, usize)> {
+    match tabs(db, kind).into_iter().map(|t| t.view).find(|v| matches!(v, View::Code(_))) {
+        Some(View::Code(s)) => Some((fill(db, &s, owner, name), usize::MAX)),
+        _ => ddl_sql(db, kind, owner, name),
+    }
+}
+
+/// Run PL/SQL (Oracle): arguments of `[owner.][package.]name`. Columns: owner, package_name,
+/// object_name, argument_name, position, data_type, in_out, overload; first overload first.
+pub fn plsql_args_sql(ident: &str) -> String {
+    let p: Vec<String> = ident.split('.').map(|s| lit(&fold(Db::Oracle, s.trim().trim_matches('"')))).collect();
+    let cur = "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')";
+    let cond = match p.as_slice() {
+        [n] => format!("object_name = '{n}' AND package_name IS NULL AND owner = {cur}"),
+        [a, n] => format!("object_name = '{n}' AND ((owner = '{a}' AND package_name IS NULL) OR (package_name = '{a}' AND owner = {cur}))"),
+        [o, k, n, ..] => format!("object_name = '{n}' AND owner = '{o}' AND package_name = '{k}'"),
+        [] => "1 = 0".into(),
+    };
+    format!("SELECT owner, package_name, object_name, argument_name, position, data_type, in_out, overload FROM all_arguments WHERE data_level = 0 AND {cond} ORDER BY overload NULLS FIRST, position")
+}
+
+/// Anonymous block calling the procedure / function described by [`plsql_args_sql`] rows:
+/// one variable per argument (IN values to fill in), OUT values and the return printed.
+pub fn plsql_block(rows: &[Vec<Option<String>>]) -> Option<String> {
+    let get = |r: &Vec<Option<String>>, i: usize| r.get(i).cloned().flatten().unwrap_or_default();
+    let first = rows.first()?;
+    let (owner, pkg, name, ov) = (get(first, 0), get(first, 1), get(first, 2), get(first, 7));
+    let rows: Vec<_> = rows.iter().filter(|r| (get(r, 0), get(r, 1), get(r, 7)) == (owner.clone(), pkg.clone(), ov.clone())).collect();
+    let ty = |dt: &str| match dt {
+        "VARCHAR2" | "NVARCHAR2" | "CHAR" | "NCHAR" | "RAW" => format!("{dt}(32767)"),
+        "REF CURSOR" => "SYS_REFCURSOR".into(),
+        "PL/SQL BOOLEAN" => "BOOLEAN".into(),
+        "NUMBER" | "DATE" | "CLOB" | "NCLOB" | "BLOB" | "BOOLEAN" | "BINARY_INTEGER" | "PLS_INTEGER" | "INTEGER" | "FLOAT" | "BINARY_FLOAT" | "BINARY_DOUBLE" | "ROWID" => dt.into(),
+        t if t.starts_with("TIMESTAMP") || t.starts_with("INTERVAL") => t.into(),
+        t => format!("{t} /* adjust type */"),
+    };
+    let printable = |dt: &str| !matches!(dt, "REF CURSOR" | "PL/SQL BOOLEAN" | "BOOLEAN" | "BLOB" | "PL/SQL RECORD" | "PL/SQL TABLE" | "TABLE" | "OBJECT" | "VARRAY");
+    let target = [owner.as_str(), pkg.as_str(), name.as_str()].iter().filter(|s| !s.is_empty()).map(|s| quote(Db::Oracle, s)).collect::<Vec<_>>().join(".");
+    let mut decl = String::new();
+    let mut prints = String::new();
+    let mut args = vec![];
+    let mut ret = None;
+    for r in &rows {
+        let (arg, pos, dt, io) = (get(r, 3), get(r, 4), get(r, 5), get(r, 6));
+        if arg.is_empty() {
+            // Function return (position 0); a procedure without arguments has one empty row.
+            if pos == "0" && !dt.is_empty() {
+                decl += &format!("  v_return {};\n", ty(&dt));
+                if printable(&dt) {
+                    prints += "  DBMS_OUTPUT.PUT_LINE('v_return = ' || v_return);\n";
+                }
+                ret = Some(());
+            }
+            continue;
+        }
+        let v = quote(Db::Oracle, &arg);
+        let init = if io == "OUT" { String::new() } else { " := NULL".into() };
+        decl += &format!("  {v} {}{init};  -- {io}\n", ty(&dt));
+        if io != "IN" && printable(&dt) {
+            prints += &format!("  DBMS_OUTPUT.PUT_LINE('{} = ' || {v});\n", lit(&arg));
+        }
+        args.push(format!("{v} => {v}"));
+    }
+    let call = if args.is_empty() { target } else { format!("{target}(\n    {}\n  )", args.join(",\n    ")) };
+    let call = if ret.is_some() { format!("v_return := {call}") } else { call };
+    let decl = if decl.is_empty() { String::new() } else { format!("DECLARE\n{decl}") };
+    Some(format!("SET SERVEROUTPUT ON\n{decl}BEGIN\n  {call};\n{prints}END;\n/\n"))
+}
+
 /// Columns query for DESCRIBE in the script runner.
 pub fn describe_sql(db: Db, owner: &str, name: &str) -> Option<String> {
     children_sql(db, TABLE).map(|s| fill(db, &s, owner, name))
@@ -582,6 +882,54 @@ pub fn fold(db: Db, ident: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_sql_queries() {
+        let q = &top_sql(Db::Oracle, "cpu", "o'x").unwrap()[0];
+        assert!(q.contains("ORDER BY cpu_time DESC") && q.contains("LIKE '%O''X%'") && q.contains("FROM v$sql"));
+        assert_eq!(top_sql(Db::Postgres, "avg", "").unwrap().len(), 2);
+        assert!(top_sql(Db::Mysql, "nope", "").unwrap()[0].contains("ORDER BY SUM_TIMER_WAIT DESC"));
+        assert!(top_sql(Db::Sqlite, "elapsed", "").is_none());
+        assert!(top_sql_plan("abc123', 1) --", "0").is_none());
+        assert!(top_sql_plan("0w2qpuc6u2zsp", "1").unwrap().contains("DISPLAY_CURSOR('0w2qpuc6u2zsp', 1,"));
+    }
+
+    #[test]
+    fn fill_single_pass() {
+        assert_eq!(fill(Db::Oracle, "'{n}' {q} '{lq}'", "HR", "{q}'x"), "'{q}''x' \"HR\".\"{q}'x\" '\"HR\".\"{q}''x\"'");
+        assert_eq!(fill(Db::Mysql, "'{n}'", "", "a\\"), "'a\\\\'");
+    }
+
+    #[test]
+    fn plsql_run_block() {
+        assert!(plsql_args_sql("hr.pkg.f").contains("owner = 'HR' AND package_name = 'PKG'"));
+        let r = |v: &[&str]| v.iter().map(|x| (!x.is_empty()).then(|| x.to_string())).collect::<Vec<_>>();
+        let rows = vec![
+            r(&["HR", "PKG", "F", "", "0", "NUMBER", "OUT", "1"]),
+            r(&["HR", "PKG", "F", "P_ID", "1", "NUMBER", "IN", "1"]),
+            r(&["HR", "PKG", "F", "P_NAME", "2", "VARCHAR2", "OUT", "1"]),
+            r(&["HR", "PKG", "F", "P_X", "1", "DATE", "IN", "2"]),
+        ];
+        let b = plsql_block(&rows).unwrap();
+        assert_eq!(
+            b,
+            "SET SERVEROUTPUT ON\nDECLARE\n  v_return NUMBER;\n  \"P_ID\" NUMBER := NULL;  -- IN\n  \"P_NAME\" VARCHAR2(32767);  -- OUT\nBEGIN\n  v_return := \"HR\".\"PKG\".\"F\"(\n    \"P_ID\" => \"P_ID\",\n    \"P_NAME\" => \"P_NAME\"\n  );\n  DBMS_OUTPUT.PUT_LINE('v_return = ' || v_return);\n  DBMS_OUTPUT.PUT_LINE('P_NAME = ' || \"P_NAME\");\nEND;\n/\n"
+        );
+        let none = vec![r(&["HR", "", "P", "", "1", "", "IN", ""])];
+        assert_eq!(plsql_block(&none).unwrap(), "SET SERVEROUTPUT ON\nBEGIN\n  \"HR\".\"P\";\nEND;\n/\n");
+    }
+
+    #[test]
+    fn autotrace_hint() {
+        let a = autotrace(Db::Oracle, "with q as (select 1 x from dual) select * from q;", 7).unwrap();
+        assert_eq!(a.stmts[0], "with q as (select 1 x from dual) select /*+ gather_plan_statistics */ /* rsqldev-autotrace-7 */ * from q");
+        assert!(a.stmts[1].contains("rsqldev-autotrace-7") && a.show == 1);
+        assert!(autotrace(Db::Oracle, "update t set x = 1", 1).is_none());
+        assert!(autotrace(Db::Oracle, "insert into t select * from s", 1).is_none());
+        assert!(autotrace(Db::Postgres, "with d as (select 1) delete from t", 1).is_none());
+        assert!(autotrace(Db::Postgres, "select * from t where s = 'delete'", 1).is_some());
+        assert_eq!(autotrace(Db::Postgres, "select 1", 1).unwrap().stmts, vec!["EXPLAIN (ANALYZE, BUFFERS) select 1"]);
+    }
 
     #[test]
     fn session_kill() {

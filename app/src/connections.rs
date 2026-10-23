@@ -38,6 +38,10 @@ const M_TRUNCATE: i32 = 7110;
 const M_DDL: i32 = 7111;
 const M_COMPILE: i32 = 7112;
 const M_RENAME: i32 = 7113;
+const M_NEW_TABLE: i32 = 7114;
+const M_EDIT_TABLE: i32 = 7115;
+const M_NEW_INDEX: i32 = 7116;
+const M_REBUILD: i32 = 7117;
 
 impl Navigator {
     pub fn new(parent: &dyn WxWidget) -> Navigator {
@@ -79,6 +83,21 @@ impl Navigator {
                 nav.context_menu(&i);
             }
         });
+        // Ctrl+C / Cmd+C copies the selected node's name (connection, table, column, ...).
+        // Registered on focus and on the user's selecting; rebuilds from code run quietly.
+        let copy_target = move || {
+            crate::copy::set(move || {
+                if !tree.is_valid() {
+                    return false;
+                }
+                if let Some(t) = tree.get_selection().and_then(|i| tree.get_item_text(&i)).filter(|t| !t.is_empty()) {
+                    Clipboard::get().set_text(&t);
+                }
+                true
+            })
+        };
+        tree.on_set_focus(move |_| copy_target());
+        tree.on_selection_changed(move |_| copy_target());
         nav
     }
 
@@ -87,7 +106,7 @@ impl Navigator {
         let Some(root) = self.tree.get_root_item() else { return };
         if let Some((c, _)) = self.tree.get_first_child(&root) {
             self.tree.expand(&c);
-            self.tree.select_item(&c);
+            crate::copy::quietly(|| self.tree.select_item(&c));
         }
     }
 
@@ -95,10 +114,21 @@ impl Navigator {
         self.tree.get_custom_data(i).and_then(|d| d.downcast_ref::<Node>().cloned()).unwrap_or(Node::Leaf)
     }
 
+    /// Tree image of connection `name`: its engine's icon, with the "open" badge when `up`.
+    fn conn_image(name: &str, up: bool) -> i32 {
+        let driver = crate::app().conns.borrow().iter().find(|c| c.name == name).map(|c| c.driver.clone()).unwrap_or_default();
+        crate::icons::tree_index(&crate::icons::conn_icon(&driver, up))
+    }
+
+    fn set_conn_image(&self, i: &TreeItemId, name: &str, up: bool) {
+        let img = Self::conn_image(name, up);
+        self.tree.set_item_image(i, img, TreeItemIcon::Normal);
+        self.tree.set_item_image(i, img, TreeItemIcon::Selected);
+    }
+
     fn add(&self, parent: &TreeItemId, text: &str, n: Node, expandable: bool) -> Option<TreeItemId> {
         let icon = match &n {
-            Node::Conn(name) if crate::app().open_conn(name).is_some() => "conn_up",
-            Node::Conn(_) => "conn",
+            Node::Conn(_) => "",
             Node::Folder => "folder",
             Node::Schemas { .. } | Node::Schema { .. } => "user",
             Node::Kind { kind, .. } => crate::icons::for_kind(kind),
@@ -106,7 +136,11 @@ impl Navigator {
             Node::Leaf => "column",
             Node::Loading => "",
         };
-        let img = Some(crate::icons::tree_index(icon)).filter(|i| *i >= 0);
+        let img = match &n {
+            Node::Conn(name) => Self::conn_image(name, crate::app().open_conn(name).is_some()),
+            _ => crate::icons::tree_index(icon),
+        };
+        let img = Some(img).filter(|i| *i >= 0);
         let i = self.tree.append_item_with_data(parent, text, n, img, img)?;
         if expandable {
             self.tree.append_item_with_data(&i, "Loading…", Node::Loading, None, None);
@@ -116,6 +150,10 @@ impl Navigator {
 
     /// Rebuild the top level from saved connections, grouped by folder.
     pub fn reload(&self, conns: &[ConnConfig]) {
+        crate::copy::quietly(|| self.rebuild(conns));
+    }
+
+    fn rebuild(&self, conns: &[ConnConfig]) {
         let t = self.tree;
         t.delete_all_items();
         let Some(root) = t.add_root("Connections", None, None) else { return };
@@ -145,12 +183,13 @@ impl Navigator {
         match self.node(i) {
             Node::Conn(name) => crate::app().connect(&name.clone(), move |c| {
                 let owner = c.borrow().schema.clone();
-                nav.tree.delete_children(&item);
-                nav.tree.set_item_image(&item, crate::icons::tree_index("conn_up"), TreeItemIcon::Normal);
-                nav.tree.set_item_image(&item, crate::icons::tree_index("conn_up"), TreeItemIcon::Selected);
-                nav.add_folders(&item, &name, &owner, c.borrow().kind);
-                nav.add(&item, dialect::schemas_label(c.borrow().kind), Node::Schemas { conn: name.clone() }, true);
-                nav.tree.expand(&item);
+                crate::copy::quietly(|| {
+                    nav.tree.delete_children(&item);
+                    nav.set_conn_image(&item, &name, true);
+                    nav.add_folders(&item, &name, &owner, c.borrow().kind);
+                    nav.add(&item, dialect::schemas_label(c.borrow().kind), Node::Schemas { conn: name.clone() }, true);
+                    nav.tree.expand(&item);
+                });
             }),
             Node::Schema { conn, owner } => {
                 if let Some(c) = crate::app().open_conn(&conn) {
@@ -215,13 +254,15 @@ impl Navigator {
         let nav = *self;
         let item = i.clone();
         Conn::meta_query(&c, &sql, move |r| {
-            nav.tree.delete_children(&item);
-            match r {
-                Ok(r) => fill(&nav, &item, kind, r.rows),
-                Err(e) => {
-                    nav.add(&item, &format!("Error: {e}"), Node::Leaf, false);
+            crate::copy::quietly(|| {
+                nav.tree.delete_children(&item);
+                match r {
+                    Ok(r) => fill(&nav, &item, kind, r.rows),
+                    Err(e) => {
+                        nav.add(&item, &format!("Error: {e}"), Node::Leaf, false);
+                    }
                 }
-            }
+            });
         });
     }
 
@@ -262,14 +303,26 @@ impl Navigator {
             Node::Obj { kind, conn, .. } => {
                 b = b.append_item(M_OPEN, "Open", "").append_item(M_REFRESH, "Refresh", "").append_item(M_DDL, "Quick DDL ▸ Worksheet", "").append_separator();
                 if *kind == dialect::TABLE {
-                    b = b.append_item(M_COUNT, "Count Rows", "").append_item(M_RENAME, "Rename…", "").append_item(M_TRUNCATE, "Truncate…", "");
+                    b = b
+                        .append_item(M_EDIT_TABLE, "Edit Table…", "Columns, constraints and indexes, with the DDL shown first")
+                        .append_item(M_NEW_INDEX, "New Index…", "")
+                        .append_separator()
+                        .append_item(M_COUNT, "Count Rows", "")
+                        .append_item(M_RENAME, "Rename…", "")
+                        .append_item(M_TRUNCATE, "Truncate…", "");
                 }
-                let oracle = crate::app().open_conn(conn).is_some_and(|c| c.borrow().kind == Kind::Oracle);
+                let db = crate::app().open_conn(conn).map(|c| c.borrow().kind);
+                // Rebuild needs only the index name on these engines.
+                if *kind == dialect::INDEX && matches!(db, Some(Kind::Oracle | Kind::Postgres | Kind::Sqlite)) {
+                    b = b.append_item(M_REBUILD, "Rebuild", "");
+                }
+                let oracle = db == Some(Kind::Oracle);
                 if oracle && matches!(*kind, dialect::PACKAGE | dialect::PROCEDURE | dialect::FUNCTION | dialect::TRIGGER | dialect::VIEW | dialect::TYPE) {
                     b = b.append_item(M_COMPILE, "Compile", "");
                 }
                 b = b.append_item(M_DROP, "Drop…", "");
             }
+            Node::Kind { kind, .. } if *kind == dialect::TABLE => b = b.append_item(M_NEW_TABLE, "New Table…", "").append_separator().append_item(M_REFRESH, "Refresh", ""),
             Node::Kind { .. } | Node::Schemas { .. } | Node::Schema { .. } => b = b.append_item(M_REFRESH, "Refresh", ""),
             _ => return,
         }
@@ -288,8 +341,7 @@ impl Navigator {
             (M_CONNECT, Node::Conn(_)) => self.tree.expand(i),
             (M_DISCONNECT, Node::Conn(name)) => {
                 app.disconnect(&name);
-                self.tree.set_item_image(i, crate::icons::tree_index("conn"), TreeItemIcon::Normal);
-                self.tree.set_item_image(i, crate::icons::tree_index("conn"), TreeItemIcon::Selected);
+                self.set_conn_image(i, &name, false);
                 self.tree.collapse(i);
                 self.tree.delete_children(i);
                 self.tree.append_item_with_data(i, "Loading…", Node::Loading, None, None);
@@ -303,6 +355,17 @@ impl Navigator {
             }
             (M_OPEN, Node::Obj { conn, owner, kind, name }) => app.open_object(&conn, &owner, kind, &name),
             (M_DDL, Node::Obj { conn, owner, kind, name }) => app.ddl_to_worksheet(&conn, &owner, kind, &name),
+            (M_NEW_TABLE, Node::Kind { conn, owner, .. }) => {
+                let Some(c) = app.open_conn(&conn) else { return };
+                let (nav, item) = (*self, i.clone());
+                crate::table_editor::create(c, owner, move || nav.refresh(&item));
+            }
+            (M_EDIT_TABLE | M_NEW_INDEX, Node::Obj { conn, owner, name, .. }) => {
+                let Some(c) = app.open_conn(&conn) else { return };
+                let (nav, item) = (*self, i.clone());
+                let start = if id == M_NEW_INDEX { crate::table_editor::Start::Indexes } else { crate::table_editor::Start::Columns };
+                crate::table_editor::edit(c, owner, name, start, move || nav.refresh(&item));
+            }
             (_, Node::Obj { conn, owner, kind, name }) => {
                 let Some(c) = app.open_conn(&conn) else { return };
                 let db = c.borrow().kind;
@@ -319,6 +382,10 @@ impl Navigator {
                         _ => format!("DROP {kind} {q}"),
                     },
                     M_COMPILE => format!("ALTER {} {q} COMPILE", if kind == dialect::PACKAGE { "PACKAGE" } else { kind }),
+                    M_REBUILD => match rsqldev_core::ddl::rebuild_index(db, &owner, "", &name) {
+                        Some(s) if crate::ui::confirm(&self.tree, &format!("Rebuild index {q}?\n\n{s}")) => s,
+                        _ => return,
+                    },
                     M_RENAME => match crate::ui::ask(&self.tree, "New name:", "Rename Table", &name) {
                         Some(n) if n != name => match db {
                             Kind::Mssql => format!("EXEC sp_rename '{}', '{}'", dialect::lit(&format!("{owner}.{name}")), dialect::lit(&n)),

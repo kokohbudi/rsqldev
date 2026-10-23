@@ -4,4 +4,12 @@ members = ["core", "app"]
 
 [workspace.package]
 edition = "2024"
-version = "0.3.0"
+version = "0.4.0"
+
+# Release builds run in CI, so build time is cheap: whole-program optimisation for a smaller,
+# slightly faster binary, and no symbol table in the shipped executable. Panics stay `unwind`:
+# a panic on a connection thread then ends that connection, not the whole app.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

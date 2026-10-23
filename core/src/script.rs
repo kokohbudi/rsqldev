@@ -353,6 +353,103 @@ impl Defines {
     }
 }
 
+/// Replace bind variables (`:name`, `:1`) outside strings and comments with literals: a number
+/// stays as typed, empty becomes NULL, anything else is quoted. `ask` gets each distinct name
+/// once (None = cancel run). Skips `::` casts, `:=`, `a[1:n]` slices and `CREATE ...` bodies
+/// (trigger `:new` / `:old`).
+// ponytail: literals, not real binds; Backend::execute has no bind list for queries.
+pub fn bind_literals(text: &str, ask: &mut dyn FnMut(&str) -> Option<String>) -> Option<String> {
+    let s = text;
+    if !s.contains(':') || s[skip_trivia(s, 0, Db::Oracle)..].get(..6).is_some_and(|w| w.eq_ignore_ascii_case("CREATE")) {
+        return Some(text.to_string());
+    }
+    let b = s.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'#';
+    let mut vals: BTreeMap<String, String> = BTreeMap::new();
+    let mut out = String::with_capacity(s.len());
+    let (mut i, mut copied) = (0, 0);
+    while i < b.len() {
+        let rest = &s[i..];
+        if rest.starts_with("--") {
+            i = next_line(s, i);
+        } else if rest.starts_with("/*") {
+            i = s[i + 2..].find("*/").map_or(s.len(), |n| i + 2 + n + 2);
+        } else if b[i] == b'\'' || b[i] == b'"' {
+            let q = b[i];
+            i += 1;
+            while i < b.len() && !(b[i] == q && b.get(i + 1) != Some(&q)) {
+                i += if b[i] == q { 2 } else { 1 };
+            }
+            i += 1;
+        } else if b[i] == b':' && i + 1 < b.len() && word(b[i + 1]) && (i == 0 || !(word(b[i - 1]) || b[i - 1] == b':' || b[i - 1] == b']')) {
+            let end = s[i + 1..].find(|c: char| !(c.is_ascii_alphanumeric() || "_$#".contains(c))).map_or(s.len(), |n| i + 1 + n);
+            let name = &s[i + 1..end];
+            let key = name.to_uppercase();
+            let v = match vals.get(&key) {
+                Some(v) => v.clone(),
+                None => {
+                    let v = ask(name)?;
+                    vals.insert(key, v.clone());
+                    v
+                }
+            };
+            let t = v.trim();
+            let lit = if t.is_empty() {
+                "NULL".to_string()
+            } else if t.parse::<f64>().is_ok() && t.bytes().all(|c| c.is_ascii_digit() || b".-+eE".contains(&c)) {
+                t.to_string()
+            } else {
+                format!("'{}'", v.replace('\'', "''"))
+            };
+            out.push_str(&s[copied..i]);
+            out.push_str(&lit);
+            i = end;
+            copied = end;
+        } else {
+            i += b[i].len_utf8_hint();
+        }
+    }
+    out.push_str(&s[copied.min(s.len())..]);
+    Some(out)
+}
+
+/// `DELETE` / `UPDATE` with no top-level `WHERE` (one inside a subquery, string or comment does
+/// not count): returns the verb, so the worksheet can confirm before touching every row.
+pub fn unbounded_dml(sql: &str) -> Option<&'static str> {
+    let verb = match crate::first_keyword(sql).as_str() {
+        "DELETE" => "DELETE",
+        "UPDATE" => "UPDATE",
+        _ => return None,
+    };
+    let (s, b) = (sql, sql.as_bytes());
+    let (mut i, mut depth) = (0, 0i32);
+    while i < b.len() {
+        let rest = &s[i..];
+        match b[i] {
+            _ if rest.starts_with("--") => i = next_line(s, i),
+            _ if rest.starts_with("/*") => i = s[i + 2..].find("*/").map_or(s.len(), |n| i + 2 + n + 2),
+            q @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < b.len() && !(b[i] == q && b.get(i + 1) != Some(&q)) {
+                    i += if b[i] == q { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'(' => (depth, i) = (depth + 1, i + 1),
+            b')' => (depth, i) = (depth - 1, i + 1),
+            c if c.is_ascii_alphabetic() => {
+                let end = rest.find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).map_or(s.len(), |n| i + n);
+                if depth == 0 && s[i..end].eq_ignore_ascii_case("WHERE") {
+                    return None;
+                }
+                i = end;
+            }
+            c => i += c.len_utf8_hint(),
+        }
+    }
+    Some(verb)
+}
+
 /// What the worksheet should do for a command item.
 #[derive(Debug, PartialEq)]
 pub enum Action {
@@ -570,6 +667,31 @@ mod tests {
         assert_eq!(command("@/tmp/x.sql", &mut d), Action::Include("/tmp/x.sql".into()));
         command("set define off", &mut d);
         assert_eq!(d.substitute("a & b &x", &mut |_| None).unwrap(), "a & b &x");
+    }
+
+    #[test]
+    fn unbounded() {
+        assert_eq!(unbounded_dml("delete from emp"), Some("DELETE"));
+        assert_eq!(unbounded_dml("UPDATE emp SET sal = (SELECT max(sal) FROM emp WHERE 1 = 1) -- where"), Some("UPDATE"));
+        assert_eq!(unbounded_dml("update emp set note = 'where' "), Some("UPDATE"));
+        assert_eq!(unbounded_dml("delete from emp where id = 1"), None);
+        assert_eq!(unbounded_dml("UPDATE emp SET x = 1\nWHERE id IN (SELECT id FROM t)"), None);
+        assert_eq!(unbounded_dml("select * from emp"), None);
+    }
+
+    #[test]
+    fn binds() {
+        let mut asked = vec![];
+        let r = bind_literals("select ':x' from t -- :c\nwhere id = :id and n = :Name and id2 = :ID and t = x::int and a := 1 and s[1:n]", &mut |n| {
+            asked.push(n.to_string());
+            Some(if n == "id" { "7".into() } else { "O'Neil".into() })
+        });
+        assert_eq!(r.unwrap(), "select ':x' from t -- :c\nwhere id = 7 and n = 'O''Neil' and id2 = 7 and t = x::int and a := 1 and s[1:n]");
+        assert_eq!(asked, vec!["id", "Name"]);
+        assert_eq!(bind_literals("x = :1", &mut |_| Some(" ".into())).unwrap(), "x = NULL");
+        let trig = "create trigger t before insert on e for each row begin :new.id := 1; end;";
+        assert_eq!(bind_literals(trig, &mut |_| None).unwrap(), trig);
+        assert!(bind_literals("x = :a", &mut |_| None).is_none());
     }
 
     #[test]

@@ -84,16 +84,22 @@ pub struct Key {
 }
 
 impl Key {
-    /// Primary key first (stable across updates; PostgreSQL ctid is not), then the row locator.
+    /// The row locator first (Oracle ROWID, SQLite / DuckDB rowid: the row itself, not values
+    /// that happen to be visible), then the primary key, then every column. PostgreSQL ctid is
+    /// the exception: it changes with every UPDATE, so a second edit of the same row would miss;
+    /// there the primary key comes first.
     pub fn new(cols: &[Column], hidden: Option<&str>, pk: &[String]) -> Key {
+        let locator = hidden.and_then(|h| cols.iter().position(|c| c.name.eq_ignore_ascii_case(h)));
+        let stable_locator = hidden.is_some_and(|h| h != "ctid");
+        if let Some(i) = locator.filter(|_| stable_locator) {
+            return Key { cols: vec![i], all_columns: false };
+        }
         let pk_idx: Vec<usize> = pk.iter().filter_map(|p| cols.iter().position(|c| c.name.eq_ignore_ascii_case(p))).collect();
         if !pk_idx.is_empty() && pk_idx.len() == pk.len() {
             return Key { cols: pk_idx, all_columns: false };
         }
-        if let Some(h) = hidden {
-            if let Some(i) = cols.iter().position(|c| c.name.eq_ignore_ascii_case(h)) {
-                return Key { cols: vec![i], all_columns: false };
-            }
+        if let Some(i) = locator {
+            return Key { cols: vec![i], all_columns: false };
         }
         Key { cols: (0..cols.len()).collect(), all_columns: true }
     }
@@ -108,6 +114,8 @@ fn cond(db: Db, cols: &[Column], key: &Key, row: &[Cell]) -> String {
             match &row[i] {
                 None => format!("{name} IS NULL"),
                 v if db == Db::Postgres && c.name == "ctid" => format!("{name} = {}::tid", literal(db, c, v)),
+                // Index-organized tables have logical UROWIDs (`*BAEB...`), which CHARTOROWID rejects.
+                Some(v) if db == Db::Oracle && c.name.eq_ignore_ascii_case("ROWID") && v.starts_with('*') => format!("{name} = '{}'", v.replace('\'', "''")),
                 v if db == Db::Oracle && c.name.eq_ignore_ascii_case("ROWID") => format!("{name} = CHARTOROWID({})", literal(db, c, v)),
                 v => format!("{name} = {}", literal(db, c, v)),
             }
@@ -188,6 +196,9 @@ mod tests {
             "UPDATE \"HR\".\"EMP\" SET \"NAME\" = 'Bob', \"HIRED\" = '02-JAN-26' WHERE ROWID = CHARTOROWID('AAA')"
         );
         assert_eq!(insert(Db::Oracle, "T", &cols, Some(0), &old, &[]), "INSERT INTO T (\"ID\", \"NAME\") VALUES (1, 'O''Neil')");
+        // An index-organized table's logical ROWID is compared as text, without CHARTOROWID.
+        let iot = vec![Some("*BAEBwPUCwQL+".into()), Some("1".into()), None, None];
+        assert_eq!(delete(Db::Oracle, "T", &cols, &key, &iot), "DELETE FROM T WHERE ROWID = '*BAEBwPUCwQL+'");
         // Staged BLOBs bind as parameters, even when the cell text did not change.
         assert_eq!(
             update(Db::Oracle, "T", &cols, &key, Some(0), &old, &old, &[3]).unwrap(),
@@ -199,6 +210,12 @@ mod tests {
         assert_eq!(delete(Db::Mysql, "`t`", &cols, &key, &[Some("1".into()), None]), "DELETE FROM `t` WHERE `a` = 1 AND `b` IS NULL LIMIT 1");
         let key = Key::new(&cols, None, &["A".into()]);
         assert_eq!(delete(Db::Mssql, "[t]", &cols, &key, &[Some("1".into()), None]), "DELETE FROM [t] WHERE [a] = 1");
+        // ROWID wins over a primary key; PostgreSQL ctid does not (it changes on UPDATE).
+        let ora = vec![col("ROWID", "ROWID", false), col("ID", "NUMBER", true)];
+        assert_eq!(Key::new(&ora, Some("ROWID"), &["ID".into()]).cols, vec![0]);
+        let pg = vec![col("ctid", "tid", false), col("id", "int4", true)];
+        assert_eq!(Key::new(&pg, Some("ctid"), &["id".into()]).cols, vec![1]);
+        assert_eq!(Key::new(&pg, Some("ctid"), &[]).cols, vec![0]);
         assert_eq!(insert(Db::Mssql, "[t]", &cols, None, &[Some("1".into()), None], &[1]), "INSERT INTO [t] ([a], [b]) VALUES (1, @P1)");
         let d = col("D", "DATE", false);
         assert_eq!(literal(Db::Oracle, &d, &Some("2026-01-02".into())), "TO_TIMESTAMP('2026-01-02', 'YYYY-MM-DD')");

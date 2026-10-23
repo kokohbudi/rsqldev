@@ -10,8 +10,17 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+# A newer push to the same branch cancels the older run: parallel runs each download the
+# ~0.8 GB caches and ran the account's cache egress limit out (restore failed, full rebuild).
+# Tag (release) builds are never cancelled.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/') }}
 env:
   SAVE_CACHE: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' }}
+  # rust-cache keys hash dependencies only, not [profile.*]: bump this after changing a
+  # profile, or every run restores stale artifacts, rebuilds everything and never re-saves.
+  CACHE_PREFIX: v1-rust
 jobs:
   macos:
     runs-on: macos-latest
@@ -24,6 +33,7 @@ jobs:
         with:
           shared-key: macos-universal
           save-if: ${{ env.SAVE_CACHE }}
+          prefix-key: ${{ env.CACHE_PREFIX }}
       - name: Universal app bundle (Apple Silicon + Intel)
         run: scripts/bundle-macos.sh
       - uses: actions/upload-artifact@v4
@@ -40,19 +50,21 @@ jobs:
         with:
           shared-key: windows
           save-if: ${{ env.SAVE_CACHE }}
+          prefix-key: ${{ env.CACHE_PREFIX }}
       - name: Release build
         run: cargo build --release -p rsqldev
       - name: Zip with the VC++ runtime next to the exe (runs without the redistributable)
         shell: pwsh
         run: |
           $out = "rsqldev-windows-x64"
-          New-Item -ItemType Directory $out | Out-Null
+          # -Force: a zip or folder left in the workspace (restored cache) must not fail the build.
+          New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item target/release/rsqldev.exe $out
           foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
             $p = Join-Path $env:WINDIR "System32\$dll"
             if (Test-Path $p) { Copy-Item $p $out }
           }
-          Compress-Archive -Path $out -DestinationPath "$out.zip"
+          Compress-Archive -Force -Path $out -DestinationPath "$out.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -76,6 +88,7 @@ jobs:
         with:
           shared-key: linux-${{ matrix.arch }}
           save-if: ${{ env.SAVE_CACHE }}
+          prefix-key: ${{ env.CACHE_PREFIX }}
       - name: Unit + embedded-DB tests
         if: matrix.test
         run: cargo test -p rsqldev-core

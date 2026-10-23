@@ -10,8 +10,54 @@ const SHEET: &str = "<path d='M3 1h7l3 3v11H3z' fill='#fff' stroke='#6b7d93'/><p
 const RUN: &str = "<path d='M5 3l8 5-8 5z' fill='#2f9e44' stroke='#1d6b2d' stroke-linejoin='round'/>";
 const GRID: &str = "<rect x='1.5' y='2.5' width='13' height='11' fill='#fff' stroke='#5a7fa8'/><rect x='1.5' y='2.5' width='13' height='3' fill='#8fb0d6' stroke='#5a7fa8'/><path d='M1.5 8.5h13M1.5 11h13M6 5.5v8M10.5 5.5v8' stroke='#9fb4cc'/>";
 
+/// Database cylinder in an engine's colour (original shapes, not the vendors' logos).
+fn cyl(fill: &str, stroke: &str, top: &str) -> String {
+    format!("<path d='M2.5 3.5C2.5 2.1 5.2 1 8 1s5.5 1.1 5.5 2.5v9c0 1.4-2.7 2.5-5.5 2.5s-5.5-1.1-5.5-2.5z' fill='{fill}' stroke='{stroke}'/><ellipse cx='8' cy='3.5' rx='5.5' ry='2' fill='{top}' stroke='{stroke}'/>")
+}
+
+/// Per-engine connection icon body; `None` for an unknown name.
+fn engine(name: &str) -> Option<String> {
+    Some(match name {
+        "oracle" => format!("{}<ellipse cx='8' cy='9.5' rx='3' ry='2' fill='none' stroke='#fff' stroke-width='1.5'/>", cyl("#d9534f", "#962d22", "#f1a097")),
+        "postgres" => format!("{}<path d='M5.5 7.5c0 3 1 5 2.5 5s2.5-2 2.5-5' fill='none' stroke='#fff' stroke-width='1.4' stroke-linecap='round'/>", cyl("#3f73ad", "#1f416b", "#93b6de")),
+        "mysql" => format!("{}<path d='M4.5 11c2-3 5-3 7-5' fill='none' stroke='#f29111' stroke-width='1.8' stroke-linecap='round'/>", cyl("#1d7f99", "#0d4f61", "#7fc1d3")),
+        "mssql" => format!("{}<path d='M4 8.5h8M4 11h8' stroke='#e03a3e' stroke-width='1.6'/>", cyl("#6b7787", "#3e4652", "#b4bdc8")),
+        "sqlite" => "<path d='M3 1h7l3 3v11H3z' fill='#d6ebfa' stroke='#2f6fa3'/><path d='M10 1v3h3' fill='none' stroke='#2f6fa3'/><path d='M5 7.5h6M5 10h6M5 12.5h4' stroke='#2f6fa3' stroke-width='1.3'/>".into(),
+        "duckdb" => "<circle cx='7.5' cy='8' r='6.5' fill='#ffd43b' stroke='#a07800'/><path d='M12 7l3.5 1.5L12 10z' fill='#f76707' stroke='#b04a00' stroke-linejoin='round'/><circle cx='8.5' cy='6' r='1.1' fill='#222'/>".into(),
+        "clickhouse" => "<rect x='1' y='1.5' width='14' height='13' rx='2' fill='#ffe14d' stroke='#a08a00'/><path d='M4 4v8M6.7 4v8M9.4 4v8M12 6.5v3' stroke='#222' stroke-width='1.6'/>".into(),
+        _ => return None,
+    })
+}
+
+/// Engine names for [`engine`] icons, by backend.
+pub fn engine_name(kind: rsqldev_core::registry::Kind) -> &'static str {
+    use rsqldev_core::registry::Kind::*;
+    match kind {
+        Oracle => "oracle",
+        Postgres => "postgres",
+        Mysql => "mysql",
+        Mssql => "mssql",
+        Sqlite => "sqlite",
+        Duckdb => "duckdb",
+        Clickhouse => "clickhouse",
+    }
+}
+
+/// Tree icon for a connection of driver `driver_id`, open (`up`) or not.
+pub fn conn_icon(driver_id: &str, up: bool) -> String {
+    match rsqldev_core::registry::find(driver_id) {
+        Some(d) => format!("db_{}{}", engine_name(d.backend), if up { "_up" } else { "" }),
+        None => (if up { "conn_up" } else { "conn" }).into(),
+    }
+}
+
 fn svg(name: &str) -> String {
+    let engine_icon = name.strip_prefix("db_").and_then(|n| {
+        let (n, up) = n.strip_suffix("_up").map_or((n, false), |n| (n, true));
+        engine(n).map(|b| if up { format!("{b}<circle cx='12.5' cy='12.5' r='3.2' fill='#2f9e44' stroke='#fff'/>") } else { b })
+    });
     let body = match name {
+        _ if engine_icon.is_some() => engine_icon.unwrap(),
         "new" => "<path d='M8 2v12M2 8h12' stroke='#2f9e44' stroke-width='3' stroke-linecap='round'/>".to_string(),
         "open" => "<path d='M1.5 4h5l1 1.5h7v8h-13z' fill='#f2c94c' stroke='#b08a1e'/><path d='M1.5 13.5l2-6h12l-2 6z' fill='#f7dc80' stroke='#b08a1e'/>".into(),
         "save" => "<rect x='2' y='2' width='12' height='12' rx='1' fill='#5b7fbd' stroke='#2f4d80'/><rect x='4.5' y='2.5' width='7' height='4' fill='#fff'/><rect x='4' y='9' width='8' height='4.5' fill='#dfe7f3'/>".into(),
@@ -97,7 +143,8 @@ pub fn tool(parent: &dyn WxWidget, name: &str, tip: &str) -> BitmapButton {
 /// Tree image list; index order = [`TREE`].
 pub const TREE: &[&str] = &[
     "conn", "conn_up", "folder", "table", "view", "mview", "index", "package", "procedure", "function", "trigger", "type", "sequence", "synonym", "dblink", "user",
-    "column",
+    "column", "db_oracle", "db_oracle_up", "db_postgres", "db_postgres_up", "db_mysql", "db_mysql_up", "db_mssql", "db_mssql_up", "db_sqlite", "db_sqlite_up",
+    "db_duckdb", "db_duckdb_up", "db_clickhouse", "db_clickhouse_up",
 ];
 
 pub fn tree_index(name: &str) -> i32 {

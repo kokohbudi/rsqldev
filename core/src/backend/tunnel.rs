@@ -105,6 +105,16 @@ impl Backend for Tunneled {
     fn execute_binds(&mut self, sql: &str, binds: &[Bind]) -> Result<Option<u64>> {
         self.inner.execute_binds(sql, binds)
     }
+    fn read_server_file(
+        &mut self,
+        dir: &str,
+        file: &str,
+        offset: u64,
+        out: &mut dyn std::io::Write,
+        progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<u64> {
+        self.inner.read_server_file(dir, file, offset, out, progress)
+    }
 }
 
 #[cfg(test)]

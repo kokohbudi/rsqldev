@@ -118,7 +118,8 @@ impl ResultGrid {
         grid.set_default_cell_text_colour(&c(p.text));
         grid.set_selection_background(&c(p.select_bg));
         grid.set_selection_foreground(&c(p.select_fg));
-        grid.set_default_row_size(20, true);
+        // From the font, not fixed pixels: Windows at 125-150% scaling has taller text.
+        grid.set_default_row_size((grid.get_char_height() + 6).max(20), true);
         let g = ResultGrid { grid, st: Rc::default() };
         let weak = Rc::downgrade(&g.st);
         let me = g.clone_weak();
@@ -146,6 +147,34 @@ impl ResultGrid {
         });
         let me = g.clone();
         grid.on_cell_right_click(move |e| me.context_menu(Some(e.get_position()), (e.get_row(), e.get_col())));
+        // Ctrl+C / Cmd+C copies the selected cells (the menu accelerator never reaches the grid).
+        // Registered on the user's clicks, keys and drags; cursor moves from code run quietly.
+        let st = Rc::downgrade(&g.st);
+        let target = move || {
+            let st = st.clone();
+            crate::copy::set(move || match st.upgrade() {
+                Some(st) if grid.is_valid() => {
+                    ResultGrid { grid, st }.menu(ID_COPY);
+                    true
+                }
+                _ => false,
+            })
+        };
+        let t2 = target.clone();
+        grid.on_select_cell(move |e| {
+            target();
+            // The cursor cell only gets a border: select it too so it is filled like a
+            // selection. Next tick, once wx has finished the click or key, and only when
+            // nothing else is selected (shift / drag selections stay as they are).
+            let (r, c) = (e.get_row(), e.get_col());
+            crate::hub::every_tick(move || {
+                if grid.is_valid() && !grid.is_selection() && (grid.get_grid_cursor_row(), grid.get_grid_cursor_col()) == (r, c) {
+                    crate::copy::quietly(|| grid.select_block(r, c, r, c, false));
+                }
+                false
+            });
+        });
+        grid.on_range_selected(move |_| t2());
         g
     }
 
@@ -280,6 +309,10 @@ impl ResultGrid {
     }
 
     pub fn redraw_all(&self) {
+        crate::copy::quietly(|| self.redraw());
+    }
+
+    fn redraw(&self) {
         let g = self.grid;
         g.begin_batch();
         if g.get_number_rows() > 0 {
@@ -405,7 +438,21 @@ impl ResultGrid {
             st.rows.len() - 1
         };
         self.append_rows(n);
-        self.grid.go_to_cell(n as i32, self.st.borrow().hidden as i32);
+        let hidden = self.st.borrow().hidden as i32;
+        self.move_cursor(n as i32, hidden, true);
+    }
+
+    /// Move the cursor from code: the old selection goes (Delete Row reads it) and the Copy
+    /// target stays where the user put it. `show` scrolls the cell into view.
+    pub fn move_cursor(&self, r: i32, c: i32, show: bool) {
+        crate::copy::quietly(|| {
+            self.grid.clear_selection();
+            if show {
+                self.grid.go_to_cell(r, c);
+            } else {
+                self.grid.set_grid_cursor(r, c);
+            }
+        });
     }
 
     /// Add rows as pending inserts (import); Commit posts them.
@@ -417,14 +464,15 @@ impl ResultGrid {
             start
         };
         self.append_rows(start);
-        self.grid.go_to_cell(start as i32, self.st.borrow().hidden as i32);
+        let hidden = self.st.borrow().hidden as i32;
+        self.move_cursor(start as i32, hidden, true);
     }
 
+    /// Marks every row touched by the selection (whole rows, and cell blocks dragged or
+    /// shift / ctrl-clicked across several rows), or the cursor row when nothing is selected.
     pub fn delete_selected_rows(&self) {
-        let mut rows: Vec<i32> = self.grid.get_selected_rows();
-        if rows.is_empty() {
-            rows.push(self.grid.get_grid_cursor_row());
-        }
+        let cursor = (self.grid.get_grid_cursor_row(), self.grid.get_grid_cursor_col());
+        let rows = rows_to_mark(self.grid.get_selected_rows(), &self.grid.get_selected_blocks(), cursor);
         let mut st = self.st.borrow_mut();
         for r in rows.into_iter().filter(|r| *r >= 0) {
             if let Some(row) = st.rows.get_mut(r as usize) {
@@ -660,9 +708,9 @@ impl ResultGrid {
         };
         match hit {
             Some((r, c)) => {
-                self.grid.set_grid_cursor(r as i32, c as i32);
-                self.grid.make_cell_visible(r as i32, c as i32);
-                self.grid.select_block(r as i32, c as i32, r as i32, c as i32, false);
+                let (r, c) = (r as i32, c as i32);
+                self.move_cursor(r, c, true);
+                crate::copy::quietly(|| self.grid.select_block(r, c, r, c, false));
             }
             None => crate::app().status(0, &format!("'{text}' not found in the fetched rows")),
         }
@@ -875,10 +923,51 @@ impl WeakGrid {
     }
 }
 
+/// Rows Delete Row marks: whole selected rows plus every row of the selected blocks, else the
+/// cursor row. A lone 1x1 block away from the cursor is a stale auto-selection (the cursor was
+/// moved by code since): it is ignored, so the cursor row is marked instead.
+fn rows_to_mark(selected: Vec<i32>, blocks: &[GridBlockCoords], cursor: (i32, i32)) -> Vec<i32> {
+    let stale = |b: &GridBlockCoords| b.top_row == b.bottom_row && b.left_col == b.right_col && (b.top_row, b.left_col) != cursor;
+    let mut rows = selected;
+    if !(rows.is_empty() && blocks.len() == 1 && stale(&blocks[0])) {
+        for b in blocks {
+            rows.extend(b.top_row..=b.bottom_row);
+        }
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    if rows.is_empty() {
+        rows.push(cursor.0);
+    }
+    rows
+}
+
 /// Name / Value grid for single-row "Details" tabs.
 pub fn transpose(cols: &[Column], rows: &[Vec<Cell>]) -> (Vec<Column>, Vec<Vec<Cell>>) {
     let tc = |n: &str| Column { name: n.into(), type_name: String::new(), numeric: false };
     let first = rows.first();
     let out = cols.iter().enumerate().map(|(i, c)| vec![Some(c.name.clone()), first.and_then(|r| r[i].clone())]).collect();
     (vec![tc("Name"), tc("Value")], out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(top: i32, left: i32, bottom: i32, right: i32) -> GridBlockCoords {
+        GridBlockCoords { top_row: top, left_col: left, bottom_row: bottom, right_col: right }
+    }
+
+    #[test]
+    fn delete_row_ignores_a_stale_auto_selection() {
+        // The cursor cell's own 1x1 block, a drag over rows 1-3, whole rows.
+        assert_eq!(rows_to_mark(vec![], &[block(4, 2, 4, 2)], (4, 2)), vec![4]);
+        assert_eq!(rows_to_mark(vec![], &[block(1, 0, 3, 1)], (9, 0)), vec![1, 2, 3]);
+        assert_eq!(rows_to_mark(vec![5, 2], &[], (0, 0)), vec![2, 5]);
+        // A 1x1 block left on row 3 after code moved the cursor to row 7: row 7 is marked.
+        assert_eq!(rows_to_mark(vec![], &[block(3, 1, 3, 1)], (7, 1)), vec![7]);
+        // Ctrl-clicked cells on two rows are a real selection.
+        assert_eq!(rows_to_mark(vec![], &[block(3, 1, 3, 1), block(5, 1, 5, 1)], (5, 1)), vec![3, 5]);
+        assert_eq!(rows_to_mark(vec![], &[], (6, 0)), vec![6]);
+    }
 }

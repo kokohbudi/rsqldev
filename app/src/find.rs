@@ -26,6 +26,7 @@ impl FindBar {
         };
         let field = || {
             let t = TextCtrl::builder(&panel).with_style(TextCtrlStyle::ProcessEnter).with_size(Size::new(200, -1)).build();
+            crate::copy::text(t);
             s.add(&t, 0, SizerFlag::AlignCenterVertical | SizerFlag::All, 2);
             t
         };

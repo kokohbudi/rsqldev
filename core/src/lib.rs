@@ -1,8 +1,11 @@
 //! rsqldev core: database backends, driver registry/downloader, dialect metadata, script runner.
 
 pub mod backend;
+pub mod compare;
 pub mod complete;
 pub mod config;
+pub mod datapump;
+pub mod ddl;
 pub mod dialect;
 pub mod dml;
 pub mod download;
@@ -81,6 +84,20 @@ pub trait Backend: Send {
     /// and long text go through here: literals cap out at a few KB and differ per engine.
     fn execute_binds(&mut self, _sql: &str, _binds: &[Bind]) -> Result<Option<u64>> {
         anyhow::bail!("bind parameters are not supported for this database")
+    }
+
+    /// Stream a file of a server directory object (Oracle BFILE) into `out`, starting at byte
+    /// `offset`. `progress(done_total, file_len)` runs after each read; `false` cancels.
+    /// Returns the bytes written.
+    fn read_server_file(
+        &mut self,
+        _dir: &str,
+        _file: &str,
+        _offset: u64,
+        _out: &mut dyn std::io::Write,
+        _progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<u64> {
+        anyhow::bail!("server files are only available on Oracle")
     }
 }
 
