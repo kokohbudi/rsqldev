@@ -454,6 +454,7 @@ fn finish(conn: &ConnRef, env: &Env, spec: &ExportSpec, r: Result<(), String>) {
             all.push(rec(&spec.log_file, FileKind::Log));
             let saved = datapump::save_files(&all);
             app.status(0, &format!("Export job {} started on {conn_name}", spec.job));
+            app.open_datapump(conn.clone());
             let mut msg = format!("Export job {} started on {conn_name}.\n\nDirectory: {}\n", spec.job, spec.directory);
             if !spec.estimate_only {
                 msg.push_str(&format!("Dump file: {}\n", spec.dump_file));

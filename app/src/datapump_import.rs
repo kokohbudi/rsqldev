@@ -444,6 +444,7 @@ fn finish(conn: &ConnRef, env: &Env, spec: &ImportSpec, uploaded: bool, r: Resul
     }
     let saved = record(conn, env, spec, &files);
     app.status(0, &format!("Import job {} started on {conn_name}", spec.job));
+    app.open_datapump(conn.clone());
     let mut msg = format!("{} job {} started on {conn_name}.\n\nDirectory: {}\nLog file: {}", if sql { "SQL file" } else { "Import" }, spec.job, spec.directory, spec.log_file);
     if sql {
         msg.push_str(&format!("\nSQL file: {}", spec.sql_file));

@@ -8,6 +8,7 @@ mod copy;
 mod conn;
 mod connections;
 mod datapump_export;
+mod datapump_tab;
 mod datapump_import;
 mod driver_manager;
 mod editor;
@@ -101,12 +102,14 @@ const ID_RUN_PLSQL: i32 = ID_HIGHEST + 45;
 const ID_TOPSQL: i32 = ID_HIGHEST + 46;
 const ID_DP_EXPORT: i32 = ID_HIGHEST + 47;
 const ID_DP_IMPORT: i32 = ID_HIGHEST + 48;
+const ID_DP_JOBS: i32 = ID_HIGHEST + 49;
 
 enum Page {
     Sheet(SheetRef),
     Obj(Rc<ObjectView>),
     Sessions(Rc<sessions::Sessions>),
     TopSql(Rc<topsql::TopSql>),
+    DataPump(Rc<datapump_tab::DataPumpTab>),
 }
 
 impl Page {
@@ -116,6 +119,7 @@ impl Page {
             Page::Obj(o) => o.panel,
             Page::Sessions(s) => s.panel,
             Page::TopSql(s) => s.panel,
+            Page::DataPump(s) => s.panel,
         }
     }
 }
@@ -333,6 +337,7 @@ impl App {
                 Page::Obj(o) => o.key.starts_with(&format!("{name}|")),
                 Page::Sessions(s) => s.conn_name == name,
                 Page::TopSql(s) => s.conn_name == name,
+                Page::DataPump(s) => s.conn_name == name,
             };
             if mine {
                 let idx = self.nb.get_page_index(&pages[i].panel());
@@ -400,6 +405,24 @@ impl App {
         let panel = page.panel();
         self.pages.borrow_mut().push(page);
         self.nb.add_page(&panel, title, true);
+    }
+
+    /// Data Pump Jobs & Files tab of a connection: focus it if open, else create it.
+    pub fn open_datapump(&self, conn: ConnRef) {
+        let name = conn.borrow().cfg.name.clone();
+        let found = self.pages.borrow().iter().find_map(|p| match p {
+            Page::DataPump(t) if t.conn_name == name => Some(t.clone()),
+            _ => None,
+        });
+        if let Some(t) = found {
+            let i = self.nb.get_page_index(&t.panel);
+            if i >= 0 {
+                self.nb.set_selection(i as usize);
+            }
+            return t.refresh();
+        }
+        let t = datapump_tab::DataPumpTab::new(&self.nb, conn);
+        self.add_page(Page::DataPump(t), &format!("Data Pump: {name}"));
     }
 
     pub fn open_worksheet(&self, c: ConnRef) {
@@ -648,6 +671,13 @@ impl App {
             ID_DP_IMPORT => self.pick_conn(|c| {
                 if c.borrow().kind == rsqldev_core::registry::Kind::Oracle {
                     datapump_import::show(c);
+                } else {
+                    ui::info(&app().frame, "Data Pump is available on Oracle connections");
+                }
+            }),
+            ID_DP_JOBS => self.pick_conn(|c| {
+                if c.borrow().kind == rsqldev_core::registry::Kind::Oracle {
+                    app().open_datapump(c);
                 } else {
                     ui::info(&app().frame, "Data Pump is available on Oracle connections");
                 }
@@ -980,6 +1010,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_TOPSQL, "&Top SQL…", "Heaviest statements on the server: elapsed, CPU, reads, executions, cost")
         .append_item(ID_DP_EXPORT, "Data Pump &Export…", "Export schemas, tables or the whole database with Oracle Data Pump (Oracle only)")
         .append_item(ID_DP_IMPORT, "Data Pump &Import…", "Import a dump file, uploading it first if it is on this computer (Oracle only)")
+        .append_item(ID_DP_JOBS, "Data Pump &Jobs && Files…", "Running Data Pump jobs and the dump and log files on the server (Oracle only)")
         .append_item(ID_COMPARE, "Schema &Compare…", "Compare two schemas and open a script that brings the target in line")
         .append_item(ID_DRIVERS, "&Drivers…", "Download or locate native client drivers")
         .append_item(ID_PREFERENCES, "&Preferences…", "")

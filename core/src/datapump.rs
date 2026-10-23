@@ -327,6 +327,11 @@ pub fn job_running_sql(owner: &str, job: &str) -> String {
     )
 }
 
+/// Same check against `USER_DATAPUMP_JOBS`, for users who cannot read the DBA view.
+pub fn job_running_sql_user(job: &str) -> String {
+    format!("SELECT state FROM user_datapump_jobs WHERE job_name = '{}'", lit(job))
+}
+
 fn attach_block(owner: &str, job: &str, body: &[String]) -> String {
     let mut v = vec![format!("  h := DBMS_DATAPUMP.ATTACH({}, {});", q(job), q(owner))];
     v.extend(body.iter().cloned());
@@ -606,5 +611,11 @@ mod tests {
         assert_eq!(all[2].conn, "dev-new");
         let t = toml::to_string(&Files { file: all.clone() }).unwrap();
         assert_eq!(toml::from_str::<Files>(&t).unwrap().file, all);
+    }
+
+    #[test]
+    fn job_running_user_sql() {
+        let q = job_running_sql_user("A'B");
+        assert!(q.contains("user_datapump_jobs") && q.contains("'A''B'"));
     }
 }
