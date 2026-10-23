@@ -81,6 +81,13 @@ const ID_SNIPPET: i32 = ID_HIGHEST + 32;
 const ID_SNIPPET_SAVE: i32 = ID_HIGHEST + 33;
 const ID_NEW_SHEET: i32 = ID_HIGHEST + 34;
 const ID_FIND_OBJECT: i32 = ID_HIGHEST + 35;
+const ID_DUP_LINES: i32 = ID_HIGHEST + 36;
+const ID_LINES_UP: i32 = ID_HIGHEST + 37;
+const ID_LINES_DOWN: i32 = ID_HIGHEST + 38;
+const ID_BRACE: i32 = ID_HIGHEST + 39;
+const ID_BOOKMARK: i32 = ID_HIGHEST + 40;
+const ID_BOOKMARK_NEXT: i32 = ID_HIGHEST + 41;
+const ID_BOOKMARK_PREV: i32 = ID_HIGHEST + 42;
 
 enum Page {
     Sheet(SheetRef),
@@ -713,6 +720,16 @@ impl App {
                     complete::show(s.editor, &s.conn(), true);
                 }
             }
+            ID_DUP_LINES | ID_LINES_UP | ID_LINES_DOWN | ID_BRACE | ID_BOOKMARK | ID_BOOKMARK_NEXT | ID_BOOKMARK_PREV => {
+                let Some(e) = sheet.map(|s| s.editor) else { return true };
+                match id {
+                    ID_DUP_LINES => editor::duplicate_lines(e),
+                    ID_LINES_UP | ID_LINES_DOWN => editor::move_lines(e, id == ID_LINES_UP),
+                    ID_BRACE => editor::goto_brace(e),
+                    ID_BOOKMARK => editor::toggle_bookmark(e),
+                    _ => editor::goto_bookmark(e, id == ID_BOOKMARK_NEXT),
+                }
+            }
             ID_SNIPPET | ID_SNIPPET_SAVE => {
                 if let Some(s) = sheet {
                     if id == ID_SNIPPET { snippets::insert(&self.frame, s.editor) } else { snippets::save_selection(&self.frame, s.editor) }
@@ -876,6 +893,15 @@ fn menus(frame: &Frame) {
         .append_item(ID_SNIPPET, "Insert S&nippet…\tCtrl+Shift+J", "Insert a SQL template at the caret")
         .append_item(ID_SNIPPET_SAVE, "Save Selection as Snippet…", "Keep the selected SQL as one of your snippets")
         .append_separator()
+        .append_item(ID_DUP_LINES, "&Duplicate Lines\tCtrl+Shift+D", "")
+        .append_item(ID_LINES_UP, "Move Lines &Up\tAlt+Up", "")
+        .append_item(ID_LINES_DOWN, "Move Lines Do&wn\tAlt+Down", "")
+        .append_item(ID_BRACE, "Go to &Matching Bracket\tCtrl+]", "")
+        .append_separator()
+        .append_item(ID_BOOKMARK, "Toggle &Bookmark\tCtrl+K", "")
+        .append_item(ID_BOOKMARK_NEXT, "Ne&xt Bookmark\tF2", "")
+        .append_item(ID_BOOKMARK_PREV, "Previous Bookmar&k\tShift+F2", "")
+        .append_separator()
         .append_item(ID_FIND, "&Find…\tCtrl+F", "")
         .append_item(ID_REPLACE, "R&eplace…\tCtrl+R", "")
         .append_item(ID_FIND_NEXT, "Find &Next\tF3", "")
@@ -969,6 +995,12 @@ Editor
   Completion Insight       Ctrl+Space (also after typing alias.)
   Format SQL               Ctrl/Cmd+F7
   Insert Snippet           Ctrl/Cmd+Shift+J
+  Duplicate Lines          Ctrl/Cmd+Shift+D
+  Move Lines Up / Down     Alt+Up / Alt+Down
+  Matching Bracket         Ctrl/Cmd+]
+  Bookmark: toggle         Ctrl/Cmd+K
+  Bookmark: next / prev    F2 / Shift+F2
+  Go to Definition         Ctrl+Click (Cmd+Click on macOS)
   Find / Replace           Ctrl/Cmd+F / Ctrl/Cmd+R
   Find Next / Previous     F3 / Shift+F3
 

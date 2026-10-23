@@ -10,6 +10,10 @@ const S_NUMBER: i32 = 3;
 const S_KEYWORD: i32 = 4;
 const S_IDENT_Q: i32 = 5;
 pub const MARK_ERROR: i32 = 1;
+pub const MARK_BOOKMARK: i32 = 2;
+// Scintilla STYLE_BRACELIGHT / STYLE_BRACEBAD.
+const S_BRACE: i32 = 34;
+const S_BRACE_BAD: i32 = 35;
 
 pub const KEYWORDS: &[&str] = &[
     "ADD", "ALL", "ALTER", "AND", "ANY", "AS", "ASC", "BEGIN", "BETWEEN", "BODY", "BY", "CASE", "CHECK", "CLOSE", "COLUMN", "COMMENT",
@@ -42,19 +46,129 @@ pub fn new_editor(parent: &dyn WxWidget, font_face: &str, font_size: i32) -> Sty
     stc.style_set_foreground(S_IDENT_Q, rgb(fg));
     // Lines with PL/SQL compilation errors: tinted background.
     stc.marker_define_symbol(MARK_ERROR, MarkerSymbol::Background, rgb(p.deleted_bg), rgb(p.deleted_bg));
+    stc.marker_define_symbol(MARK_BOOKMARK, MarkerSymbol::RoundRect, rgb(p.accent), rgb(p.accent));
     stc.style_set_background(33, rgb(margin)); // STYLE_LINENUMBER
     stc.style_set_foreground(33, rgb(p.ed_margin_text));
+    stc.style_set_foreground(S_BRACE, rgb(p.accent));
+    stc.style_set_bold(S_BRACE, true);
+    stc.style_set_foreground(S_BRACE_BAD, rgb(0xcc3333));
+    stc.style_set_bold(S_BRACE_BAD, true);
     // SCLEX_CONTAINER = 0 (wxDragon's Lexer enum is off: its Container = 2 is SCLEX_PYTHON).
     stc.set_lexer(0);
     stc.set_margin_type_typed(0, MarginType::Number);
     stc.set_margin_width(0, 36);
-    stc.set_margin_width(1, 4);
+    // Bookmark symbols.
+    stc.set_margin_width(1, 12);
+    stc.on_stc_update_ui(move |_| brace_light(&stc));
     stc.set_tab_width(4);
     stc.set_use_tabs(false);
     stc.set_caret_line_visible(true);
     stc.set_caret_line_background(rgb(line));
     stc.on_stc_style_needed(move |_| highlight(&stc));
     stc
+}
+
+/// Bracket at or just before the caret, if any.
+fn brace_at(stc: &StyledTextCtrl) -> Option<i32> {
+    let p = stc.get_current_pos();
+    let is = |q: i32| q >= 0 && matches!(u8::try_from(stc.get_char_at(q)), Ok(b'(' | b')' | b'[' | b']'));
+    [p, p - 1].into_iter().find(|q| is(*q))
+}
+
+fn brace_light(stc: &StyledTextCtrl) {
+    match brace_at(stc) {
+        Some(a) => match stc.brace_match(a) {
+            -1 => stc.brace_bad_light(a),
+            b => stc.brace_highlight(a, b),
+        },
+        None => stc.brace_highlight(-1, -1),
+    }
+}
+
+/// Edit ▸ Go to Matching Bracket.
+pub fn goto_brace(stc: StyledTextCtrl) {
+    if let Some(b) = brace_at(&stc).map(|a| stc.brace_match(a)).filter(|b| *b >= 0) {
+        stc.goto_pos(b);
+    }
+}
+
+/// Byte range of the whole lines touched by the selection (or the caret line).
+fn line_block(stc: &StyledTextCtrl) -> (i32, i32) {
+    let (s, e) = (stc.get_selection_start(), stc.get_selection_end());
+    let l0 = stc.line_from_position(s);
+    let mut l1 = stc.line_from_position(e);
+    if e > s && e == stc.position_from_line(l1) {
+        l1 -= 1;
+    }
+    let end = if l1 + 1 < stc.get_line_count() { stc.position_from_line(l1 + 1) } else { stc.get_length() };
+    (stc.position_from_line(l0), end)
+}
+
+fn replace(stc: &StyledTextCtrl, a: i32, b: i32, text: &str) {
+    stc.set_target_start(a);
+    stc.set_target_end(b);
+    stc.replace_target(text);
+}
+
+/// Edit ▸ Duplicate Lines: the touched lines, copied below themselves (one undo step).
+pub fn duplicate_lines(stc: StyledTextCtrl) {
+    let (a, b) = line_block(&stc);
+    let text = stc.get_text();
+    let Some(block) = text.get(a as usize..b as usize) else { return };
+    let block = if block.ends_with('\n') { block.to_string() } else { format!("{block}\n") };
+    replace(&stc, a, b, &format!("{block}{}", &text[a as usize..b as usize]));
+    stc.set_selection(a + block.len() as i32, a + 2 * block.len() as i32 - 1);
+}
+
+/// Edit ▸ Move Lines Up / Down: swap the touched lines with the line above / below.
+pub fn move_lines(stc: StyledTextCtrl, up: bool) {
+    let (a, b) = line_block(&stc);
+    let text = stc.get_text();
+    let (lo, hi) = if up {
+        if a == 0 {
+            return;
+        }
+        (stc.position_from_line(stc.line_from_position(a) - 1), b)
+    } else {
+        if b >= stc.get_length() {
+            return;
+        }
+        let nl = stc.line_from_position(b);
+        (a, if nl + 1 < stc.get_line_count() { stc.position_from_line(nl + 1) } else { stc.get_length() })
+    };
+    let (Some(moving), Some(other), Some(span)) = (text.get(a as usize..b as usize), if up { text.get(lo as usize..a as usize) } else { text.get(b as usize..hi as usize) }, text.get(lo as usize..hi as usize)) else { return };
+    // Swap the lines without their line ends; the span keeps its own trailing newline (or none
+    // on the last line).
+    let eol = if span.contains("\r\n") { "\r\n" } else { "\n" };
+    let (m, o) = (moving.trim_end_matches(['\r', '\n']), other.trim_end_matches(['\r', '\n']));
+    let tail = if span.ends_with('\n') { eol } else { "" };
+    let out = if up { format!("{m}{eol}{o}{tail}") } else { format!("{o}{eol}{m}{tail}") };
+    replace(&stc, lo, hi, &out);
+    let start = if up { lo } else { lo + (o.len() + eol.len()) as i32 };
+    stc.set_selection(start, start + m.len() as i32);
+}
+
+/// Edit ▸ Toggle Bookmark on the caret line.
+pub fn toggle_bookmark(stc: StyledTextCtrl) {
+    let line = stc.line_from_position(stc.get_current_pos());
+    if stc.marker_get(line) & (1 << MARK_BOOKMARK) != 0 {
+        stc.marker_delete(line, MARK_BOOKMARK);
+    } else {
+        stc.marker_add(line, MARK_BOOKMARK);
+    }
+}
+
+/// Edit ▸ Next / Previous Bookmark, wrapping around.
+pub fn goto_bookmark(stc: StyledTextCtrl, next: bool) {
+    let (line, mask, last) = (stc.line_from_position(stc.get_current_pos()), 1 << MARK_BOOKMARK, stc.get_line_count() - 1);
+    let found = if next {
+        Some(stc.marker_next(line + 1, mask)).filter(|l| *l >= 0).unwrap_or_else(|| stc.marker_next(0, mask))
+    } else {
+        Some(stc.marker_previous(line - 1, mask)).filter(|l| *l >= 0).unwrap_or_else(|| stc.marker_previous(last, mask))
+    };
+    if found >= 0 {
+        stc.goto_line(found);
+    }
 }
 
 /// Style the whole document. ponytail: full restyle per change, fine below ~1 MB scripts.
