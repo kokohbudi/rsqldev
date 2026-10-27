@@ -65,7 +65,20 @@ pub fn new_editor(parent: &dyn WxWidget, font_face: &str, font_size: i32) -> Sty
     stc.set_use_tabs(false);
     stc.set_caret_line_visible(true);
     stc.set_caret_line_background(rgb(line));
-    stc.on_stc_style_needed(move |_| highlight(&stc));
+    // Incremental styling. wxDragon has no GetEndStyled, so the first unstyled byte is tracked
+    // here: text changes (Modified) move it back, styling moves it forward. Changes made by
+    // the styling itself are ignored (`busy`).
+    let styled = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let busy = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (s1, b1) = (styled.clone(), busy.clone());
+    stc.on_stc_modified(move |e| {
+        if !b1.get() {
+            if let Some(p) = e.get_position() {
+                s1.set(s1.get().min(p.max(0) as usize));
+            }
+        }
+    });
+    stc.on_stc_style_needed(move |e| highlight(&stc, &styled, &busy, e.get_position()));
     stc
 }
 
@@ -173,13 +186,38 @@ pub fn goto_bookmark(stc: StyledTextCtrl, next: bool) {
 }
 
 /// Style the whole document. ponytail: full restyle per change, fine below ~1 MB scripts.
-pub fn highlight(stc: &StyledTextCtrl) {
+/// Style from the first unstyled line up to `until` (Scintilla asks for what it shows), not
+/// the whole document on every keystroke.
+fn highlight(stc: &StyledTextCtrl, styled: &std::cell::Cell<usize>, busy: &std::cell::Cell<bool>, until: Option<i32>) {
     let text = stc.get_text();
+    let len = text.len();
+    let until = until.map_or(len, |p| (p.max(0) as usize).min(len));
+    // Start of the line holding the first unstyled byte (a token boundary)...
+    let mut from = styled.get().min(len);
+    from = text[..from].rfind('\n').map_or(0, |i| i + 1);
+    // ...moved up while that line starts inside a multi-line comment or string.
+    while from > 0 && matches!(stc.get_style_at(from as i32 - 1), S_COMMENT | S_STRING | S_IDENT_Q) {
+        from = text[..from - 1].rfind('\n').map_or(0, |i| i + 1);
+    }
+    busy.set(true);
+    stc.start_styling(from as i32);
+    let mut end = from;
+    for (n, style) in lex(&text, from, until) {
+        stc.set_styling(n as i32, style);
+        end += n;
+    }
+    busy.set(false);
+    styled.set(end);
+}
+
+/// Tokens (byte length, style) from byte `from` (a token boundary) through the token that
+/// reaches `until`.
+fn lex(text: &str, from: usize, until: usize) -> Vec<(usize, i32)> {
     let b = text.as_bytes();
-    stc.start_styling(0);
-    let mut i = 0;
-    let run = |len: usize, style: i32| stc.set_styling(len as i32, style);
-    while i < b.len() {
+    let mut out = vec![];
+    let mut i = from;
+    let mut run = |len: usize, style: i32| out.push((len, style));
+    while i < b.len() && i < until.max(from + 1) {
         let start = i;
         let c = b[i];
         let style = if c == b'-' && b.get(i + 1) == Some(&b'-') {
@@ -225,10 +263,42 @@ pub fn highlight(stc: &StyledTextCtrl) {
         };
         run(i.min(b.len()) - start, style);
     }
+    out
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    const SQL: &str = "select a, 'x''y' from t -- note\n/* multi\nline */ where n = 42;";
+
+    #[test]
+    fn lex_whole_text() {
+        let toks = lex(SQL, 0, SQL.len());
+        assert_eq!(toks.iter().map(|t| t.0).sum::<usize>(), SQL.len());
+        assert_eq!(toks[0], (6, S_KEYWORD));
+        assert!(toks.contains(&(6, S_STRING)) && toks.contains(&(16, S_COMMENT)) && toks.contains(&(2, S_NUMBER)));
+    }
+
+    #[test]
+    fn lex_from_a_token_boundary_matches_the_tail() {
+        let full = lex(SQL, 0, SQL.len());
+        // Start at "from" (offset 17): same tokens as the full run from there on.
+        let tail = lex(SQL, 17, SQL.len());
+        let mut at = 0;
+        let skip = full.iter().take_while(|t| {
+            at += t.0;
+            at <= 17
+        });
+        assert_eq!(tail, full[skip.count()..].to_vec());
+    }
+
+    #[test]
+    fn lex_stops_after_the_token_reaching_until() {
+        let toks = lex(SQL, 0, 3);
+        assert_eq!(toks, vec![(6, S_KEYWORD)]);
+    }
+
     #[test]
     fn keywords_sorted() {
         assert!(super::KEYWORDS.windows(2).all(|w| w[0] < w[1]));
