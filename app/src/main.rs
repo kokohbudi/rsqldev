@@ -2,6 +2,7 @@
 //! rsqldev: a native SQL Developer. wxWidgets gives Cocoa widgets on macOS and Win32 on Windows.
 
 mod autosave;
+mod buddy;
 mod compare;
 mod complete;
 mod copy;
@@ -948,33 +949,45 @@ fn check_updates(manual: bool) {
 fn activity_bar(sb: StatusBar) {
     const F_TIME: usize = 4;
     const F_BAR: usize = 5;
-    let gauge = Gauge::builder(&sb).with_range(100).build();
-    gauge.show(false);
+    // The buddy hops while the database works and beams for a second when it is done.
+    let Some(frames) = buddy::Frames::new() else { return };
+    let pet = StaticBitmap::new_with_bitmap_bundle(&sb, ID_ANY as i32, &frames.happy);
+    pet.show(false);
     let mut since: Option<std::time::Instant> = None;
-    let mut phase = 0;
+    let mut tick: u32 = 0;
+    let mut cheer = 0;
     hub::every_tick(move || {
-        if !gauge.is_valid() {
+        if !pet.is_valid() {
             return false;
         }
         let busy = rsqldev_core::worker::busy() > 0 || conn::meta_pending() > 0;
+        let r = sb.get_field_rect(F_BAR);
+        let x = |t| r.x + 4 + buddy::walk(t, r.width - 28);
+        let y = r.y + (r.height - 20) / 2;
         match (busy, since) {
             (true, None) => since = Some(std::time::Instant::now()),
             (false, Some(_)) => {
                 since = None;
-                gauge.show(false);
                 sb.set_status_text("", F_TIME);
+                // ~1 s of joy at 25 ms ticks.
+                cheer = 40;
+                pet.set_bitmap_bundle(&frames.happy);
             }
             _ => {}
         }
-        // Shown at once: a click that waits on the database must never look like a hang.
-        let Some(t) = since else { return true };
-        let r = sb.get_field_rect(F_BAR);
-        gauge.set_size_with_pos(r.x + 4, r.y + 2, r.width - 8, r.height - 4);
-        gauge.show(true);
-        // No indeterminate mode in wxDragon: sweep the bar instead (~1.5 s per pass at 25 ms ticks).
-        phase = (phase + 2) % 102;
-        gauge.set_value(phase.min(100));
-        sb.set_status_text(&format!("Working {:.1} s", t.elapsed().as_secs_f32()), F_TIME);
+        if let Some(t) = since {
+            // Shown at once: a click that waits on the database must never look like a hang.
+            tick = tick.wrapping_add(1);
+            pet.set_bitmap_bundle(frames.at(tick));
+            pet.set_size_with_pos(x(tick), y, 20, 20);
+            pet.show(true);
+            sb.set_status_text(&format!("Working {:.1} s", t.elapsed().as_secs_f32()), F_TIME);
+        } else if cheer > 0 {
+            cheer -= 1;
+            if cheer == 0 {
+                pet.show(false);
+            }
+        }
         true
     });
 }
