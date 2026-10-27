@@ -19,8 +19,9 @@ concurrency:
 env:
   SAVE_CACHE: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' }}
   # rust-cache keys hash dependencies only, not [profile.*]: bump this after changing a
-  # profile, or every run restores stale artifacts, rebuilds everything and never re-saves.
-  CACHE_PREFIX: v2-rust
+  # release profile, or every run restores stale artifacts, rebuilds everything and never
+  # re-saves. A [profile.dev] change only needs the Linux test leg's key bumped.
+  CACHE_PREFIX: v1-rust
 jobs:
   macos:
     runs-on: macos-latest
@@ -86,7 +87,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
-          shared-key: linux-${{ matrix.arch }}
+          # Own key for the test leg: [profile.dev] changes only touch its cache.
+          shared-key: linux-${{ matrix.arch }}${{ matrix.test && '-dev2' || '' }}
           save-if: ${{ env.SAVE_CACHE }}
           prefix-key: ${{ env.CACHE_PREFIX }}
       - name: Unit + embedded-DB tests
