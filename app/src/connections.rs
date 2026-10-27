@@ -107,6 +107,74 @@ impl Navigator {
         }
     }
 
+    /// Select `owner.name` in the tree, expanding (and loading) the path to it: the object
+    /// viewer's "select in navigator", like IntelliJ's select-in-project. Gives up quietly
+    /// after 15 s or when a step is missing.
+    pub fn reveal(&self, conn: &str, schema: &str, owner: &str, kind: &'static str, name: &str) {
+        let nav = *self;
+        let (conn, owner, name) = (conn.to_string(), owner.to_string(), name.to_string());
+        // Own schema: folders right under the connection; other schemas under Schemas ▸ owner.
+        let own = owner.eq_ignore_ascii_case(schema);
+        let steps: Vec<Box<dyn Fn(&Node) -> bool>> = {
+            let (c1, c2, o1, o2, n1) = (conn.clone(), conn.clone(), owner.clone(), owner.clone(), name.clone());
+            let mut v: Vec<Box<dyn Fn(&Node) -> bool>> = vec![Box::new(move |n| matches!(n, Node::Conn(c) if *c == c1))];
+            if !own {
+                v.push(Box::new(move |n| matches!(n, Node::Schemas { conn } if *conn == c2)));
+                v.push(Box::new(move |n| matches!(n, Node::Schema { owner, .. } if owner.eq_ignore_ascii_case(&o1))));
+            }
+            v.push(Box::new(move |n| matches!(n, Node::Kind { kind: k, owner, .. } if *k == kind && owner.eq_ignore_ascii_case(&o2))));
+            v.push(Box::new(move |n| matches!(n, Node::Obj { name: x, .. } if *x == n1)));
+            v
+        };
+        let Some(root) = self.tree.get_root_item() else { return };
+        let (mut at, mut step) = (root, 0usize);
+        let start = std::time::Instant::now();
+        crate::hub::every_tick(move || {
+            if !nav.tree.is_valid() || start.elapsed().as_secs() > 15 {
+                return false;
+            }
+            // Wait while a load replaces the Loading placeholder.
+            if nav.first_child_is_loading(&at) {
+                if !nav.tree.is_expanded(&at) {
+                    nav.tree.expand(&at);
+                }
+                return true;
+            }
+            // Connections can sit in folders: look one folder level deep at the top.
+            let found = nav.child_where(&at, &steps[step]).or_else(|| {
+                (step == 0).then(|| nav.children(&at).into_iter().filter(|c| matches!(nav.node(c), Node::Folder)).find_map(|f| nav.child_where(&f, &steps[0]))).flatten()
+            });
+            let Some(next) = found else { return false };
+            step += 1;
+            if step == steps.len() {
+                crate::copy::quietly(|| nav.tree.select_item(&next));
+                nav.tree.ensure_visible(&next);
+                return false;
+            }
+            nav.tree.expand(&next);
+            at = next;
+            true
+        });
+    }
+
+    fn children(&self, i: &TreeItemId) -> Vec<TreeItemId> {
+        let mut out = vec![];
+        if let Some((mut c, _)) = self.tree.get_first_child(i) {
+            loop {
+                out.push(c.clone());
+                match self.tree.get_next_sibling(&c) {
+                    Some(n) => c = n,
+                    None => break,
+                }
+            }
+        }
+        out
+    }
+
+    fn child_where(&self, i: &TreeItemId, f: &dyn Fn(&Node) -> bool) -> Option<TreeItemId> {
+        self.children(i).into_iter().find(|c| f(&self.node(c)))
+    }
+
     fn node(&self, i: &TreeItemId) -> Node {
         self.tree.get_custom_data(i).and_then(|d| d.downcast_ref::<Node>().cloned()).unwrap_or(Node::Leaf)
     }

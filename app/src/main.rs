@@ -442,6 +442,9 @@ impl App {
 
     pub fn open_object(&self, conn: &str, owner: &str, kind: &'static str, name: &str) {
         let Some(c) = self.open_conn(conn) else { return };
+        // Select it in the Connections tree too (IntelliJ's select-in-project).
+        let schema = c.borrow().schema.clone();
+        self.nav.reveal(conn, &schema, owner, kind, name);
         let key = format!("{conn}|{owner}|{kind}|{name}");
         let idx = self.pages.borrow().iter().find(|p| matches!(p, Page::Obj(o) if o.key == key)).map(|p| self.nb.get_page_index(&p.panel()));
         if let Some(i) = idx.filter(|i| *i >= 0) {

@@ -9,6 +9,8 @@ const S_STRING: i32 = 2;
 const S_NUMBER: i32 = 3;
 const S_KEYWORD: i32 = 4;
 const S_IDENT_Q: i32 = 5;
+/// Object names while Ctrl / Cmd is held: blue, underlined, clickable (Ctrl+Click opens them).
+const S_LINK: i32 = 6;
 pub const MARK_ERROR: i32 = 1;
 pub const MARK_BOOKMARK: i32 = 2;
 // Scintilla STYLE_BRACELIGHT / STYLE_BRACEBAD.
@@ -44,6 +46,8 @@ pub fn new_editor(parent: &dyn WxWidget, font_face: &str, font_size: i32) -> Sty
     stc.style_set_foreground(S_KEYWORD, rgb(kw));
     stc.style_set_bold(S_KEYWORD, true);
     stc.style_set_foreground(S_IDENT_Q, rgb(fg));
+    stc.style_set_foreground(S_LINK, rgb(p.link));
+    stc.style_set_underline(S_LINK, true);
     // Lines with PL/SQL compilation errors: tinted background.
     stc.marker_define_symbol(MARK_ERROR, MarkerSymbol::Background, rgb(p.deleted_bg), rgb(p.deleted_bg));
     stc.marker_define_symbol(MARK_BOOKMARK, MarkerSymbol::RoundRect, rgb(p.accent), rgb(p.accent));
@@ -70,6 +74,40 @@ pub fn new_editor(parent: &dyn WxWidget, font_face: &str, font_size: i32) -> Sty
     // the styling itself are ignored (`busy`).
     let styled = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let busy = std::rc::Rc::new(std::cell::Cell::new(false));
+    // Ctrl / Cmd held: object names show as links (whole text restyled once per press).
+    let links = std::rc::Rc::new(std::cell::Cell::new(false));
+    let toggle = {
+        let (styled, busy, links) = (styled.clone(), busy.clone(), links.clone());
+        move |on: bool| {
+            if links.replace(on) != on {
+                styled.set(0);
+                highlight(&stc, &styled, &busy, on, None);
+            }
+        }
+    };
+    let t1 = toggle.clone();
+    stc.on_key_down(move |e| {
+        if let WindowEventData::Keyboard(k) = &e {
+            if k.get_key_code() == Some(wxdragon::keycode::WXK_COMMAND) {
+                t1(true);
+            }
+        }
+        e.skip(true);
+    });
+    let t2 = toggle.clone();
+    stc.on_key_up(move |e| {
+        if let WindowEventData::Keyboard(k) = &e {
+            if k.get_key_code() == Some(wxdragon::keycode::WXK_COMMAND) {
+                t2(false);
+            }
+        }
+        e.skip(true);
+    });
+    // A key-up missed while another window had focus must not leave the links on.
+    stc.on_kill_focus(move |e| {
+        toggle(false);
+        e.skip(true);
+    });
     let (s1, b1) = (styled.clone(), busy.clone());
     stc.on_stc_modified(move |e| {
         if !b1.get() {
@@ -78,7 +116,7 @@ pub fn new_editor(parent: &dyn WxWidget, font_face: &str, font_size: i32) -> Sty
             }
         }
     });
-    stc.on_stc_style_needed(move |e| highlight(&stc, &styled, &busy, e.get_position()));
+    stc.on_stc_style_needed(move |e| highlight(&stc, &styled, &busy, links.get(), e.get_position()));
     stc
 }
 
@@ -188,7 +226,7 @@ pub fn goto_bookmark(stc: StyledTextCtrl, next: bool) {
 /// Style the whole document. ponytail: full restyle per change, fine below ~1 MB scripts.
 /// Style from the first unstyled line up to `until` (Scintilla asks for what it shows), not
 /// the whole document on every keystroke.
-fn highlight(stc: &StyledTextCtrl, styled: &std::cell::Cell<usize>, busy: &std::cell::Cell<bool>, until: Option<i32>) {
+fn highlight(stc: &StyledTextCtrl, styled: &std::cell::Cell<usize>, busy: &std::cell::Cell<bool>, links: bool, until: Option<i32>) {
     let text = stc.get_text();
     let len = text.len();
     let until = until.map_or(len, |p| (p.max(0) as usize).min(len));
@@ -199,15 +237,65 @@ fn highlight(stc: &StyledTextCtrl, styled: &std::cell::Cell<usize>, busy: &std::
     while from > 0 && matches!(stc.get_style_at(from as i32 - 1), S_COMMENT | S_STRING | S_IDENT_Q) {
         from = text[..from - 1].rfind('\n').map_or(0, |i| i + 1);
     }
+    // Links need the statement's start (FROM may be lines above): restyle from the top then.
+    if links {
+        from = 0;
+    }
     busy.set(true);
     stc.start_styling(from as i32);
     let mut end = from;
-    for (n, style) in lex(&text, from, until) {
+    for (n, style) in lex_links(&text, from, until, links) {
         stc.set_styling(n as i32, style);
         end += n;
     }
     busy.set(false);
     styled.set(end);
+}
+
+/// [`lex`], with object names marked [`S_LINK`] when `links` (Ctrl / Cmd held): the names after
+/// FROM, JOIN, INTO, UPDATE and TABLE, each part of `owner.name`, and every item of a FROM list.
+fn lex_links(text: &str, from: usize, until: usize, links: bool) -> Vec<(usize, i32)> {
+    let mut toks = lex(text, from, until);
+    if !links {
+        return toks;
+    }
+    let (mut expect, mut in_from, mut dot_next, mut after_dot) = (false, false, false, false);
+    let mut at = from;
+    for (n, style) in toks.iter_mut() {
+        let t = &text[at..at + *n];
+        at += *n;
+        if t.trim().is_empty() {
+            continue;
+        }
+        let ident = *style == S_IDENT_Q || (*style == S_DEFAULT && t.starts_with(|c: char| c.is_alphabetic() || c == '_'));
+        if *style == S_KEYWORD {
+            match t.to_ascii_uppercase().as_str() {
+                "FROM" | "JOIN" => (expect, in_from) = (true, true),
+                "INTO" | "UPDATE" | "TABLE" => (expect, in_from) = (true, false),
+                "AS" => {}
+                _ => (expect, in_from) = (false, false),
+            }
+            (dot_next, after_dot) = (false, false);
+        } else if ident {
+            if expect || after_dot {
+                *style = S_LINK;
+                (expect, after_dot, dot_next) = (false, false, true);
+            } else {
+                dot_next = false;
+            }
+        } else if t == "." && dot_next {
+            *style = S_LINK;
+            (after_dot, dot_next) = (true, false);
+        } else {
+            if t == "," && in_from {
+                expect = true;
+            } else if t == "(" {
+                expect = false;
+            }
+            (dot_next, after_dot) = (false, false);
+        }
+    }
+    toks
 }
 
 /// Tokens (byte length, style) from byte `from` (a token boundary) through the token that
@@ -297,6 +385,28 @@ mod tests {
     fn lex_stops_after_the_token_reaching_until() {
         let toks = lex(SQL, 0, 3);
         assert_eq!(toks, vec![(6, S_KEYWORD)]);
+    }
+
+    /// Text of each token styled `style`.
+    fn styled(sql: &str, toks: &[(usize, i32)], style: i32) -> Vec<String> {
+        let mut at = 0;
+        let mut out = vec![];
+        for (n, s) in toks {
+            if *s == style {
+                out.push(sql[at..at + n].to_string());
+            }
+            at += n;
+        }
+        out
+    }
+
+    #[test]
+    fn links_mark_object_names_after_from_join_into() {
+        let sql = "select x from hr.emp e, dept d join loc l on l.id = e.id where e.x = 1;\ninsert into audit_log values (1)";
+        let toks = lex_links(sql, 0, sql.len(), true);
+        assert_eq!(styled(sql, &toks, S_LINK), vec!["hr", ".", "emp", "dept", "loc", "audit_log"]);
+        // Without Ctrl the same text has no links.
+        assert!(styled(sql, &lex_links(sql, 0, sql.len(), false), S_LINK).is_empty());
     }
 
     #[test]
