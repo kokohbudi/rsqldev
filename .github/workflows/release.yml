@@ -74,5 +74,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           test -f macos/rsqldev-macos-universal.zip && test -f windows/rsqldev-windows-x64.zip
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "rsqldev $GITHUB_REF_NAME" --generate-notes \
+          # v1.2.3-rc1 and the like are test releases: marked pre-release, not "Latest".
+          pre=""
+          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" $pre --repo "$GITHUB_REPOSITORY" --title "rsqldev $GITHUB_REF_NAME" --generate-notes \
             macos/rsqldev-macos-universal.zip windows/rsqldev-windows-x64.zip linux-*/rsqldev-linux-*.tar.gz
