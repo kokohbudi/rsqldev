@@ -45,6 +45,11 @@ pub struct Worksheet {
     /// Autosave slot (`<config>/worksheets/<id>.toml`).
     pub autosave_id: u64,
     pub autosaved: RefCell<String>,
+    /// Posts edits of a single-table query result (SQL Developer: editable query results).
+    dml: RefCell<Option<Rc<crate::data_editor::Editor>>>,
+    /// Bumped per Run Statement: a late editability check of an older run is dropped.
+    run_gen: Cell<u64>,
+    last_line: Cell<i32>,
 }
 
 const P_RESULT: usize = 0;
@@ -182,6 +187,9 @@ impl Worksheet {
             running: Cell::new(false),
             started: Cell::new(None),
             me: me.clone(),
+            dml: RefCell::default(),
+            run_gen: Cell::new(0),
+            last_line: Cell::new(1),
             b_cancel,
             busy: Cell::new(false),
             autosave_id: crate::autosave::next_id(),
@@ -496,6 +504,81 @@ impl Worksheet {
             self.results.load(rows, 0, false);
             self.results.st.borrow_mut().count = Conn::counter(&self.conn(), &sql, self.status);
             self.bottom.set_selection(P_RESULT);
+            self.last_line.set(line);
+            self.editable_result(&sql);
+        }
+    }
+
+    /// A query of one table whose every result column is a column of that table gets an
+    /// editable grid: edits post on Commit (F11), keyed by the primary key (else every column).
+    fn editable_result(&self, sql: &str) {
+        *self.dml.borrow_mut() = None;
+        let run = self.run_gen.get() + 1;
+        self.run_gen.set(run);
+        let Some((o, t)) = rsqldev_core::dml::single_table(sql) else { return };
+        let conn = self.conn();
+        let db = conn.borrow().kind;
+        let name = rsqldev_core::ddl::ident(db, &t);
+        let me = self.weak();
+        let c2 = conn.clone();
+        let check = move |owner: String| {
+            let Some(cols_sql) = dialect::children_sql(db, dialect::TABLE) else { return };
+            let c3 = c2.clone();
+            Conn::meta_query(&c2, &dialect::fill(db, &cols_sql, &owner, &name), move |r| {
+                let Ok(r) = r else { return };
+                let table_cols: Vec<String> = r.rows.into_iter().filter_map(|row| row.into_iter().next().flatten()).collect();
+                if table_cols.is_empty() {
+                    return;
+                }
+                // Wait for the result's columns, then compare.
+                crate::hub::every_tick(move || {
+                    let Some(ws) = me.upgrade() else { return false };
+                    if ws.run_gen.get() != run {
+                        return false;
+                    }
+                    let st = ws.results.st.borrow();
+                    if st.cols.is_empty() {
+                        return !st.done;
+                    }
+                    let ok = st.cols.iter().all(|c| table_cols.iter().any(|t| t.eq_ignore_ascii_case(&c.name)));
+                    drop(st);
+                    if ok {
+                        let (w1, w2) = (me.clone(), me.clone());
+                        let ed = crate::data_editor::Editor::new(
+                            c3.clone(),
+                            &owner,
+                            &name,
+                            ws.results.clone(),
+                            None,
+                            move |line| {
+                                if let Some(ws) = w1.upgrade() {
+                                    ws.out(line)
+                                }
+                            },
+                            move || {
+                                if let Some(ws) = w2.upgrade() {
+                                    let sql = ws.last.borrow().clone();
+                                    if let Some(sql) = sql {
+                                        ws.run_sql_grid(sql, ws.last_line.get());
+                                    }
+                                }
+                            },
+                        );
+                        ws.results.set_editable(true);
+                        *ws.dml.borrow_mut() = Some(ed);
+                        crate::app().status(0, &format!("Query Result is editable ({name}): Commit (F11) posts the changes"));
+                    }
+                    false
+                });
+            });
+        };
+        match o {
+            Some(o) => check(rsqldev_core::ddl::ident(db, &o)),
+            None => Conn::meta_query(&conn, dialect::current_schema_sql(db), move |r| {
+                if let Some(owner) = r.ok().and_then(|r| r.rows.into_iter().next()).and_then(|row| row.into_iter().next().flatten()) {
+                    check(owner)
+                }
+            }),
         }
     }
 
@@ -713,6 +796,11 @@ impl Worksheet {
     }
 
     pub fn commit(&self) {
+        // Pending grid edits of an editable result: post them, then COMMIT.
+        let ed = self.dml.borrow().clone();
+        if ed.is_some_and(|ed| ed.pending() && ed.commit()) {
+            return;
+        }
         let me = self.weak();
         Conn::tx(&self.conn(), Cmd::Commit, move |r| {
             if let Some(me) = me.upgrade() {
@@ -722,6 +810,10 @@ impl Worksheet {
     }
 
     pub fn rollback(&self) {
+        let ed = self.dml.borrow().clone();
+        if let Some(ed) = ed.filter(|ed| ed.pending()) {
+            return ed.rollback();
+        }
         let me = self.weak();
         Conn::tx(&self.conn(), Cmd::Rollback, move |r| {
             if let Some(me) = me.upgrade() {

@@ -5,6 +5,7 @@ mod autosave;
 mod compare;
 mod complete;
 mod copy;
+mod data_editor;
 mod conn;
 mod connections;
 mod datapump_export;

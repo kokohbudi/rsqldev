@@ -2,11 +2,9 @@
 //! loaded lazily on first view. The Data tab is an editable grid that posts generated DML.
 
 use crate::conn::{Conn, ConnRef};
-use crate::grid::{ResultGrid, Row, transpose};
+use crate::grid::{ResultGrid, transpose};
 use rsqldev_core::dialect::{self, Tab, View};
-use rsqldev_core::{Bind, dml};
 use rsqldev_core::registry::Kind;
-use rsqldev_core::worker::Cmd;
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use wxdragon::prelude::*;
@@ -34,14 +32,6 @@ enum Page {
     Data,
 }
 
-/// One generated DML statement and the grid row it came from (for "Row n:" errors).
-#[derive(Clone)]
-struct Stmt {
-    row: usize,
-    sql: String,
-    binds: Vec<Bind>,
-}
-
 struct DataTab {
     grid: ResultGrid,
     filter: TextCtrl,
@@ -50,12 +40,10 @@ struct DataTab {
     log: TextCtrl,
     /// Sort… keys, appended as ORDER BY.
     order: RefCell<Vec<dialect::SortKey>>,
-    /// Rows already posted (row change) and not yet committed.
-    posted: Cell<bool>,
-    pk: RefCell<Vec<String>>,
+    /// Posts the grid edits (editable tables).
+    ed: std::cell::OnceCell<Rc<crate::data_editor::Editor>>,
     hidden: Option<&'static str>,
     editable: bool,
-    busy: Cell<bool>,
     buttons: [BitmapButton; 5],
     import: BitmapButton,
 }
@@ -201,15 +189,22 @@ impl ObjectView {
 
     fn bind_data(&self) {
         let Some(d) = &self.data else { return };
-        if let Some(sql) = dialect::pk_sql(self.db, &self.owner, &self.name) {
-            let me = self.me.clone();
-            Conn::meta_query(&self.conn, &sql, move |r| {
-                if let (Some(me), Ok(r)) = (me.upgrade(), r) {
-                    if let Some(d) = &me.data {
-                        *d.pk.borrow_mut() = r.rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect();
+        if d.editable {
+            let (me, log) = (self.me.clone(), d.log);
+            let ed = crate::data_editor::Editor::new(
+                self.conn.clone(),
+                &self.owner,
+                &self.name,
+                d.grid.clone(),
+                d.hidden,
+                move |line| log.append_text(&format!("{line}\n")),
+                move || {
+                    if let Some(me) = me.upgrade() {
+                        me.load_data()
                     }
-                }
-            });
+                },
+            );
+            let _ = d.ed.set(ed);
         }
         let st = d.status;
         d.grid.st.borrow_mut().on_change = Some(Rc::new(move |s| {
@@ -224,14 +219,6 @@ impl ObjectView {
         d.grid.st.borrow_mut().sort_dialog = Some(Rc::new(move || {
             if let Some(me) = me.upgrade() {
                 me.sort_dialog()
-            }
-        }));
-        let me = self.me.clone();
-        d.grid.st.borrow_mut().on_row_leave = Some(Rc::new(move |r| {
-            if let Some(me) = me.upgrade() {
-                if crate::app().prefs().post_on_row_change {
-                    me.post_row(r)
-                }
             }
         }));
         let acts: [fn(&ObjectView); 5] = [ObjectView::insert_row, ObjectView::delete_rows, ObjectView::commit, ObjectView::rollback, ObjectView::load_data];
@@ -267,7 +254,9 @@ impl ObjectView {
 
     pub fn load_data(&self) {
         let (sql, d) = self.data_sql();
-        d.posted.set(false);
+        if let Some(ed) = d.ed.get() {
+            ed.loaded();
+        }
         let st = d.status;
         let rows = Conn::exec(&self.conn, &sql, move |done| {
             if let Err(e) = done.result {
@@ -278,153 +267,18 @@ impl ObjectView {
         d.grid.st.borrow_mut().count = Conn::counter(&self.conn, &sql, d.status);
     }
 
-    /// Generated DML for pending grid edits (rows picked by `want`), each with its grid row and
-    /// the values it binds (staged BLOB files, and text too long for an Oracle literal).
-    fn pending_dml(&self, want: impl Fn(usize) -> bool) -> Vec<Stmt> {
-        let d = self.data.as_ref().unwrap();
-        let st = d.grid.st.borrow();
-        let table = dialect::qualified(self.db, &self.owner, &self.name);
-        let key = dml::Key::new(&st.cols, d.hidden, &d.pk.borrow());
-        let skip = d.hidden.map(|_| 0);
-        let mut out = vec![];
-        for (ri, row) in st.rows.iter().enumerate().filter(|(ri, r)| want(*ri) && !r.posted) {
-            let Row { cur, deleted, blobs, new, .. } = row;
-            let changed = |c: usize| *new || row.original()[c] != cur[c];
-            let cols: Vec<usize> = (0..st.cols.len())
-                .filter(|&c| Some(c) != skip && (blobs.contains_key(&c) || (changed(c) && dml::text_needs_bind(self.db, &st.cols[c], &cur[c]))))
-                .collect();
-            let binds = || {
-                cols.iter()
-                    .map(|c| match blobs.get(c) {
-                        Some(b) => Bind::Bytes(b.to_vec()),
-                        None => Bind::Text(cur[*c].as_deref().map(|s| rsqldev_core::lob::expand(s).into_owned()).unwrap_or_default()),
-                    })
-                    .collect::<Vec<_>>()
-            };
-            match (new, deleted) {
-                (true, true) => {}
-                (true, false) => out.push(Stmt { row: ri, sql: dml::insert(self.db, &table, &st.cols, skip, cur, &cols), binds: binds() }),
-                (false, true) => out.push(Stmt { row: ri, sql: dml::delete(self.db, &table, &st.cols, &key, row.original()), binds: vec![] }),
-                (false, false) if row.dirty() => out.extend(dml::update(self.db, &table, &st.cols, &key, skip, row.original(), cur, &cols).map(|sql| Stmt { row: ri, sql, binds: binds() })),
-                (false, false) => {}
-            }
-        }
-        out
-    }
-
-    fn log(&self, line: &str) {
-        if let Some(d) = &self.data {
-            d.log.append_text(&format!("{line}\n"));
-        }
-    }
-
     /// Commit Changes (F11): post every pending row, then COMMIT.
     pub fn commit(&self) {
-        let Some(d) = &self.data else { return };
-        if d.busy.get() {
-            return;
-        }
-        let stmts = self.pending_dml(|_| true);
-        if stmts.is_empty() && !d.posted.get() {
-            return;
-        }
-        d.busy.set(true);
-        self.post(stmts, 0, true);
-    }
-
-    /// "Post edits on row change": the row the cursor left goes to the database now.
-    fn post_row(&self, r: usize) {
-        let Some(d) = &self.data else { return };
-        if d.busy.get() {
-            return;
-        }
-        let stmts = self.pending_dml(|i| i == r);
-        if stmts.is_empty() {
-            return;
-        }
-        d.busy.set(true);
-        self.post(stmts, 0, false);
-    }
-
-    /// Run `stmts` in order on the worksheet session, logging each; then COMMIT (`commit`) or
-    /// mark the rows posted. The first error rolls the whole batch back.
-    fn post(&self, stmts: Vec<Stmt>, i: usize, commit: bool) {
-        let me = self.me.clone();
-        if i == stmts.len() {
-            if !commit {
-                let d = self.data.as_ref().unwrap();
-                d.busy.set(false);
-                d.posted.set(true);
-                let rows: Vec<usize> = stmts.iter().map(|s| s.row).collect();
-                d.grid.mark_posted(&rows);
-                return;
-            }
-            return Conn::tx(&self.conn, Cmd::Commit, move |r| {
-                let Some(me) = me.upgrade() else { return };
-                let d = me.data.as_ref().unwrap();
-                d.busy.set(false);
-                match r {
-                    Ok(_) => {
-                        me.log("Commit Successful");
-                        me.load_data();
-                        d.status.set_label(&format!("Commit successful: {} statement(s)", stmts.len()));
-                    }
-                    Err(e) => {
-                        me.log(&format!("Commit failed: {e}"));
-                        crate::ui::error(&me.panel, &e)
-                    }
-                }
-            });
-        }
-        if i == 0 && crate::app().prefs().autocommit {
-            self.log("Autocommit is on: every statement is committed as it runs, Rollback cannot undo it.");
-        }
-        let Stmt { row, sql, binds } = stmts[i].clone();
-        self.log(&format!("{sql};"));
-        let run = sql.clone();
-        let done = move |r: Result<Option<u64>, String>| {
-            let Some(me) = me.upgrade() else { return };
-            let fail = |msg: String| {
-                let d = me.data.as_ref().unwrap();
-                d.busy.set(false);
-                d.posted.set(false);
-                me.log(&format!("Row {}: {msg}", row + 1));
-                me.log("Rollback Done");
-                crate::ui::error(&me.panel, &format!("One error saving changes to table {}:\nRow {}: {msg}\n\n{sql}", me.name, row + 1));
-                Conn::tx(&me.conn, Cmd::Rollback, |_| {});
-            };
-            match r {
-                Ok(Some(0)) => fail("Data got committed in another/same session, cannot update row.".into()),
-                Ok(n) => {
-                    if let Some(n) = n {
-                        me.log(&format!("{n} row(s) affected"));
-                    }
-                    me.post(stmts, i + 1, commit)
-                }
-                Err(e) => fail(e),
-            }
-        };
-        if binds.is_empty() {
-            Conn::work_query(&self.conn, &run, move |r| done(r.map(|r| r.affected)));
-        } else {
-            Conn::work_binds(&self.conn, &run, binds, done);
+        if let Some(ed) = self.data.as_ref().and_then(|d| d.ed.get()) {
+            ed.commit();
         }
     }
 
-    /// Rollback Changes (F12): asks first when there is something to lose.
+    /// Rollback Changes (F12).
     pub fn rollback(&self) {
-        let Some(d) = &self.data else { return };
-        let pending = d.posted.get() || d.grid.st.borrow().rows.iter().any(|r| r.dirty());
-        if pending && !crate::ui::confirm(&self.panel, "Do you want to rollback changes ?") {
-            return;
+        if let Some(ed) = self.data.as_ref().and_then(|d| d.ed.get()) {
+            ed.rollback();
         }
-        let me = self.me.clone();
-        Conn::tx(&self.conn, Cmd::Rollback, move |_| {
-            if let Some(me) = me.upgrade() {
-                me.log("Rollback Done");
-                me.load_data();
-            }
-        });
     }
 
     /// Sort… : several columns, ASC / DESC, NULLS FIRST / LAST, re-queried with ORDER BY.
@@ -629,7 +483,7 @@ impl DataTab {
         s.add(&log, 0, SizerFlag::Expand, 0);
         log.show(dq.editable);
         p.set_sizer(s, true);
-        let d = DataTab { grid, filter, status, log, order: RefCell::default(), posted: Cell::new(false), pk: RefCell::default(), hidden: dq.hidden, editable: dq.editable, busy: Cell::new(false), buttons, import };
+        let d = DataTab { grid, filter, status, log, order: RefCell::default(), ed: Default::default(), hidden: dq.hidden, editable: dq.editable, buttons, import };
         (p, d)
     }
 }

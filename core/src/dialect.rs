@@ -688,7 +688,10 @@ pub fn pk_sql(db: Db, owner: &str, name: &str) -> Option<String> {
         Db::Postgres => "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey) WHERE i.indrelid = '{lq}'::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)",
         Db::Mysql => "SELECT column_name FROM information_schema.key_column_usage WHERE table_schema = '{o}' AND table_name = '{n}' AND constraint_name = 'PRIMARY' ORDER BY ordinal_position",
         Db::Mssql => "SELECT c.name FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE i.is_primary_key = 1 AND i.object_id = OBJECT_ID('{lq}') ORDER BY ic.key_ordinal",
-        _ => return None,
+        Db::Oracle => "SELECT cc.column_name FROM all_constraints c JOIN all_cons_columns cc ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name WHERE c.owner = '{o}' AND c.table_name = '{n}' AND c.constraint_type = 'P' ORDER BY cc.position",
+        Db::Sqlite => "SELECT name FROM pragma_table_info('{n}', '{o}') WHERE pk > 0 ORDER BY pk",
+        Db::Duckdb => "SELECT unnest(constraint_column_names) FROM duckdb_constraints() WHERE schema_name = '{o}' AND table_name = '{n}' AND constraint_type = 'PRIMARY KEY'",
+        Db::Clickhouse => return None,
     };
     Some(fill(db, tpl, owner, name))
 }

@@ -234,6 +234,19 @@ impl ResultGrid {
         self.grid.enable_editing(editable);
     }
 
+    /// Turn editing on (or off) for the rows already loaded and those still to come.
+    pub fn set_editable(&self, on: bool) {
+        self.st.borrow_mut().editable = on;
+        let g = self.grid;
+        g.enable_editing(on);
+        let st = self.st.borrow();
+        g.begin_batch();
+        for ri in 0..st.rows.len() {
+            Self::fill_row(g, &st, ri);
+        }
+        g.end_batch();
+    }
+
     /// Show a complete result.
     pub fn set(&self, cols: Vec<Column>, rows: Vec<Vec<Cell>>) {
         self.reset();
