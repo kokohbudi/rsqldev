@@ -130,7 +130,7 @@ impl Worksheet {
             }
             t
         };
-        let (qp, qs, qb, status) = pane(&bottom, &[("refresh", "Refresh (re-run)"), ("export", "Export…")]);
+        let (qp, qs, qb, status) = pane(&bottom, &[("refresh", "Refresh (re-run)"), ("export", "Export…"), ("edit", "View / Edit Value… (Alt+Enter)")]);
         let results = ResultGrid::new(&qp);
         results.st.borrow_mut().db = Some(conn.borrow().kind);
         qs.add(&results.grid, 1, SizerFlag::Expand, 0);
@@ -211,6 +211,7 @@ impl Worksheet {
             (b_cancel, Worksheet::cancel),
             (qb[0], Worksheet::rerun),
             (qb[1], |w| w.results.export_dialog()),
+            (qb[2], |w| w.results.edit_value()),
             (sb[0], |w| w.script_out.clear()),
             (sb[1], |w| save_text(&w.panel, &w.script_out.get_value())),
             (db[0], |w| w.set_output(true)),

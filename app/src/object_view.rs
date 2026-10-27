@@ -44,7 +44,7 @@ struct DataTab {
     ed: std::cell::OnceCell<Rc<crate::data_editor::Editor>>,
     hidden: Option<&'static str>,
     editable: bool,
-    buttons: [BitmapButton; 5],
+    buttons: [BitmapButton; 6],
     import: BitmapButton,
 }
 
@@ -221,7 +221,7 @@ impl ObjectView {
                 me.sort_dialog()
             }
         }));
-        let acts: [fn(&ObjectView); 5] = [ObjectView::insert_row, ObjectView::delete_rows, ObjectView::commit, ObjectView::rollback, ObjectView::refresh_data];
+        let acts: [fn(&ObjectView); 6] = [ObjectView::insert_row, ObjectView::delete_rows, ObjectView::edit_value, ObjectView::commit, ObjectView::rollback, ObjectView::refresh_data];
         for (b, f) in d.buttons.iter().zip(acts) {
             let me = self.me.clone();
             b.on_click(move |_| {
@@ -438,6 +438,13 @@ Review them in the grid, then Commit (F11) to insert.",
         }
     }
 
+    /// Edit Value (pencil, Alt+Enter) on the cursor cell.
+    pub fn edit_value(&self) {
+        if let Some(d) = &self.data {
+            d.grid.edit_value();
+        }
+    }
+
     /// The Data tab is the selected tab (keys F11, F12, Ctrl+I, Ctrl+D, Ctrl+R, paste go to it).
     pub fn data_active(&self) -> bool {
         let sel = self.nb.get_selection();
@@ -475,6 +482,7 @@ impl DataTab {
         let buttons = [
             mk("insertrow", "Insert Row (Ctrl+I)"),
             mk("deleterow", "Delete Selected Row(s) (Ctrl+D)"),
+            mk("edit", "Edit Value… (Alt+Enter): long text, dates, LOBs"),
             mk("commit", "Commit Changes (F11)"),
             mk("rollback", "Rollback Changes (F12)"),
             refresh,

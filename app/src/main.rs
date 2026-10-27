@@ -107,6 +107,7 @@ const ID_DP_EXPORT: i32 = ID_HIGHEST + 47;
 const ID_DP_IMPORT: i32 = ID_HIGHEST + 48;
 const ID_DP_JOBS: i32 = ID_HIGHEST + 49;
 const ID_INSERT_ROW: i32 = ID_HIGHEST + 50;
+const ID_EDIT_VALUE: i32 = ID_HIGHEST + 51;
 
 enum Page {
     Sheet(SheetRef),
@@ -675,6 +676,7 @@ impl App {
                 ID_COMMIT => o.commit(),
                 ID_ROLLBACK => o.rollback(),
                 ID_INSERT_ROW => o.insert_row(),
+                ID_EDIT_VALUE => o.edit_value(),
                 ID_CLEAR => o.delete_rows(),
                 ID_REPLACE => o.refresh_data(),
                 ID_PASTE if o.paste() => {}
@@ -812,6 +814,11 @@ impl App {
                         ID_FIND | ID_REPLACE => s.find.open(id == ID_REPLACE),
                         _ => s.find.next(id == ID_FIND_PREV),
                     }
+                }
+            }
+            ID_EDIT_VALUE => {
+                if let Some(s) = sheet {
+                    s.results.edit_value();
                 }
             }
             ID_FORMAT => {
@@ -994,6 +1001,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_COPY, "&Copy\tCtrl+C", "")
         .append_item(ID_PASTE, "&Paste\tCtrl+V", "")
         .append_item(ID_INSERT_ROW, "Insert &Row\tCtrl+I", "Data editor: new row after the cursor row")
+        .append_item(ID_EDIT_VALUE, "Edit &Value…\tAlt+Enter", "Result grid: the cursor cell in an editor (long text, date picker, LOB)")
         .append_item(ID_SELECTALL, "Select &All\tCtrl+A", "")
         .append_separator()
         .append_item(ID_COMPLETE, "Completion &Insight\tRawCtrl+Space", "Complete keywords, tables and columns")
@@ -1112,6 +1120,7 @@ Data tab (table editor)
   Delete Selected Row(s)   Ctrl/Cmd+D
   Refresh                  Ctrl/Cmd+R
   Paste cells              Ctrl/Cmd+V
+  Edit Value (pencil)      Alt+Enter (date picker for DATE / TIMESTAMP)
   Unshared Worksheet       Ctrl/Cmd+Shift+N
 
 Editor

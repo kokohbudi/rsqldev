@@ -167,6 +167,22 @@ impl ResultGrid {
         });
         let me = g.clone();
         grid.on_cell_changed(move |e| me.cell_edited(e.get_row(), e.get_col()));
+        // Double-click: cells that cannot be typed into (BLOB, LOB, long or multi-line text,
+        // read-only results) open the value editor; the rest edit in place.
+        let me = g.clone();
+        grid.on_cell_left_dclick(move |e| {
+            let (r, c) = (e.get_row(), e.get_col());
+            if r < 0 || c < 0 {
+                return;
+            }
+            if me.needs_popup(r as usize, c as usize) {
+                me.view_value(r as usize, c as usize);
+            } else {
+                // The handler takes the event (no skip in wxDragon): start the in-place editor.
+                me.grid.set_grid_cursor(r, c);
+                me.grid.enable_cell_edit_control(true);
+            }
+        });
         let me = g.clone();
         grid.on_label_right_click(move |e| {
             if e.get_row() < 0 && e.get_col() >= 0 {
@@ -843,7 +859,8 @@ impl ResultGrid {
             b = b.append_item(ID_COUNT, "Count Rows", "Count every row of the result on the server, without fetching them");
         }
         if r >= 0 && c >= hidden {
-            b = b.append_item(ID_VIEW_VALUE, "View Value…", "Show the whole value: long text, BLOB as image / text / hex");
+            let label = if editable { "Edit Value…\tAlt+Enter" } else { "View Value…\tAlt+Enter" };
+            b = b.append_item(ID_VIEW_VALUE, label, "The whole value in an editor: long text, dates (date picker), BLOB as image / text / hex");
             b = b.append_item(ID_SAVE_VALUE, "Save Value to File…", "Write this cell (BLOB bytes or text) to a file");
             if editable {
                 b = b.append_item(ID_LOAD_VALUE, "Load Value from File…", "Replace this cell with a file's contents; Commit to post");
@@ -972,6 +989,27 @@ impl ResultGrid {
             crate::value::Outcome::Load => self.load_value(r, c),
             crate::value::Outcome::Keep => {}
         }
+    }
+
+    /// Edit Value (pencil, Alt+Enter): the value editor for the cursor cell.
+    pub fn edit_value(&self) {
+        let (r, c) = (self.grid.get_grid_cursor_row(), self.grid.get_grid_cursor_col());
+        let (n, hidden) = {
+            let st = self.st.borrow();
+            (st.rows.len() as i32, st.hidden as i32)
+        };
+        if r >= 0 && r < n && c >= hidden {
+            self.grid.save_edit_control_value();
+            self.view_value(r as usize, c as usize);
+        }
+    }
+
+    /// The cell is better edited in the popup than in place.
+    fn needs_popup(&self, r: usize, c: usize) -> bool {
+        let st = self.st.borrow();
+        let (Some(row), Some(col)) = (st.rows.get(r), st.cols.get(c)) else { return false };
+        let long = row.cur[c].as_deref().is_some_and(|v| v.contains('\n') || v.len() > 200 || rsqldev_core::lob::display(v) != v);
+        !Self::cell_editable(&st, r, c) || rsqldev_core::is_binary(&col.type_name) || long
     }
 
     /// Find in Results: case-insensitive, over the fetched (and not filtered-out) rows, from the
