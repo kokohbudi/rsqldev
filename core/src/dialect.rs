@@ -879,9 +879,45 @@ pub fn fold(db: Db, ident: &str) -> String {
     }
 }
 
+/// One Sort… key: column name, descending, nulls first (None = engine default).
+pub type SortKey = (String, bool, Option<bool>);
+
+/// ` ORDER BY ...` for the data editor's Sort… dialog; empty for no keys. NULLS FIRST / LAST
+/// only where the engine has it.
+pub fn order_by(db: Db, keys: &[SortKey]) -> String {
+    if keys.is_empty() {
+        return String::new();
+    }
+    let nulls_ok = !matches!(db, Db::Mysql | Db::Mssql);
+    let parts: Vec<String> = keys
+        .iter()
+        .map(|(c, desc, nulls)| {
+            let mut p = quote(db, c);
+            if *desc {
+                p += " DESC";
+            }
+            match nulls {
+                Some(true) if nulls_ok => p += " NULLS FIRST",
+                Some(false) if nulls_ok => p += " NULLS LAST",
+                _ => {}
+            }
+            p
+        })
+        .collect();
+    format!(" ORDER BY {}", parts.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_order_by() {
+        let k = vec![("NAME".to_string(), false, Some(false)), ("id".to_string(), true, None)];
+        assert_eq!(order_by(Db::Oracle, &k), r#" ORDER BY "NAME" NULLS LAST, "id" DESC"#);
+        assert_eq!(order_by(Db::Mysql, &k), " ORDER BY `NAME`, `id` DESC");
+        assert_eq!(order_by(Db::Postgres, &[]), "");
+    }
 
     #[test]
     fn top_sql_queries() {

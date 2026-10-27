@@ -43,6 +43,8 @@ pub struct Prefs {
     pub editor_font: String,
     pub editor_font_size: i32,
     pub autocommit: bool,
+    /// Data editor: post a row's DML when the cursor leaves it (Commit then only commits).
+    pub post_on_row_change: bool,
     /// Applied to Oracle sessions after connect.
     pub nls_date_format: String,
     /// Per-OS custom client library folder by driver id (overrides download).
@@ -59,6 +61,7 @@ impl Default for Prefs {
             editor_font: if cfg!(windows) { "Consolas".into() } else { "Menlo".into() },
             editor_font_size: 12,
             autocommit: false,
+            post_on_row_change: false,
             nls_date_format: "DD-MON-RR".into(),
             client_dirs: BTreeMap::new(),
             theme: "light".into(),

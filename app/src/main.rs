@@ -19,6 +19,7 @@ mod icons;
 mod theme;
 mod object_view;
 mod prefs;
+mod record;
 mod sessions;
 mod snippets;
 mod table_editor;
@@ -103,6 +104,7 @@ const ID_TOPSQL: i32 = ID_HIGHEST + 46;
 const ID_DP_EXPORT: i32 = ID_HIGHEST + 47;
 const ID_DP_IMPORT: i32 = ID_HIGHEST + 48;
 const ID_DP_JOBS: i32 = ID_HIGHEST + 49;
+const ID_INSERT_ROW: i32 = ID_HIGHEST + 50;
 
 enum Page {
     Sheet(SheetRef),
@@ -608,6 +610,15 @@ impl App {
         self.frame.set_status_text(text, field);
     }
 
+    /// The selected tab's object viewer, when its Data tab is showing.
+    fn current_data(&self) -> Option<Rc<ObjectView>> {
+        let i = self.current()?;
+        match &self.pages.borrow()[i] {
+            Page::Obj(o) if o.data_active() => Some(o.clone()),
+            _ => None,
+        }
+    }
+
     fn current_sheet(&self) -> Option<SheetRef> {
         let i = self.current()?;
         match &self.pages.borrow()[i] {
@@ -652,6 +663,24 @@ impl App {
     pub fn menu(&self, id: i32) -> bool {
         let sheet = self.current_sheet();
         let editor_focus = sheet.as_ref().is_some_and(|s| s.editor.has_focus());
+        // Data editor keys (SQL Developer): F11 / F12 commit / rollback, Ctrl+I insert row,
+        // Ctrl+D delete rows, Ctrl+R refresh, Ctrl+V paste cells.
+        if let Some(o) = self.current_data() {
+            match id {
+                ID_COMMIT => o.commit(),
+                ID_ROLLBACK => o.rollback(),
+                ID_INSERT_ROW => o.insert_row(),
+                ID_CLEAR => o.delete_rows(),
+                ID_REPLACE => o.load_data(),
+                ID_PASTE if o.paste() => {}
+                _ => return self.menu_rest(id, sheet, editor_focus),
+            }
+            return true;
+        }
+        self.menu_rest(id, sheet, editor_focus)
+    }
+
+    fn menu_rest(&self, id: i32, sheet: Option<SheetRef>, editor_focus: bool) -> bool {
         match id {
             ID_NEW_CONN | ID_NEW => self.new_connection(),
             ID_IMPORT_CONNS => self.import_connections(),
@@ -959,6 +988,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_CUT, "Cu&t\tCtrl+X", "")
         .append_item(ID_COPY, "&Copy\tCtrl+C", "")
         .append_item(ID_PASTE, "&Paste\tCtrl+V", "")
+        .append_item(ID_INSERT_ROW, "Insert &Row\tCtrl+I", "Data editor: new row after the cursor row")
         .append_item(ID_SELECTALL, "Select &All\tCtrl+A", "")
         .append_separator()
         .append_item(ID_COMPLETE, "Completion &Insight\tRawCtrl+Space", "Complete keywords, tables and columns")
@@ -1067,10 +1097,16 @@ const SHORTCUTS: &str = "Worksheet
   Explain Plan             F10
   Autotrace                F6
   Run PL/SQL               Ctrl/Cmd+F10
-  Commit / Rollback        F11 / F12
+  Commit / Rollback        F11 / F12 (also in a table's Data tab)
   Cancel                   Ctrl/Cmd+.
   SQL History              F8
   Clear                    Ctrl/Cmd+D
+
+Data tab (table editor)
+  Insert Row               Ctrl/Cmd+I
+  Delete Selected Row(s)   Ctrl/Cmd+D
+  Refresh                  Ctrl/Cmd+R
+  Paste cells              Ctrl/Cmd+V
   Unshared Worksheet       Ctrl/Cmd+Shift+N
 
 Editor
