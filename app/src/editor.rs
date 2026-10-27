@@ -118,6 +118,7 @@ pub fn new_editor(parent: &dyn WxWidget, font_face: &str, font_size: i32) -> Sty
     // A key-up missed while another window had focus must not leave the links on.
     stc.on_kill_focus(move |e| {
         toggle(false);
+        stc.call_tip_cancel();
         e.skip(true);
     });
     let (s1, b1) = (styled.clone(), busy.clone());

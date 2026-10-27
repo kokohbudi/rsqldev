@@ -182,6 +182,8 @@ pub struct InsertHint {
     pub table: String,
     pub columns: Option<Vec<String>>,
     pub arg: usize,
+    /// Caret in the column list (`INSERT INTO t (a, |`): the columns already written there.
+    pub written: Option<Vec<String>>,
 }
 
 /// [`InsertHint`] for the caret at byte `pos` of statement `sql`, in a VALUES tuple or in the
@@ -248,11 +250,15 @@ pub fn insert_hint(sql: &str, pos: usize) -> Option<InsertHint> {
                 None
             };
             let (owner, table) = target(i)?;
-            return Some(InsertHint { owner, table, columns, arg });
+            return Some(InsertHint { owner, table, columns, arg, written: None });
         }
         // `INSERT INTO t (a, b, |`: the table's columns, in order.
         if let Some((owner, table)) = o.checked_sub(1).and_then(target) {
-            return Some(InsertHint { owner, table, columns: None, arg });
+            let written = t[o + 1..].split(|x| *x == Tok::Punct(',')).filter_map(|c| match c.last() {
+                Some(Tok::Word(w)) => Some(w.clone()),
+                _ => None,
+            });
+            return Some(InsertHint { owner, table, columns: None, arg, written: Some(written.collect()) });
         }
     }
     None
@@ -389,7 +395,9 @@ mod tests {
     fn insert_hint_in_the_column_list_offers_the_table_columns() {
         let h = hint("insert into hr.account_hist_dtl(|").unwrap();
         assert_eq!((h.owner.as_deref(), h.table.as_str(), h.columns, h.arg), (Some("hr"), "account_hist_dtl", None, 0));
-        assert_eq!(hint("insert into emp (id,\n name, |").map(|h| h.arg), Some(2));
+        let h = hint("insert into emp (id,\n name, |").unwrap();
+        assert_eq!((h.arg, h.written), (2, Some(vec!["id".to_string(), "name".into()])));
+        assert_eq!(hint("insert into emp values (1, |").unwrap().written, None);
     }
 
     #[test]

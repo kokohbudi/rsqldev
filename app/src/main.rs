@@ -1371,6 +1371,15 @@ fn start(prefs0: config::Prefs) {
                 e.skip(true);
             }
         });
+        // A call tip is its own floating window: it must not stay over other apps.
+        frame.on_activate(|e| {
+            if let WindowEventData::Activate(a) = &e {
+                if !a.is_active() {
+                    complete::cancel_tip();
+                }
+            }
+            e.skip(true);
+        });
         frame.on_close(move |e| {
             let app = app();
             app.save_history();
@@ -1505,6 +1514,15 @@ fn selftest(name: String) {
                 }
                 17 if !complete::tip_text().is_empty() || el > 130.0 => {
                     eprintln!("SELFTEST insert tip: {:?} active={}", complete::tip_text(), ws.editor.call_tip_active());
+                    // Column list: the columns not written yet pop up by themselves.
+                    ws.editor.set_text("insert into rsq_edit (id, ");
+                    ws.editor.goto_pos(ws.editor.get_length());
+                    complete::typed(ws.editor, &ws.conn(), ' ');
+                    step = 18;
+                }
+                18 if ws.editor.auto_comp_active() || el > 140.0 => {
+                    eprintln!("SELFTEST column popup active={} tip={:?}", ws.editor.auto_comp_active(), complete::tip_text());
+                    ws.editor.auto_comp_cancel();
                     ws.editor.set_text("drop table rsq_edit");
                     ws.run_statement();
                     step = 20;
