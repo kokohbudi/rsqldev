@@ -1,5 +1,6 @@
-# Push a tag like v0.3.0: build.yml makes the packages (reusing the platform caches), then they
-# are published as a GitHub Release.
+# Push a tag like v0.3.0 (after pushing main): the packages of main's build run for the same
+# commit are published as a GitHub Release, without compiling them a second time. A tag on a
+# commit main never built falls back to building here (build.yml, reusing the platform caches).
 name: release
 on:
   push:
@@ -8,18 +9,56 @@ on:
 permissions:
   contents: read
 jobs:
+  find:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.find.outputs.run }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # main's run appears seconds after the push that precedes the tag; then wait for it.
+          for i in $(seq 1 240); do
+            json=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build.yml --branch main --commit "$GITHUB_SHA" --limit 1 --json databaseId,status,conclusion)
+            id=$(jq -r '.[0].databaseId // empty' <<<"$json")
+            if [ -z "$id" ] && [ "$i" -ge 8 ]; then
+              echo "main has no build of $GITHUB_SHA: building here"
+              exit 0
+            fi
+            if [ -n "$id" ] && [ "$(jq -r '.[0].status' <<<"$json")" = completed ]; then
+              echo "main build $id: $(jq -r '.[0].conclusion' <<<"$json")"
+              echo "run=$id" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "main build of $GITHUB_SHA did not finish within an hour"
+          exit 1
+
   build:
+    needs: find
+    if: ${{ needs.find.outputs.run == '' }}
     uses: ./.github/workflows/build.yml
 
   publish:
-    needs: build
+    needs: [find, build]
     # Publish when macOS and Windows built; a failed Linux architecture is just left out.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.find.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     steps:
-      - uses: actions/download-artifact@v4
+      - if: ${{ needs.find.outputs.run != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ needs.find.outputs.run }}
+          github-token: ${{ github.token }}
+      - if: ${{ needs.find.outputs.run == '' }}
+        uses: actions/download-artifact@v4
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
