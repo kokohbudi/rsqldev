@@ -31,6 +31,24 @@ pub fn hex_dump(b: &[u8], limit: usize) -> String {
     out
 }
 
+/// DATE / TIMESTAMP / DATETIME columns without a time zone get the date picker.
+fn date_type(t: &str) -> bool {
+    let t = t.to_uppercase();
+    (t.contains("DATE") || t.contains("TIMESTAMP")) && !t.contains("ZONE") && !t.contains("TZ") && !t.contains("OFFSET")
+}
+
+/// `YYYY-MM-DD[ T]HH:MI[:SS]` → components (fraction ignored).
+fn parse_dt(s: &str) -> Option<(i32, u16, i16, i16, i16, i16)> {
+    let s = s.trim();
+    let (d, t) = s.split_once([' ', 'T']).unwrap_or((s, ""));
+    let mut dp = d.split('-').map(|x| x.parse::<i32>().ok());
+    let (y, m, day) = (dp.next()??, dp.next()??, dp.next()??);
+    let mut tp = t.split(':').map(|x| x.split('.').next().unwrap_or("").parse::<i32>().ok());
+    let mut part = || tp.next().flatten().unwrap_or(0) as i16;
+    let (h, mi, sec) = (part(), part(), part());
+    (d.len() == 10 && (1..=12).contains(&m)).then_some((y, m as u16, day as i16, h, mi, sec))
+}
+
 /// `bytes` is set for binary columns (staged upload or decoded cell); `text` for the rest.
 pub fn show(parent: &dyn WxWidget, col: &Column, text: Option<&str>, bytes: Option<&[u8]>, editable: bool) -> Outcome {
     let dlg = Dialog::builder(parent, &format!("View Value: {}", col.name))
@@ -105,6 +123,28 @@ pub fn show(parent: &dyn WxWidget, col: &Column, text: Option<&str>, bytes: Opti
         None => body.set_value(text.unwrap_or("")),
     }
 
+    if editable && bytes.is_none() && date_type(&col.type_name) {
+        // Date picker (SQL Developer's cell editor): Set writes an ISO value into the text.
+        let (y, m, d, h, mi, sec) = text.and_then(parse_dt).unwrap_or_else(|| {
+            let n = DateTime::now();
+            (n.year(), n.month(), n.day(), 0, 0, 0)
+        });
+        let row = BoxSizer::builder(Orientation::Horizontal).build();
+        let date = DatePickerCtrl::builder(&dlg).with_value(Some(DateTime::new(y, m, d, 0, 0, 0))).build();
+        let time = TimePickerCtrl::builder(&dlg).with_value(Some(DateTime::new(2000, 1, 1, h, mi, sec))).build();
+        let set = Button::builder(&dlg).with_label("Set").build();
+        set.on_click(move |_| {
+            let (d, t) = (date.get_value(), time.get_value());
+            body.set_value(&format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", d.year(), d.month(), d.day(), t.hour(), t.minute(), t.second()));
+            null.set_value(false);
+        });
+        row.add(&StaticText::builder(&dlg).with_label("Date:").build(), 0, SizerFlag::AlignCenterVertical | SizerFlag::Right, 6);
+        row.add(&date, 0, SizerFlag::AlignCenterVertical, 0);
+        row.add(&time, 0, SizerFlag::AlignCenterVertical | SizerFlag::Left, 6);
+        row.add(&set, 0, SizerFlag::AlignCenterVertical | SizerFlag::Left, 6);
+        s.add_sizer(&row, 0, SizerFlag::All, 8);
+    }
+
     let bs = BoxSizer::builder(Orientation::Horizontal).build();
     let btn = |label: &str, id: i32| {
         let b = Button::builder(&dlg).with_label(label).with_id(id).build();
@@ -139,6 +179,14 @@ pub fn show(parent: &dyn WxWidget, col: &Column, text: Option<&str>, bytes: Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dates() {
+        assert_eq!(super::parse_dt("2026-10-27 13:04:05.123"), Some((2026, 10, 27, 13, 4, 5)));
+        assert_eq!(super::parse_dt("2026-01-02"), Some((2026, 1, 2, 0, 0, 0)));
+        assert_eq!(super::parse_dt("27-OCT-26"), None);
+        assert!(super::date_type("TIMESTAMP(6)") && super::date_type("datetime2") && !super::date_type("TIMESTAMP(6) WITH TIME ZONE") && !super::date_type("timestamptz"));
+    }
+
     #[test]
     fn dump() {
         let d = super::hex_dump(b"PK\x03\x04hello world!!!!!X", 1024);
