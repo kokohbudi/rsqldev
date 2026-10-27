@@ -208,7 +208,8 @@ impl ObjectView {
         }
         let st = d.status;
         d.grid.st.borrow_mut().on_change = Some(Rc::new(move |s| {
-            let pending = s.rows.iter().filter(|r| r.dirty()).count();
+            // Counting is O(rows): only once something was edited, not for every fetched batch.
+            let pending = if s.edited { s.rows.iter().filter(|r| r.dirty()).count() } else { 0 };
             let mut msg = format!("{} rows{}", s.rows.len(), if s.done { "" } else { "+" });
             if pending > 0 {
                 msg += &format!(" — {pending} pending change(s), Commit to post");
