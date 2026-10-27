@@ -89,13 +89,15 @@ fn via(k: rsqldev_core::registry::Kind) -> &'static str {
 pub fn show(parent: &Frame) {
     let dlg = Dialog::builder(parent, "Drivers").with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(820, 520).build();
     let list = ListCtrl::builder(&dlg).with_style(ListCtrlStyle::Report | ListCtrlStyle::SingleSel).build();
+    // Engine icons, as in the Connections tree.
+    list.set_image_list(crate::icons::tree_images(), 1 /* image_list_type::SMALL */);
     for (i, (h, w)) in [("Driver", 190), ("Category", 110), ("Connects via", 170), ("Status", 280)].iter().enumerate() {
         list.insert_column(i as i64, h, ListColumnFormat::Left, *w);
     }
     let fill = move || {
         list.delete_all_items();
         for (i, d) in registry::drivers().iter().enumerate() {
-            list.insert_item(i as i64, &d.label, None);
+            list.insert_item(i as i64, &d.label, Some(crate::icons::tree_index(&crate::icons::conn_icon(&d.id, false))));
             list.set_item_text_by_column(i as i64, 1, &d.category);
             list.set_item_text_by_column(i as i64, 2, via(d.backend));
             list.set_item_text_by_column(i as i64, 3, &status(d));

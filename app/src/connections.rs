@@ -432,10 +432,11 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let dlg = Dialog::builder(parent, "New / Select Database Connection").with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(900, 600).build();
 
     let list = ListCtrl::builder(&dlg).with_style(ListCtrlStyle::Report | ListCtrlStyle::SingleSel).build();
+    list.set_image_list(crate::icons::tree_images(), 1 /* image_list_type::SMALL */);
     list.insert_column(0, "Connection Name", ListColumnFormat::Left, 150);
     list.insert_column(1, "Connection Details", ListColumnFormat::Left, 200);
     for (i, c) in saved.iter().enumerate() {
-        list.insert_item(i as i64, &c.name, None);
+        list.insert_item(i as i64, &c.name, Some(crate::icons::tree_index(&crate::icons::conn_icon(&c.driver, false))));
         list.set_item_text_by_column(i as i64, 1, &details(c));
     }
 
