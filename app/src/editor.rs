@@ -275,21 +275,22 @@ fn highlight(stc: &StyledTextCtrl, styled: &std::cell::Cell<usize>, busy: &std::
     // Links need the statement's start (FROM may be lines above): restyle from the top then.
     // Aliases need their whole statement (the alias is defined after its first uses).
     let mut until = until;
+    while !text.is_char_boundary(until) {
+        until += 1;
+    }
     let mut aliases = true;
     if links {
         from = 0;
     } else {
-        let floor = from.saturating_sub(ALIAS_SPAN);
-        let mut at = from;
-        loop {
-            match text[floor..at].rfind(';') {
-                Some(k) if stc.get_style_at((floor + k) as i32) == S_DEFAULT => break from = floor + k + 1,
-                Some(k) => at = floor + k,
-                None => break aliases = floor == 0 && { from = 0; true },
-            }
+        match statement_start(stc, &text, from) {
+            Some(s) => from = s,
+            None => aliases = false,
         }
     }
-    let cap = (until + ALIAS_SPAN).min(len);
+    let mut cap = (until + ALIAS_SPAN).min(len);
+    while !text.is_char_boundary(cap) {
+        cap -= 1;
+    }
     match text[until..cap].find(';') {
         Some(k) => until += k + 1,
         None if cap == len => until = len,
@@ -308,6 +309,23 @@ fn highlight(stc: &StyledTextCtrl, styled: &std::cell::Cell<usize>, busy: &std::
     }
     busy.set(false);
     styled.set(end);
+}
+
+/// Start of the statement holding byte `pos`: just after the last real `;` (not in a string or
+/// comment) before it, or 0. None when that is more than [`ALIAS_SPAN`] back.
+pub fn statement_start(stc: &StyledTextCtrl, text: &str, pos: usize) -> Option<usize> {
+    let mut floor = pos.saturating_sub(ALIAS_SPAN);
+    while !text.is_char_boundary(floor) {
+        floor += 1;
+    }
+    let mut at = pos;
+    loop {
+        match text[floor..at].rfind(';') {
+            Some(k) if stc.get_style_at((floor + k) as i32) == S_DEFAULT => return Some(floor + k + 1),
+            Some(k) => at = floor + k,
+            None => return (floor == 0).then_some(0),
+        }
+    }
 }
 
 /// [`lex`], with object names marked [`S_LINK`] when `links` (Ctrl / Cmd held): the names after
