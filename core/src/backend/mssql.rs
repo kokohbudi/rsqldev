@@ -108,6 +108,7 @@ impl Backend for Ms {
             let mut s = c.simple_query(sql).await?;
             let mut b = Batcher::new(sink, fetch);
             let mut had_cols = false;
+            let mut abandoned = false;
             while let Some(item) = s.try_next().await? {
                 match item {
                     QueryItem::Metadata(m) if m.result_index() == 0 => {
@@ -121,17 +122,25 @@ impl Backend for Ms {
                             })
                             .collect();
                         if !b.columns(cols) {
-                            return Ok(None);
+                            abandoned = true;
+                            break;
                         }
                     }
                     QueryItem::Row(r) if r.result_index() == 0 => {
                         if !b.push(r.into_iter().map(text).collect()) {
-                            // ponytail: drains the rest of the stream on drop; no TDS attention/cancel in tiberius.
-                            return Ok(None);
+                            abandoned = true;
+                            break;
                         }
                     }
                     _ => {}
                 }
+            }
+            drop(s);
+            if abandoned {
+                // The grid stopped reading: a TDS Attention stops the server sending the rest
+                // (otherwise the next request reads every remaining row first).
+                tokio::time::timeout(std::time::Duration::from_secs(10), c.cancel_query()).await.map_err(|_| anyhow::anyhow!("connection lost: no reply to the query cancel"))??;
+                return Ok(None);
             }
             if had_cols {
                 b.finish();
