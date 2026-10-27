@@ -30,6 +30,8 @@ pub struct Palette {
     pub ed_caret_line: u32,
     pub ed_margin: u32,
     pub ed_margin_text: u32,
+    /// Alias colours: an alias, its uses and what it stands for share one.
+    pub ed_alias: [u32; 8],
 }
 
 const LIGHT: Palette = Palette {
@@ -56,6 +58,7 @@ const LIGHT: Palette = Palette {
     ed_caret_line: 0xeef4fb,
     ed_margin: 0xf3f3f3,
     ed_margin_text: 0x8c8c8c,
+    ed_alias: [0xb35c00, 0x8e24aa, 0x00796b, 0xc2185b, 0x8d5524, 0x827717, 0xc62828, 0x5e35b1],
 };
 
 const DARK: Palette = Palette {
@@ -81,6 +84,7 @@ const DARK: Palette = Palette {
     ed_caret_line: 0x2a2d33,
     ed_margin: 0x2b2b2b,
     ed_margin_text: 0x8c8c8c,
+    ed_alias: [0xffa657, 0xd2a8ff, 0x56d4c0, 0xff7eb6, 0xe0b080, 0xd4d96a, 0xff8a80, 0xb39ddb],
 };
 
 /// Resolved once: Preferences theme, "system" follows the OS.

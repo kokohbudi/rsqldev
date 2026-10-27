@@ -11,6 +11,12 @@ const S_KEYWORD: i32 = 4;
 const S_IDENT_Q: i32 = 5;
 /// Object names while Ctrl / Cmd is held: blue, underlined, clickable (Ctrl+Click opens them).
 const S_LINK: i32 = 6;
+/// Alias colours 8..15 (an alias, its uses and what it stands for share one); 16..23 are the
+/// same colours underlined, for aliases while Ctrl / Cmd is held.
+const S_ALIAS0: i32 = 8;
+const ALIAS_COLOURS: i32 = 8;
+/// ponytail: aliases are found only in statements up to 64 KB (one rescan per keystroke stays cheap).
+const ALIAS_SPAN: usize = 64 * 1024;
 pub const MARK_ERROR: i32 = 1;
 pub const MARK_BOOKMARK: i32 = 2;
 // Scintilla STYLE_BRACELIGHT / STYLE_BRACEBAD.
@@ -48,6 +54,12 @@ pub fn new_editor(parent: &dyn WxWidget, font_face: &str, font_size: i32) -> Sty
     stc.style_set_foreground(S_IDENT_Q, rgb(fg));
     stc.style_set_foreground(S_LINK, rgb(p.link));
     stc.style_set_underline(S_LINK, true);
+    for (i, c) in p.ed_alias.iter().enumerate() {
+        let i = i as i32;
+        stc.style_set_foreground(S_ALIAS0 + i, rgb(*c));
+        stc.style_set_foreground(S_ALIAS0 + ALIAS_COLOURS + i, rgb(*c));
+        stc.style_set_underline(S_ALIAS0 + ALIAS_COLOURS + i, true);
+    }
     // Lines with PL/SQL compilation errors: tinted background.
     stc.marker_define_symbol(MARK_ERROR, MarkerSymbol::Background, rgb(p.deleted_bg), rgb(p.deleted_bg));
     stc.marker_define_symbol(MARK_BOOKMARK, MarkerSymbol::RoundRect, rgb(p.accent), rgb(p.accent));
@@ -238,13 +250,36 @@ fn highlight(stc: &StyledTextCtrl, styled: &std::cell::Cell<usize>, busy: &std::
         from = text[..from - 1].rfind('\n').map_or(0, |i| i + 1);
     }
     // Links need the statement's start (FROM may be lines above): restyle from the top then.
+    // Aliases need their whole statement (the alias is defined after its first uses).
+    let mut until = until;
+    let mut aliases = true;
     if links {
         from = 0;
+    } else {
+        let floor = from.saturating_sub(ALIAS_SPAN);
+        let mut at = from;
+        loop {
+            match text[floor..at].rfind(';') {
+                Some(k) if stc.get_style_at((floor + k) as i32) == S_DEFAULT => break from = floor + k + 1,
+                Some(k) => at = floor + k,
+                None => break aliases = floor == 0 && { from = 0; true },
+            }
+        }
+    }
+    let cap = (until + ALIAS_SPAN).min(len);
+    match text[until..cap].find(';') {
+        Some(k) => until += k + 1,
+        None if cap == len => until = len,
+        None => aliases = false,
+    }
+    let mut toks = lex_links(&text, from, until, links);
+    if aliases {
+        alias_styles(&text, from, &mut toks, links);
     }
     busy.set(true);
     stc.start_styling(from as i32);
     let mut end = from;
-    for (n, style) in lex_links(&text, from, until, links) {
+    for (n, style) in toks {
         stc.set_styling(n as i32, style);
         end += n;
     }
@@ -296,6 +331,186 @@ fn lex_links(text: &str, from: usize, until: usize, links: bool) -> Vec<(usize, 
         }
     }
     toks
+}
+
+/// One alias of a statement: its definition and the tokens it stands for (indices into the
+/// statement's significant tokens).
+struct Alias {
+    name: String,
+    def: usize,
+    target: (usize, usize),
+    /// Subquery / CTE: only its brackets take the colour.
+    parens: bool,
+    /// CTE name: bare uses (`from q`) count, not only `q.col`.
+    cte: bool,
+}
+
+/// Words the lexer leaves unstyled that are still not aliases.
+const NOT_ALIAS: &[&str] = &["APPLY", "CONNECT", "FORCE", "IGNORE", "LATERAL", "MODEL", "NATURAL", "PIVOT", "SAMPLE", "START", "STRAIGHT_JOIN", "UNPIVOT", "USE", "WINDOW"];
+
+/// Significant token: (text, style, index into the token list, byte offset).
+type Sig<'a> = (&'a str, i32, usize, usize);
+
+/// Non-blank, non-comment tokens of `toks` (lexed from byte `from`).
+fn significant<'a>(text: &'a str, from: usize, toks: &[(usize, i32)]) -> Vec<Sig<'a>> {
+    let mut at = from;
+    let mut out = vec![];
+    for (i, (n, style)) in toks.iter().enumerate() {
+        let t = &text[at..at + n];
+        if *style != S_COMMENT && !t.trim().is_empty() {
+            out.push((t, *style, i, at));
+        }
+        at += n;
+    }
+    out
+}
+
+fn is_ident(t: &Sig) -> bool {
+    t.1 == S_IDENT_Q || t.1 == S_LINK || (t.1 == S_DEFAULT && t.0.starts_with(|c: char| c.is_alphabetic() || c == '_'))
+}
+
+/// Name as the database compares it: quoted kept, unquoted upper-cased.
+fn alias_name(t: &str) -> String {
+    match t.as_bytes().first() {
+        Some(b'"' | b'`') => t[1..t.len().saturating_sub(1).max(1)].to_string(),
+        _ => t.to_ascii_uppercase(),
+    }
+}
+
+/// Aliases of one statement: `[owner.]table [AS] a` and `(subquery) [AS] a` after FROM / JOIN /
+/// UPDATE / INTO / USING and commas of a FROM list, and `WITH name AS (...)`.
+fn find_aliases(sig: &[Sig]) -> Vec<Alias> {
+    let n = sig.len();
+    let ident = |i: usize| i < n && is_ident(&sig[i]);
+    let kw = |i: usize| (i < n && sig[i].1 == S_KEYWORD).then(|| sig[i].0.to_ascii_uppercase());
+    let is = |i: usize, p: &str| i < n && sig[i].0 == p;
+    let mut close = vec![usize::MAX; n];
+    let mut open = vec![];
+    for i in 0..n {
+        if is(i, "(") {
+            open.push(i);
+        } else if is(i, ")") {
+            if let Some(o) = open.pop() {
+                close[o] = i;
+            }
+        }
+    }
+    // `[AS] name` right after an item ending at `end`.
+    let alias_after = |end: usize| {
+        let k = if kw(end + 1).as_deref() == Some("AS") { end + 2 } else { end + 1 };
+        (ident(k) && !is(k + 1, ".") && !is(k + 1, "(") && NOT_ALIAS.binary_search(&sig[k].0.to_ascii_uppercase().as_str()).is_err()).then_some(k)
+    };
+    let mut out = vec![];
+    let (mut expect, mut in_from, mut cte) = (false, false, false);
+    // Per open bracket: the outer `in_from`, and the bracket itself when it opens a FROM subquery.
+    let mut stack: Vec<(bool, Option<usize>)> = vec![];
+    let mut cte_ends = vec![];
+    let mut i = 0;
+    while i < n {
+        if let Some(k) = kw(i) {
+            match k.as_str() {
+                "FROM" | "JOIN" => (expect, in_from) = (true, true),
+                "UPDATE" | "INTO" | "USING" => (expect, in_from) = (true, false),
+                "WITH" => (expect, in_from, cte) = (false, false, true),
+                _ => (expect, in_from) = (false, false),
+            }
+        } else if cte && ident(i) {
+            cte = false;
+            let mut j = i + 1;
+            if is(j, "(") && close[j] != usize::MAX {
+                j = close[j] + 1;
+            }
+            if kw(j).as_deref() == Some("AS") {
+                j += 1;
+                // [NOT] MATERIALIZED
+                while j < n && !is(j, "(") && (ident(j) || kw(j).as_deref() == Some("NOT")) {
+                    j += 1;
+                }
+                if is(j, "(") && close[j] != usize::MAX {
+                    out.push(Alias { name: alias_name(sig[i].0), def: i, target: (j, close[j]), parens: true, cte: true });
+                    cte_ends.push(close[j]);
+                }
+            }
+        } else if expect && ident(i) {
+            let start = i;
+            while is(i + 1, ".") && ident(i + 2) {
+                i += 2;
+            }
+            expect = false;
+            // A table function `f(...)` is skipped.
+            if let Some(k) = alias_after(i).filter(|_| !is(i + 1, "(")) {
+                out.push(Alias { name: alias_name(sig[k].0), def: k, target: (start, i), parens: false, cte: false });
+                i = k;
+            }
+        } else if is(i, "(") {
+            let sub = expect && matches!(kw(i + 1).as_deref(), Some("SELECT" | "WITH")) && close[i] != usize::MAX;
+            stack.push((in_from, sub.then_some(i)));
+            (expect, in_from) = (false, false);
+        } else if is(i, ")") {
+            let (f, sub) = stack.pop().unwrap_or((false, None));
+            in_from = f;
+            if let Some(k) = sub.and_then(|_| alias_after(i)) {
+                out.push(Alias { name: alias_name(sig[k].0), def: k, target: (sub.unwrap(), i), parens: true, cte: false });
+                i = k + 1;
+                continue;
+            }
+            cte = cte_ends.contains(&i) && is(i + 1, ",");
+        } else if is(i, ",") {
+            expect = in_from;
+        } else {
+            expect = false;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The alias that token `i` defines or uses (`a.col`, or a bare CTE name).
+fn alias_of(sig: &[Sig], aliases: &[Alias], i: usize) -> Option<usize> {
+    if !is_ident(&sig[i]) || (i > 0 && sig[i - 1].0 == ".") {
+        return None;
+    }
+    let name = alias_name(sig[i].0);
+    let dotted = sig.get(i + 1).is_some_and(|t| t.0 == ".");
+    aliases.iter().position(|a| a.def == i || (a.name == name && (dotted || a.cte)))
+}
+
+/// Colour every alias of each statement in `toks` (lexed from byte `from`): its definition, its
+/// uses and what it stands for share one of [`ALIAS_COLOURS`]. With `links`, aliases are
+/// underlined and table names keep their link style.
+fn alias_styles(text: &str, from: usize, toks: &mut [(usize, i32)], links: bool) {
+    let sig = significant(text, from, toks);
+    for stmt in sig.split(|t| t.0 == ";" && t.1 == S_DEFAULT) {
+        let aliases = find_aliases(stmt);
+        let colour = |n: usize| S_ALIAS0 + n as i32 % ALIAS_COLOURS;
+        for (n, a) in aliases.iter().enumerate() {
+            let (t0, t1) = a.target;
+            for t in if a.parens { vec![t0, t1] } else { (t0..=t1).collect() } {
+                let tok = &mut toks[stmt[t].2];
+                if tok.1 != S_LINK {
+                    tok.1 = colour(n);
+                }
+            }
+        }
+        for i in 0..stmt.len() {
+            if let Some(n) = alias_of(stmt, &aliases, i) {
+                toks[stmt[i].2].1 = colour(n) + if links { ALIAS_COLOURS } else { 0 };
+            }
+        }
+    }
+}
+
+/// Ctrl+Click on an alias at byte `pos`: the byte range of what it stands for (the table name,
+/// or the subquery / CTE with its brackets).
+pub fn alias_target_at(text: &str, pos: usize) -> Option<(usize, usize)> {
+    let toks = lex(text, 0, text.len());
+    let sig = significant(text, 0, &toks);
+    let stmt = sig.split(|t| t.0 == ";" && t.1 == S_DEFAULT).find(|s| s.last().is_some_and(|t| t.3 + t.0.len() >= pos))?;
+    let i = stmt.iter().position(|t| t.3 <= pos && pos <= t.3 + t.0.len() && is_ident(t))?;
+    let aliases = find_aliases(stmt);
+    let a = &aliases[alias_of(stmt, &aliases, i)?];
+    let (t0, t1) = (&stmt[a.target.0], &stmt[a.target.1]);
+    Some((t0.3, t1.3 + t1.0.len()))
 }
 
 /// Tokens (byte length, style) from byte `from` (a token boundary) through the token that
@@ -407,6 +622,39 @@ mod tests {
         assert_eq!(styled(sql, &toks, S_LINK), vec!["hr", ".", "emp", "dept", "loc", "audit_log"]);
         // Without Ctrl the same text has no links.
         assert!(styled(sql, &lex_links(sql, 0, sql.len(), false), S_LINK).is_empty());
+    }
+
+    /// Texts styled with alias colour `i`.
+    fn alias_texts(sql: &str, i: i32) -> Vec<String> {
+        let mut toks = lex(sql, 0, sql.len());
+        alias_styles(sql, 0, &mut toks, false);
+        styled(sql, &toks, S_ALIAS0 + i)
+    }
+
+    #[test]
+    fn table_aliases_share_a_colour_with_their_table() {
+        let sql = "select e.x, d.y from hr.emp e join dept as d on d.id = e.d";
+        assert_eq!(alias_texts(sql, 0), vec!["e", "hr", ".", "emp", "e", "e"]);
+        assert_eq!(alias_texts(sql, 1), vec!["d", "dept", "d", "d"]);
+    }
+
+    #[test]
+    fn subquery_and_cte_aliases_colour_their_brackets() {
+        let sql = "with q as (select 1 a from dual) select q.a, s.n from q, (select 2 n from dual) s";
+        assert_eq!(alias_texts(sql, 0), vec!["q", "(", ")", "q", "q"]);
+        assert_eq!(alias_texts(sql, 1), vec!["s", "(", ")", "s"]);
+    }
+
+    #[test]
+    fn ctrl_click_on_an_alias_selects_what_it_stands_for() {
+        let sql = "select s.n, e.x from (select 2 n from dual) s, hr.emp e;\nselect 1 from dual";
+        let at = |needle: &str| sql.find(needle).unwrap();
+        let sub = "(select 2 n from dual)";
+        assert_eq!(alias_target_at(sql, at("s.n")), Some((at(sub), at(sub) + sub.len())));
+        assert_eq!(alias_target_at(sql, at("e.x")), Some((at("hr.emp"), at("hr.emp") + 6)));
+        // Not an alias: the table name itself, or text in another statement.
+        assert_eq!(alias_target_at(sql, at("emp e")), None);
+        assert_eq!(alias_target_at(sql, sql.len() - 2), None);
     }
 
     #[test]

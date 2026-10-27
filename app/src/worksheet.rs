@@ -281,14 +281,19 @@ impl Worksheet {
             }
             e.skip(true);
         });
-        // Ctrl+Click (Cmd+Click on macOS): open the object under the caret.
+        // Ctrl+Click (Cmd+Click on macOS): open the object under the caret, or select an alias's source.
         let w = Rc::downgrade(&ws);
         ws.editor.on_mouse_left_up(move |_| {
             let Some(w) = w.upgrade() else { return };
             if !wxdragon::utils::get_key_state(wxdragon::keycode::WXK_COMMAND) {
                 return;
             }
-            let ident = ident_at(&w.editor.get_text(), w.editor.get_current_pos() as usize);
+            let (text, pos) = (w.editor.get_text(), w.editor.get_current_pos() as usize);
+            // An alias: select what it stands for (the table, or the subquery / CTE).
+            if let Some((a, b)) = crate::editor::alias_target_at(&text, pos) {
+                return w.editor.set_selection(a as i32, b as i32);
+            }
+            let ident = ident_at(&text, pos);
             if !ident.is_empty() {
                 crate::app().goto_object(w.conn(), &ident);
             }
