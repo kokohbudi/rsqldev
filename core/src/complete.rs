@@ -392,6 +392,17 @@ mod tests {
     }
 
     #[test]
+    fn insert_hint_for_both_insert_forms() {
+        // Columns written: the tip lists them, the value under the caret picks one.
+        let h = hint("-- 1. Kolom ditulis\ninsert into account_hist_dtl (id, account_no, amount)\nvalues (1, 'A001', |5000);").unwrap();
+        assert_eq!((h.table.as_str(), h.arg), ("account_hist_dtl", 2));
+        assert_eq!(h.columns, Some(vec!["id".to_string(), "account_no".into(), "amount".into()]));
+        // No columns: all of the table's columns (fetched), same position rule.
+        let h = hint("-- 2. Tanpa kolom\ninsert into account_hist_dtl\nvalues (1, 'A001', 5000, sysdate, |'Y');").unwrap();
+        assert_eq!((h.table.as_str(), h.columns, h.arg), ("account_hist_dtl", None, 4));
+    }
+
+    #[test]
     fn insert_hint_in_the_column_list_offers_the_table_columns() {
         let h = hint("insert into hr.account_hist_dtl(|").unwrap();
         assert_eq!((h.owner.as_deref(), h.table.as_str(), h.columns, h.arg), (Some("hr"), "account_hist_dtl", None, 0));
