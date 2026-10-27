@@ -221,14 +221,28 @@ impl ObjectView {
                 me.sort_dialog()
             }
         }));
-        let acts: [fn(&ObjectView); 6] = [ObjectView::insert_row, ObjectView::delete_rows, ObjectView::edit_value, ObjectView::commit, ObjectView::rollback, ObjectView::refresh_data];
+        let (g, ed) = (d.grid.clone(), d.ed.get().cloned());
+        let grid_act = |f: fn(&ResultGrid)| -> Box<dyn Fn()> {
+            let g = g.clone();
+            Box::new(move || f(&g))
+        };
+        let ed_act = |f: fn(&crate::data_editor::Editor)| -> Box<dyn Fn()> {
+            let ed = ed.clone();
+            Box::new(move || ed.iter().for_each(|e| f(e)))
+        };
+        let me = self.me.clone();
+        let acts: [Box<dyn Fn()>; 6] = [
+            grid_act(ResultGrid::insert_row),
+            grid_act(ResultGrid::delete_selected_rows),
+            grid_act(ResultGrid::edit_value),
+            ed_act(|e| {
+                e.commit();
+            }),
+            ed_act(crate::data_editor::Editor::rollback),
+            Box::new(move || me.upgrade().iter().for_each(|v| v.refresh_data())),
+        ];
         for (b, f) in d.buttons.iter().zip(acts) {
-            let me = self.me.clone();
-            b.on_click(move |_| {
-                if let Some(me) = me.upgrade() {
-                    f(&me)
-                }
-            });
+            b.on_click(move |_| f());
         }
         let me = self.me.clone();
         d.import.on_click(move |_| {
@@ -282,20 +296,6 @@ impl ObjectView {
         d.grid.load(rows, d.hidden.map_or(0, |_| 1), d.editable);
         d.grid.st.borrow_mut().count = Conn::counter(&self.conn, &sql, d.status);
         d.grid.st.borrow_mut().resume = Conn::resume(&self.conn, &sql);
-    }
-
-    /// Commit Changes (F11): post every pending row, then COMMIT.
-    pub fn commit(&self) {
-        if let Some(ed) = self.data.as_ref().and_then(|d| d.ed.get()) {
-            ed.commit();
-        }
-    }
-
-    /// Rollback Changes (F12).
-    pub fn rollback(&self) {
-        if let Some(ed) = self.data.as_ref().and_then(|d| d.ed.get()) {
-            ed.rollback();
-        }
     }
 
     /// Sort… : several columns, ASC / DESC, NULLS FIRST / LAST, re-queried with ORDER BY.
@@ -426,28 +426,14 @@ Review them in the grid, then Commit (F11) to insert.",
         d.grid.fetch_all(move || g.append_new_rows(out));
     }
 
-    pub fn insert_row(&self) {
-        if let Some(d) = &self.data {
-            d.grid.insert_row();
-        }
-    }
-
-    pub fn delete_rows(&self) {
-        if let Some(d) = &self.data {
-            d.grid.delete_selected_rows();
-        }
-    }
-
-    /// Edit Value (pencil, Alt+Enter) on the cursor cell.
-    pub fn edit_value(&self) {
-        if let Some(d) = &self.data {
-            d.grid.edit_value();
-        }
-    }
-
-    /// The Data tab's grid (self-test).
+    /// The Data tab's grid (row actions, Edit Value).
     pub fn data_grid(&self) -> Option<ResultGrid> {
         self.data.as_ref().map(|d| d.grid.clone())
+    }
+
+    /// The Data tab's edit poster (Commit / Rollback); editable tables only.
+    pub fn editor(&self) -> Option<Rc<crate::data_editor::Editor>> {
+        self.data.as_ref().and_then(|d| d.ed.get().cloned())
     }
 
     /// The Data tab is the selected tab (keys F11, F12, Ctrl+I, Ctrl+D, Ctrl+R, paste go to it).

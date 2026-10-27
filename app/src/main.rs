@@ -674,11 +674,13 @@ impl App {
         // Ctrl+D delete rows, Ctrl+R refresh, Ctrl+V paste cells.
         if let Some(o) = self.current_data() {
             match id {
-                ID_COMMIT => o.commit(),
-                ID_ROLLBACK => o.rollback(),
-                ID_INSERT_ROW => o.insert_row(),
-                ID_EDIT_VALUE => o.edit_value(),
-                ID_CLEAR => o.delete_rows(),
+                ID_COMMIT => o.editor().iter().for_each(|e| {
+                    e.commit();
+                }),
+                ID_ROLLBACK => o.editor().iter().for_each(|e| e.rollback()),
+                ID_INSERT_ROW => o.data_grid().iter().for_each(grid::ResultGrid::insert_row),
+                ID_EDIT_VALUE => o.data_grid().iter().for_each(grid::ResultGrid::edit_value),
+                ID_CLEAR => o.data_grid().iter().for_each(grid::ResultGrid::delete_selected_rows),
                 ID_REPLACE => o.refresh_data(),
                 ID_PASTE if o.paste() => {}
                 _ => return self.menu_rest(id, sheet, editor_focus),
@@ -1450,7 +1452,9 @@ fn selftest(name: String) {
                         g.set_cell(2, name_col - 1, Some("3".into()));
                         g.set_cell(2, name_col, Some("c".into()));
                         eprintln!("SELFTEST data tab: {} rows, pending edits, commit", g.st.borrow().rows.len());
-                        v.commit();
+                        v.editor().iter().for_each(|e| {
+                            e.commit();
+                        });
                         step = 13;
                     } else if step == 13 && !g.st.borrow().rows.iter().any(|r| r.dirty()) && g.st.borrow().done {
                         eprintln!("SELFTEST data tab after commit: {:?}", g.st.borrow().rows.iter().map(|r| r.cur.iter().skip(g.st.borrow().hidden).cloned().collect::<Vec<_>>()).collect::<Vec<_>>());

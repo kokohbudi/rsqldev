@@ -20,7 +20,7 @@ impl Lite {
 }
 
 pub(crate) fn hex(b: &[u8]) -> String {
-    format!("0x{}", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+    format!("0x{}", crate::hex(b))
 }
 
 impl Backend for Lite {

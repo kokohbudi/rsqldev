@@ -39,11 +39,6 @@ fn sniff(data: &[u8]) -> u8 {
     [b',', b';', b'\t'].into_iter().max_by_key(|d| line.iter().filter(|b| *b == d).count()).unwrap_or(b',')
 }
 
-pub fn read_xlsx<R: std::io::Read + std::io::Seek>(r: R) -> Result<(Vec<String>, Vec<Vec<Cell>>)> {
-    let mut wb: calamine::Xlsx<R> = calamine::Reader::new(r)?;
-    sheet(&mut wb)
-}
-
 fn sheet<R: std::io::Read + std::io::Seek, W: calamine::Reader<R>>(wb: &mut W) -> Result<(Vec<String>, Vec<Vec<Cell>>)>
 where
     W::Error: std::error::Error + Send + Sync + 'static,

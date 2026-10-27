@@ -625,8 +625,7 @@ impl ResultGrid {
         let mut out = vec![];
         let blocks = self.grid.get_selected_blocks();
         let cursor = (self.grid.get_grid_cursor_row(), self.grid.get_grid_cursor_col());
-        let stale = blocks.len() == 1 && blocks[0].top_row == blocks[0].bottom_row && blocks[0].left_col == blocks[0].right_col && (blocks[0].top_row, blocks[0].left_col) != cursor;
-        if blocks.is_empty() || stale {
+        if blocks.is_empty() || (blocks.len() == 1 && stale(&blocks[0], cursor)) {
             out.push(cursor);
         } else {
             for b in &blocks {
@@ -1272,10 +1271,14 @@ impl WeakGrid {
 /// Rows Delete Row marks: whole selected rows plus every row of the selected blocks, else the
 /// cursor row. A lone 1x1 block away from the cursor is a stale auto-selection (the cursor was
 /// moved by code since): it is ignored, so the cursor row is marked instead.
+/// A lone 1x1 block away from the cursor: left over after code moved the cursor.
+fn stale(b: &GridBlockCoords, cursor: (i32, i32)) -> bool {
+    b.top_row == b.bottom_row && b.left_col == b.right_col && (b.top_row, b.left_col) != cursor
+}
+
 fn rows_to_mark(selected: Vec<i32>, blocks: &[GridBlockCoords], cursor: (i32, i32)) -> Vec<i32> {
-    let stale = |b: &GridBlockCoords| b.top_row == b.bottom_row && b.left_col == b.right_col && (b.top_row, b.left_col) != cursor;
     let mut rows = selected;
-    if !(rows.is_empty() && blocks.len() == 1 && stale(&blocks[0])) {
+    if !(rows.is_empty() && blocks.len() == 1 && stale(&blocks[0], cursor)) {
         for b in blocks {
             rows.extend(b.top_row..=b.bottom_row);
         }
