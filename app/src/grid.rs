@@ -21,6 +21,9 @@ pub struct Row {
     /// Inserted in the grid (not fetched).
     pub new: bool,
     pub deleted: bool,
+    /// Insert / delete already posted ("Post edits on row change"), waiting for Commit: the
+    /// row has no locator yet, so it stays read-only until the data is refreshed.
+    pub posted: bool,
     /// Files loaded into binary cells (column → bytes), posted as bind values on commit.
     pub blobs: HashMap<usize, Rc<Vec<u8>>>,
 }
@@ -72,7 +75,24 @@ pub struct State {
     find: String,
     /// Count every row of the result on the server (set by the worksheet / data tab).
     pub count: Option<Rc<dyn Fn()>>,
+    /// Sort… dialog re-querying with ORDER BY (set by the data tab).
+    pub sort_dialog: Option<Rc<dyn Fn()>>,
+    /// The cursor left this row ("Post edits on row change").
+    pub on_row_leave: Option<Rc<dyn Fn(usize)>>,
+    /// Continue the result from row n with a new statement ([`crate::conn::Conn::resume`]):
+    /// set, an idle grid closes its cursor after [`IDLE_RELEASE`].
+    pub resume: Option<Rc<dyn Fn(usize) -> Rows>>,
+    /// The last batch arrived (idle measure).
+    last_batch: Option<std::time::Instant>,
+    /// Cursor closed while idle; the next fetch resumes.
+    released: bool,
+    /// Resumed statement: its column header is already shown.
+    resumed: bool,
 }
+
+/// Idle time before a resumable result closes its cursor (PostgreSQL autocommit transaction).
+// ponytail: fixed 30 s; servers with a shorter idle_in_transaction_session_timeout still cut it.
+const IDLE_RELEASE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct ResultGrid {
@@ -100,6 +120,14 @@ const ID_COPY_INSERT: i32 = 7016;
 const ID_COUNT: i32 = 7017;
 const ID_FILTER: i32 = 7018;
 const ID_CLEAR_FILTERS: i32 = 7019;
+const ID_INSERT_ROW: i32 = 7021;
+const ID_DUP_ROW: i32 = 7022;
+const ID_DELETE_ROWS: i32 = 7023;
+const ID_SET_NULL: i32 = 7024;
+const ID_REVERT: i32 = 7025;
+const ID_PASTE: i32 = 7026;
+const ID_RECORD: i32 = 7027;
+const ID_SORT_DLG: i32 = 7028;
 
 impl ResultGrid {
     pub fn new(parent: &dyn WxWidget) -> ResultGrid {
@@ -161,8 +189,17 @@ impl ResultGrid {
             })
         };
         let t2 = target.clone();
+        let last_row = Rc::new(std::cell::Cell::new(-1));
+        let st2 = Rc::downgrade(&g.st);
         grid.on_select_cell(move |e| {
             target();
+            let prev = last_row.replace(e.get_row());
+            if prev >= 0 && prev != e.get_row() {
+                let hook = st2.upgrade().and_then(|st| st.borrow().on_row_leave.clone());
+                if let Some(h) = hook {
+                    h(prev as usize)
+                }
+            }
             // The cursor cell only gets a border: select it too so it is filled like a
             // selection. Next tick, once wx has finished the click or key, and only when
             // nothing else is selected (shift / drag selections stay as they are).
@@ -194,8 +231,8 @@ impl ResultGrid {
                 rsqldev_core::lob::release(v);
             }
         }
-        let keep = (st.on_change.take(), st.db, st.count.take(), std::mem::take(&mut st.find));
-        *st = State { on_change: keep.0, db: keep.1, count: keep.2, find: keep.3, ..State::default() };
+        let keep = (st.on_change.take(), st.db, st.count.take(), std::mem::take(&mut st.find), st.sort_dialog.take(), st.on_row_leave.take());
+        *st = State { on_change: keep.0, db: keep.1, count: keep.2, find: keep.3, sort_dialog: keep.4, on_row_leave: keep.5, ..State::default() };
         drop(st);
         self.redraw_all();
     }
@@ -208,6 +245,19 @@ impl ResultGrid {
         st.hidden = hidden;
         st.editable = editable;
         self.grid.enable_editing(editable);
+    }
+
+    /// Turn editing on (or off) for the rows already loaded and those still to come.
+    pub fn set_editable(&self, on: bool) {
+        self.st.borrow_mut().editable = on;
+        let g = self.grid;
+        g.enable_editing(on);
+        let st = self.st.borrow();
+        g.begin_batch();
+        for ri in 0..st.rows.len() {
+            Self::fill_row(g, &st, ri);
+        }
+        g.end_batch();
     }
 
     /// Show a complete result.
@@ -235,9 +285,32 @@ impl ResultGrid {
 
     fn pump(&self) {
         let (rx, hidden, fetch_all, n) = {
-            let st = self.st.borrow();
+            let mut st = self.st.borrow_mut();
+            let idle = st.last_batch.is_some_and(|t| t.elapsed() > IDLE_RELEASE);
+            if st.resume.is_some() && st.rx.is_some() && !st.done && !st.fetch_all && idle {
+                // Close the cursor (its transaction ends) until the grid wants more.
+                if let Some(rx) = st.rx.take() {
+                    rx.borrow_mut().take();
+                }
+                st.released = true;
+                drop(st);
+                crate::app().status(0, "Fetching paused while idle (the database transaction is released); scroll to continue");
+                return;
+            }
             match &st.rx {
                 Some(rx) => (rx.clone(), st.hidden, st.fetch_all, st.rows.len()),
+                None if st.released && !st.done => {
+                    let n = st.rows.len();
+                    let wants = st.fetch_all || self.grid.is_visible(n as i32 - 1, st.hidden as i32, false);
+                    let Some(f) = st.resume.clone().filter(|_| wants) else { return };
+                    st.released = false;
+                    st.resumed = true;
+                    st.last_batch = Some(std::time::Instant::now());
+                    drop(st);
+                    let rows = f(n);
+                    self.st.borrow_mut().rx = Some(rows);
+                    return;
+                }
                 None => return,
             }
         };
@@ -253,6 +326,7 @@ impl ResultGrid {
             }
         };
         match ev {
+            Ok(Event::Columns(_)) if self.st.borrow().resumed => {}
             Ok(Event::Columns(c)) => {
                 self.st.borrow_mut().cols = c;
                 self.redraw_all();
@@ -263,6 +337,7 @@ impl ResultGrid {
                 {
                     let mut st = self.st.borrow_mut();
                     st.rows.extend(batch.into_iter().map(Row::fetched));
+                    st.last_batch = Some(std::time::Instant::now());
                 }
                 self.append_rows(start);
                 if last {
@@ -349,27 +424,8 @@ impl ResultGrid {
         }
         g.begin_batch();
         g.append_rows((n - start) as i32, true);
-        // (null) placeholder, ≥ 4.5:1 in both palettes (see theme tests).
-        let grey = crate::theme::c(crate::theme::p().null);
-        for (ri, row) in st.rows.iter().enumerate().skip(start) {
-            for (ci, v) in row.cur.iter().enumerate() {
-                let (r, c) = (ri as i32, ci as i32);
-                match v {
-                    Some(s) => g.set_cell_value(r, c, &rsqldev_core::lob::grid_text(st.cols.get(ci).map_or("", |c| c.type_name.as_str()), s)),
-                    None => {
-                        g.set_cell_value(r, c, NULL_TEXT);
-                        g.set_cell_text_colour(r, c, &grey);
-                    }
-                }
-                if st.cols.get(ci).is_some_and(|c| c.numeric) {
-                    g.set_cell_alignment(r, c, 0x0200 /* wxALIGN_RIGHT */, 0x0800 /* wxALIGN_CENTER_VERTICAL */);
-                }
-                // BLOB cells change through Load Value, not by typing over "(BLOB)".
-                if !st.editable || st.cols.get(ci).is_some_and(|c| rsqldev_core::lob::is_blob_type(&c.type_name)) {
-                    g.set_read_only(r, c, true);
-                }
-            }
-            Self::mark_row(g, &st, ri);
+        for ri in start..n {
+            Self::fill_row(g, &st, ri);
         }
         if start == 0 {
             g.auto_size_columns(false);
@@ -392,10 +448,46 @@ impl ResultGrid {
         }
     }
 
+    /// Values, colours and read-only flags of one grid row, from scratch (new, reverted or
+    /// shifted rows too).
+    fn fill_row(g: Grid, st: &State, ri: usize) {
+        let p = crate::theme::p();
+        // (null) placeholder, ≥ 4.5:1 in both palettes (see theme tests).
+        let (grey, text, bg) = (crate::theme::c(p.null), crate::theme::c(p.text), crate::theme::c(p.bg));
+        let row = &st.rows[ri];
+        for (ci, v) in row.cur.iter().enumerate() {
+            let (r, c) = (ri as i32, ci as i32);
+            match v {
+                Some(s) => {
+                    g.set_cell_value(r, c, &rsqldev_core::lob::grid_text(st.cols.get(ci).map_or("", |c| c.type_name.as_str()), s));
+                    g.set_cell_text_colour(r, c, &text);
+                }
+                None => {
+                    g.set_cell_value(r, c, NULL_TEXT);
+                    g.set_cell_text_colour(r, c, &grey);
+                }
+            }
+            g.set_cell_background_colour(r, c, &bg);
+            if st.cols.get(ci).is_some_and(|c| c.numeric) {
+                g.set_cell_alignment(r, c, 0x0200 /* wxALIGN_RIGHT */, 0x0800 /* wxALIGN_CENTER_VERTICAL */);
+            }
+            // BLOB cells change through Load Value, not by typing over "(BLOB)".
+            g.set_read_only(r, c, !Self::cell_editable(st, ri, ci));
+        }
+        Self::mark_row(g, st, ri);
+    }
+
+    /// Typing allowed: editable result, not a BLOB column, not a row already posted.
+    fn cell_editable(st: &State, ri: usize, ci: usize) -> bool {
+        st.editable && !st.rows[ri].posted && !st.cols.get(ci).is_some_and(|c| rsqldev_core::lob::is_blob_type(&c.type_name))
+    }
+
     fn mark_row(g: Grid, st: &State, ri: usize) {
         let row = &st.rows[ri];
         let r = ri as i32;
-        let label = if row.deleted {
+        let label = if row.posted {
+            format!("{} ✓", ri + 1)
+        } else if row.deleted {
             format!("{} ✕", ri + 1)
         } else if row.new {
             format!("{} +", ri + 1)
@@ -430,16 +522,195 @@ impl ResultGrid {
         self.changed();
     }
 
+    /// Insert Row: an empty new row after the cursor row (at the end when there is none).
     pub fn insert_row(&self) {
-        let n = {
-            let mut st = self.st.borrow_mut();
-            let w = st.cols.len();
-            st.rows.push(Row { cur: vec![None; w], new: true, ..Row::default() });
-            st.rows.len() - 1
+        let w = self.st.borrow().cols.len();
+        self.insert_new(self.after_cursor(), Row { cur: vec![None; w], new: true, ..Row::default() });
+    }
+
+    /// Duplicate Row: a new row after the cursor row with its values (row locator left empty;
+    /// staged files copied too).
+    pub fn duplicate_row(&self) {
+        let r = self.grid.get_grid_cursor_row();
+        let row = {
+            let st = self.st.borrow();
+            let Some(src) = st.rows.get(r.max(0) as usize).filter(|_| r >= 0) else { return };
+            let mut cur = src.cur.clone();
+            cur.iter_mut().take(st.hidden).for_each(|v| *v = None);
+            Row { cur, new: true, blobs: src.blobs.clone(), ..Row::default() }
         };
-        self.append_rows(n);
+        self.insert_new(r as usize + 1, row);
+    }
+
+    fn after_cursor(&self) -> usize {
+        let (r, n) = (self.grid.get_grid_cursor_row(), self.st.borrow().rows.len());
+        if r >= 0 && (r as usize) < n { r as usize + 1 } else { n }
+    }
+
+    fn insert_new(&self, at: usize, row: Row) {
+        if !self.st.borrow().editable {
+            return;
+        }
+        let n = self.st.borrow().rows.len();
+        if at >= n {
+            self.st.borrow_mut().rows.push(row);
+            self.append_rows(n);
+        } else {
+            self.st.borrow_mut().rows.insert(at, row);
+            let g = self.grid;
+            g.begin_batch();
+            g.insert_rows(at as i32, 1, true);
+            let st = self.st.borrow();
+            Self::fill_row(g, &st, at);
+            for ri in at + 1..st.rows.len() {
+                Self::mark_row(g, &st, ri);
+            }
+            g.end_batch();
+            drop(st);
+            self.changed();
+        }
         let hidden = self.st.borrow().hidden as i32;
-        self.move_cursor(n as i32, hidden, true);
+        self.move_cursor(at as i32, hidden, true);
+    }
+
+    /// Rows whose DML went to the database ahead of Commit: updates become the new baseline;
+    /// inserts and deletes stay read-only (✓) until the data is refreshed.
+    pub fn mark_posted(&self, rows: &[usize]) {
+        let g = self.grid;
+        let mut st = self.st.borrow_mut();
+        for &r in rows {
+            let Some(row) = st.rows.get_mut(r) else { continue };
+            if row.new || row.deleted {
+                row.posted = true;
+            } else {
+                row.orig = None;
+                row.blobs.clear();
+            }
+            Self::fill_row(g, &st, r);
+        }
+        drop(st);
+        g.force_refresh();
+        self.changed();
+    }
+
+    /// Rows touched by the selection, else the cursor row (Delete / Revert).
+    fn picked_rows(&self) -> Vec<usize> {
+        let cursor = (self.grid.get_grid_cursor_row(), self.grid.get_grid_cursor_col());
+        let n = self.st.borrow().rows.len();
+        rows_to_mark(self.grid.get_selected_rows(), &self.grid.get_selected_blocks(), cursor).into_iter().filter(|r| *r >= 0 && (*r as usize) < n).map(|r| r as usize).collect()
+    }
+
+    /// Selected cells (blocks), else the cursor cell; row locator columns left out.
+    fn picked_cells(&self) -> Vec<(usize, usize)> {
+        let (hidden, n, w) = {
+            let st = self.st.borrow();
+            (st.hidden as i32, st.rows.len() as i32, st.cols.len() as i32)
+        };
+        let mut out = vec![];
+        let blocks = self.grid.get_selected_blocks();
+        let cursor = (self.grid.get_grid_cursor_row(), self.grid.get_grid_cursor_col());
+        let stale = blocks.len() == 1 && blocks[0].top_row == blocks[0].bottom_row && blocks[0].left_col == blocks[0].right_col && (blocks[0].top_row, blocks[0].left_col) != cursor;
+        if blocks.is_empty() || stale {
+            out.push(cursor);
+        } else {
+            for b in &blocks {
+                for r in b.top_row..=b.bottom_row {
+                    out.extend((b.left_col..=b.right_col).map(|c| (r, c)));
+                }
+            }
+        }
+        out.into_iter().filter(|&(r, c)| r >= 0 && r < n && c >= hidden && c < w).map(|(r, c)| (r as usize, c as usize)).collect()
+    }
+
+    /// Set to NULL: every selected cell of rows not yet posted.
+    pub fn set_null(&self) {
+        if !self.st.borrow().editable {
+            return;
+        }
+        for (r, c) in self.picked_cells() {
+            if self.st.borrow().rows[r].posted {
+                continue;
+            }
+            if let Some(row) = self.st.borrow_mut().rows.get_mut(r) {
+                row.blobs.remove(&c);
+            }
+            self.set_cell(r, c, None);
+        }
+    }
+
+    /// Revert Row: forget a row's pending change (new rows go away).
+    pub fn revert_rows(&self) {
+        let rows = self.picked_rows();
+        let g = self.grid;
+        g.begin_batch();
+        for r in rows.into_iter().rev() {
+            let mut st = self.st.borrow_mut();
+            let row = &mut st.rows[r];
+            if row.posted {
+                continue;
+            }
+            if row.new {
+                st.rows.remove(r);
+                g.delete_rows(r as i32, 1, true);
+                for ri in r..st.rows.len() {
+                    Self::mark_row(g, &st, ri);
+                }
+                continue;
+            }
+            if let Some(o) = row.orig.take() {
+                row.cur = o;
+            }
+            row.blobs.clear();
+            row.deleted = false;
+            Self::fill_row(g, &st, r);
+        }
+        g.end_batch();
+        g.force_refresh();
+        self.changed();
+    }
+
+    /// Paste tab-separated text (a copied block, Excel) from the cursor cell; rows past the
+    /// end become new rows. Returns false when this grid cannot take it.
+    pub fn paste(&self) -> bool {
+        if !self.st.borrow().editable {
+            return false;
+        }
+        let Some(text) = Clipboard::get().get_text() else { return true };
+        let lines = parse_tsv(&text);
+        let (r0, c0) = (self.grid.get_grid_cursor_row(), self.grid.get_grid_cursor_col());
+        let (hidden, w) = {
+            let st = self.st.borrow();
+            (st.hidden, st.cols.len())
+        };
+        let (r0, c0) = (r0.max(0) as usize, (c0.max(0) as usize).max(hidden));
+        let (mut done, mut skipped) = (0, vec![]);
+        self.grid.begin_batch();
+        for (i, line) in lines.iter().enumerate() {
+            let r = r0 + i;
+            if r >= self.st.borrow().rows.len() {
+                let n = self.st.borrow().rows.len();
+                self.st.borrow_mut().rows.push(Row { cur: vec![None; w], new: true, ..Row::default() });
+                self.append_rows(n);
+            }
+            for (j, v) in line.iter().enumerate() {
+                let c = c0 + j;
+                let ok = c < w && Self::cell_editable(&self.st.borrow(), r, c);
+                if !ok {
+                    if let Some(col) = self.st.borrow().cols.get(c) {
+                        skipped.push(format!("{} ({})", col.name, col.type_name));
+                    }
+                    continue;
+                }
+                self.st.borrow_mut().rows[r].blobs.remove(&c);
+                self.set_cell(r, c, if v.is_empty() || v == NULL_TEXT { None } else { Some(v.clone()) });
+                done += 1;
+            }
+        }
+        self.grid.end_batch();
+        skipped.dedup();
+        let msg = if skipped.is_empty() { format!("Pasted {done} value(s)") } else { format!("Pasted {done} value(s). Cannot paste value for column: {}", skipped.join(", ")) };
+        crate::app().status(0, &msg);
+        true
     }
 
     /// Move the cursor from code: the old selection goes (Delete Row reads it) and the Copy
@@ -471,14 +742,17 @@ impl ResultGrid {
     /// Marks every row touched by the selection (whole rows, and cell blocks dragged or
     /// shift / ctrl-clicked across several rows), or the cursor row when nothing is selected.
     pub fn delete_selected_rows(&self) {
-        let cursor = (self.grid.get_grid_cursor_row(), self.grid.get_grid_cursor_col());
-        let rows = rows_to_mark(self.grid.get_selected_rows(), &self.grid.get_selected_blocks(), cursor);
+        if !self.st.borrow().editable {
+            return;
+        }
+        let rows = self.picked_rows();
         let mut st = self.st.borrow_mut();
-        for r in rows.into_iter().filter(|r| *r >= 0) {
-            if let Some(row) = st.rows.get_mut(r as usize) {
-                row.deleted = true;
+        for r in rows {
+            if st.rows[r].posted {
+                continue;
             }
-            Self::mark_row(self.grid, &st, r as usize);
+            st.rows[r].deleted = true;
+            Self::mark_row(self.grid, &st, r);
         }
         drop(st);
         self.grid.force_refresh();
@@ -535,7 +809,26 @@ impl ResultGrid {
             (st.editable, st.hidden as i32)
         };
         let has_count = self.st.borrow().count.is_some();
-        let mut b = Menu::builder()
+        let has_sort = self.st.borrow().sort_dialog.is_some();
+        let mut b = Menu::builder();
+        if editable {
+            b = b
+                .append_item(ID_INSERT_ROW, "Insert Row\tCtrl+I", "New row after this one; Commit to post")
+                .append_item(ID_DUP_ROW, "Duplicate Row", "New row with this row's values")
+                .append_item(ID_DELETE_ROWS, "Delete Selected Row(s)\tCtrl+D", "")
+                .append_item(ID_SET_NULL, "Set to NULL", "Selected cells become NULL")
+                .append_item(ID_REVERT, "Revert Row", "Forget this row's pending change")
+                .append_item(ID_PASTE, "Paste", "Paste copied cells (tab-separated) from this cell")
+                .append_separator();
+        }
+        if r >= 0 {
+            b = b.append_item(ID_RECORD, "Single Record View…", "One row as Name / Value, with previous / next");
+        }
+        if has_sort {
+            b = b.append_item(ID_SORT_DLG, "Sort…", "Sort the data by several columns on the server");
+        }
+        b = b
+            .append_separator()
             .append_item(ID_COPY, "Copy", "Copy selected cells")
             .append_item(ID_COPY_HDR, "Copy with Headers", "Copy selected cells with column names")
             .append_item(ID_COPY_CSV, "Copy as CSV", "")
@@ -569,6 +862,7 @@ impl ResultGrid {
             ID_SAVE_VALUE => me.save_value(r as usize, c as usize),
             ID_VIEW_VALUE => me.view_value(r as usize, c as usize),
             ID_LOAD_VALUE => me.load_value(r as usize, c as usize),
+            ID_RECORD => crate::record::show(&me, r as usize),
             id => me.menu(id),
         });
         let pos = pos.map(|p| self.grid.client_to_screen(p));
@@ -642,7 +936,7 @@ impl ResultGrid {
     }
 
     /// Write a value into a cell from code (dialogs, file loads) and mark the row dirty.
-    fn set_cell(&self, r: usize, c: usize, v: Cell) {
+    pub(crate) fn set_cell(&self, r: usize, c: usize, v: Cell) {
         let mut st = self.st.borrow_mut();
         let Some(row) = st.rows.get_mut(r) else { return };
         row.edit();
@@ -761,7 +1055,7 @@ impl ResultGrid {
         g.begin_batch();
         let mut shown = 0;
         for (r, row) in st.rows.iter().enumerate() {
-            let ok = st.filters.iter().all(|(c, t)| row.cur[*c].as_deref().is_some_and(|v| rsqldev_core::lob::display(v).to_lowercase().contains(t)));
+            let ok = row.new || st.filters.iter().all(|(c, t)| row.cur[*c].as_deref().is_some_and(|v| rsqldev_core::lob::display(v).to_lowercase().contains(t)));
             if ok {
                 g.show_row(r as i32);
                 shown += 1;
@@ -869,6 +1163,20 @@ impl ResultGrid {
             }
             ID_FIND => self.find(true),
             ID_FIND_NEXT => self.find(false),
+            ID_INSERT_ROW => self.insert_row(),
+            ID_DUP_ROW => self.duplicate_row(),
+            ID_DELETE_ROWS => self.delete_selected_rows(),
+            ID_SET_NULL => self.set_null(),
+            ID_REVERT => self.revert_rows(),
+            ID_PASTE => {
+                self.paste();
+            }
+            ID_SORT_DLG => {
+                let f = self.st.borrow().sort_dialog.clone();
+                if let Some(f) = f {
+                    f()
+                }
+            }
             ID_COUNT => {
                 let f = self.st.borrow().count.clone();
                 if let Some(f) = f {
@@ -942,6 +1250,17 @@ fn rows_to_mark(selected: Vec<i32>, blocks: &[GridBlockCoords], cursor: (i32, i3
     rows
 }
 
+/// Clipboard text as rows of tab-separated cells (trailing line break ignored).
+// ponytail: no quoted cells (Excel quotes values holding tabs / line breaks); add when users paste those.
+fn parse_tsv(s: &str) -> Vec<Vec<String>> {
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    let s = s.strip_suffix('\r').unwrap_or(s);
+    if s.is_empty() {
+        return vec![];
+    }
+    s.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l).split('\t').map(str::to_owned).collect()).collect()
+}
+
 /// Name / Value grid for single-row "Details" tabs.
 pub fn transpose(cols: &[Column], rows: &[Vec<Cell>]) -> (Vec<Column>, Vec<Vec<Cell>>) {
     let tc = |n: &str| Column { name: n.into(), type_name: String::new(), numeric: false };
@@ -956,6 +1275,13 @@ mod tests {
 
     fn block(top: i32, left: i32, bottom: i32, right: i32) -> GridBlockCoords {
         GridBlockCoords { top_row: top, left_col: left, bottom_row: bottom, right_col: right }
+    }
+
+    #[test]
+    fn tsv() {
+        assert_eq!(parse_tsv("a\tb\r\nc\t\r\n"), vec![vec!["a", "b"], vec!["c", ""]]);
+        assert_eq!(parse_tsv("x"), vec![vec!["x"]]);
+        assert!(parse_tsv("").is_empty());
     }
 
     #[test]

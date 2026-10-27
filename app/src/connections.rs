@@ -32,12 +32,9 @@ const M_PROPS: i32 = 7104;
 const M_DELETE: i32 = 7105;
 const M_REFRESH: i32 = 7106;
 const M_OPEN: i32 = 7107;
-const M_COUNT: i32 = 7108;
 const M_DROP: i32 = 7109;
-const M_TRUNCATE: i32 = 7110;
 const M_DDL: i32 = 7111;
 const M_COMPILE: i32 = 7112;
-const M_RENAME: i32 = 7113;
 const M_NEW_TABLE: i32 = 7114;
 const M_EDIT_TABLE: i32 = 7115;
 const M_NEW_INDEX: i32 = 7116;
@@ -304,12 +301,8 @@ impl Navigator {
                 b = b.append_item(M_OPEN, "Open", "").append_item(M_REFRESH, "Refresh", "").append_item(M_DDL, "Quick DDL ▸ Worksheet", "").append_separator();
                 if *kind == dialect::TABLE {
                     b = b
-                        .append_item(M_EDIT_TABLE, "Edit Table…", "Columns, constraints and indexes, with the DDL shown first")
-                        .append_item(M_NEW_INDEX, "New Index…", "")
-                        .append_separator()
-                        .append_item(M_COUNT, "Count Rows", "")
-                        .append_item(M_RENAME, "Rename…", "")
-                        .append_item(M_TRUNCATE, "Truncate…", "");
+                        .append_item(M_EDIT_TABLE, "Edit…", "Columns, keys, constraints, indexes and storage, with the DDL shown first")
+                        .append_item(M_NEW_INDEX, "New Index…", "");
                 }
                 let db = crate::app().open_conn(conn).map(|c| c.borrow().kind);
                 // Rebuild needs only the index name on these engines.
@@ -320,13 +313,20 @@ impl Navigator {
                 if oracle && matches!(*kind, dialect::PACKAGE | dialect::PROCEDURE | dialect::FUNCTION | dialect::TRIGGER | dialect::VIEW | dialect::TYPE) {
                     b = b.append_item(M_COMPILE, "Compile", "");
                 }
-                b = b.append_item(M_DROP, "Drop…", "");
+                if *kind != dialect::TABLE {
+                    b = b.append_item(M_DROP, "Drop…", "");
+                }
             }
             Node::Kind { kind, .. } if *kind == dialect::TABLE => b = b.append_item(M_NEW_TABLE, "New Table…", "").append_separator().append_item(M_REFRESH, "Refresh", ""),
             Node::Kind { .. } | Node::Schemas { .. } | Node::Schema { .. } => b = b.append_item(M_REFRESH, "Refresh", ""),
             _ => return,
         }
         let mut m = b.build();
+        if let Node::Obj { kind: dialect::TABLE, conn, .. } = &node {
+            if let Some(c) = crate::app().open_conn(conn) {
+                crate::table_menu::append(&m, c.borrow().kind);
+            }
+        }
         let nav = *self;
         let item = i.clone();
         m.on_selected(move |e| nav.menu(e.get_id(), &item, node.clone()));
@@ -353,6 +353,17 @@ impl Navigator {
                     app.delete_connection(&name);
                 }
             }
+            (id, Node::Obj { conn, owner, name, .. }) if crate::table_menu::handles(id) => {
+                let Some(c) = app.open_conn(&conn) else { return };
+                // Refresh the table list (renames, drops, copies) once the statements ran.
+                let (nav, item) = (*self, i.clone());
+                let done: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+                    if let Some(p) = nav.tree.get_item_parent(&item) {
+                        nav.refresh(&p);
+                    }
+                });
+                crate::table_menu::run(id, c, owner, name, done);
+            }
             (M_OPEN, Node::Obj { conn, owner, kind, name }) => app.open_object(&conn, &owner, kind, &name),
             (M_DDL, Node::Obj { conn, owner, kind, name }) => app.ddl_to_worksheet(&conn, &owner, kind, &name),
             (M_NEW_TABLE, Node::Kind { conn, owner, .. }) => {
@@ -371,14 +382,9 @@ impl Navigator {
                 let db = c.borrow().kind;
                 let q = dialect::qualified(db, &owner, &name);
                 let sql = match id {
-                    M_COUNT => format!("SELECT COUNT(*) FROM {q}"),
-                    M_TRUNCATE if crate::ui::confirm(&self.tree, &format!("Truncate {q}? All rows are removed.")) => {
-                        if db == Kind::Sqlite { format!("DELETE FROM {q}") } else { format!("TRUNCATE TABLE {q}") }
-                    }
                     M_DROP if crate::ui::confirm(&self.tree, &format!("Drop {kind} {q}?")) => match (db, kind) {
                         (Kind::Postgres, dialect::FUNCTION | dialect::PROCEDURE) => format!("DROP {kind} {}.{name}", dialect::quote(db, &owner)),
                         (Kind::Postgres, dialect::TRIGGER) => return crate::ui::info(&self.tree, "Drop the trigger from its table's Triggers tab (needs ON table)."),
-                        (Kind::Oracle, dialect::TABLE) => format!("DROP TABLE {q} PURGE"),
                         _ => format!("DROP {kind} {q}"),
                     },
                     M_COMPILE => format!("ALTER {} {q} COMPILE", if kind == dialect::PACKAGE { "PACKAGE" } else { kind }),
@@ -386,23 +392,11 @@ impl Navigator {
                         Some(s) if crate::ui::confirm(&self.tree, &format!("Rebuild index {q}?\n\n{s}")) => s,
                         _ => return,
                     },
-                    M_RENAME => match crate::ui::ask(&self.tree, "New name:", "Rename Table", &name) {
-                        Some(n) if n != name => match db {
-                            Kind::Mssql => format!("EXEC sp_rename '{}', '{}'", dialect::lit(&format!("{owner}.{name}")), dialect::lit(&n)),
-                            Kind::Mysql => format!("RENAME TABLE {q} TO {}", dialect::qualified(db, &owner, &n)),
-                            _ => format!("ALTER TABLE {q} RENAME TO {}", dialect::quote(db, &n)),
-                        },
-                        _ => return,
-                    },
                     _ => return,
                 };
                 let nav = *self;
                 let item = i.clone();
                 Conn::work_query(&c, &sql, move |r| match r {
-                    Ok(r) if id == M_COUNT => {
-                        let n = r.rows.first().and_then(|r| r[0].clone()).unwrap_or_default();
-                        crate::ui::info(&nav.tree, &format!("{name}: {n} rows"));
-                    }
                     Ok(_) => {
                         if let Some(p) = nav.tree.get_item_parent(&item) {
                             nav.refresh(&p);

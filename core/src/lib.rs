@@ -16,6 +16,7 @@ pub mod lob;
 pub mod migrate;
 pub mod registry;
 pub mod script;
+pub mod table_actions;
 pub mod worker;
 
 pub use anyhow::{Error, Result};

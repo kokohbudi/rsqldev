@@ -255,6 +255,24 @@ impl Conn {
         rows
     }
 
+    /// PostgreSQL in autocommit runs a query's cursor in a transaction of its own: an idle grid
+    /// closes it (releasing the snapshot and the table locks) and this continues the result
+    /// with OFFSET once the grid is scrolled again. None elsewhere.
+    // ponytail: the continuation is a new snapshot; rows changed meanwhile may shift.
+    pub fn resume(this: &ConnRef, sql: &str) -> Option<Rc<dyn Fn(usize) -> Rows>> {
+        if this.borrow().kind != Kind::Postgres || !crate::app().prefs().autocommit {
+            return None;
+        }
+        let (c, body) = (this.clone(), sql.trim_end().trim_end_matches(';').to_string());
+        Some(Rc::new(move |n| {
+            Conn::exec(&c, &format!("SELECT * FROM ({body}) rsqldev_q OFFSET {n}"), |d| {
+                if let Err(e) = d.result {
+                    crate::app().status(0, &format!("Fetching more rows failed: {e}"));
+                }
+            })
+        }))
+    }
+
     /// Worksheet / data-tab statement with fetch-on-demand rows.
     pub fn exec(this: &ConnRef, sql: &str, done: impl FnOnce(Done) + 'static) -> Rows {
         let fetch = rsqldev_core::worker::FETCH_ROWS;

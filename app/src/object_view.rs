@@ -2,11 +2,9 @@
 //! loaded lazily on first view. The Data tab is an editable grid that posts generated DML.
 
 use crate::conn::{Conn, ConnRef};
-use crate::grid::{ResultGrid, Row, transpose};
+use crate::grid::{ResultGrid, transpose};
 use rsqldev_core::dialect::{self, Tab, View};
-use rsqldev_core::{Bind, dml};
 use rsqldev_core::registry::Kind;
-use rsqldev_core::worker::Cmd;
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use wxdragon::prelude::*;
@@ -38,10 +36,14 @@ struct DataTab {
     grid: ResultGrid,
     filter: TextCtrl,
     status: StaticText,
-    pk: RefCell<Vec<String>>,
+    /// Messages - Log: executed DML, "Row n: error", commit / rollback.
+    log: TextCtrl,
+    /// Sort… keys, appended as ORDER BY.
+    order: RefCell<Vec<dialect::SortKey>>,
+    /// Posts the grid edits (editable tables).
+    ed: std::cell::OnceCell<Rc<crate::data_editor::Editor>>,
     hidden: Option<&'static str>,
     editable: bool,
-    busy: Cell<bool>,
     buttons: [BitmapButton; 5],
     import: BitmapButton,
 }
@@ -180,22 +182,29 @@ impl ObjectView {
                     set_text(e, text.trim_start());
                 });
             }
-            (View::Data, Page::Data) => self.load_data(),
+            (View::Data, Page::Data) => self.refresh_data(),
             _ => {}
         }
     }
 
     fn bind_data(&self) {
         let Some(d) = &self.data else { return };
-        if let Some(sql) = dialect::pk_sql(self.db, &self.owner, &self.name) {
-            let me = self.me.clone();
-            Conn::meta_query(&self.conn, &sql, move |r| {
-                if let (Some(me), Ok(r)) = (me.upgrade(), r) {
-                    if let Some(d) = &me.data {
-                        *d.pk.borrow_mut() = r.rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect();
+        if d.editable {
+            let (me, log) = (self.me.clone(), d.log);
+            let ed = crate::data_editor::Editor::new(
+                self.conn.clone(),
+                &self.owner,
+                &self.name,
+                d.grid.clone(),
+                d.hidden,
+                move |line| log.append_text(&format!("{line}\n")),
+                move || {
+                    if let Some(me) = me.upgrade() {
+                        me.load_data()
                     }
-                }
-            });
+                },
+            );
+            let _ = d.ed.set(ed);
         }
         let st = d.status;
         d.grid.st.borrow_mut().on_change = Some(Rc::new(move |s| {
@@ -206,7 +215,13 @@ impl ObjectView {
             }
             st.set_label(&msg);
         }));
-        let acts: [fn(&ObjectView); 5] = [ObjectView::insert_row, ObjectView::delete_rows, ObjectView::commit, ObjectView::rollback, ObjectView::load_data];
+        let me = self.me.clone();
+        d.grid.st.borrow_mut().sort_dialog = Some(Rc::new(move || {
+            if let Some(me) = me.upgrade() {
+                me.sort_dialog()
+            }
+        }));
+        let acts: [fn(&ObjectView); 5] = [ObjectView::insert_row, ObjectView::delete_rows, ObjectView::commit, ObjectView::rollback, ObjectView::refresh_data];
         for (b, f) in d.buttons.iter().zip(acts) {
             let me = self.me.clone();
             b.on_click(move |_| {
@@ -224,7 +239,7 @@ impl ObjectView {
         let me = self.me.clone();
         d.filter.on_text_enter(move |_| {
             if let Some(me) = me.upgrade() {
-                me.load_data()
+                me.refresh_data()
             }
         });
     }
@@ -234,11 +249,30 @@ impl ObjectView {
         let dq = dialect::data_query(self.db, self.kind, &self.owner, &self.name);
         let f = d.filter.get_value();
         let sql = if f.trim().is_empty() { dq.sql } else { format!("{} WHERE {}", dq.sql, f.trim()) };
-        (sql, d)
+        (sql + &dialect::order_by(self.db, &d.order.borrow()), d)
+    }
+
+    /// Refresh / filter / sort: uncommitted edits ask Commit, Discard or Cancel first.
+    pub fn refresh_data(&self) {
+        let Some(ed) = self.data.as_ref().and_then(|d| d.ed.get()).filter(|e| e.pending()) else { return self.load_data() };
+        match crate::ui::commit_discard(&self.panel, &format!("Table {} has changes that are not committed.", self.name)) {
+            // The commit reloads the data.
+            Some(true) => {
+                ed.commit();
+            }
+            Some(false) => {
+                ed.discard();
+                self.load_data()
+            }
+            None => {}
+        }
     }
 
     pub fn load_data(&self) {
         let (sql, d) = self.data_sql();
+        if let Some(ed) = d.ed.get() {
+            ed.loaded();
+        }
         let st = d.status;
         let rows = Conn::exec(&self.conn, &sql, move |done| {
             if let Err(e) = done.result {
@@ -247,105 +281,89 @@ impl ObjectView {
         });
         d.grid.load(rows, d.hidden.map_or(0, |_| 1), d.editable);
         d.grid.st.borrow_mut().count = Conn::counter(&self.conn, &sql, d.status);
+        d.grid.st.borrow_mut().resume = Conn::resume(&self.conn, &sql);
     }
 
-    /// Generated DML for pending grid edits, with the values each statement binds (staged BLOB
-    /// files, and text too long for an Oracle literal).
-    fn pending_dml(&self) -> Vec<(String, Vec<Bind>)> {
-        let d = self.data.as_ref().unwrap();
-        let st = d.grid.st.borrow();
-        let table = dialect::qualified(self.db, &self.owner, &self.name);
-        let key = dml::Key::new(&st.cols, d.hidden, &d.pk.borrow());
-        let skip = d.hidden.map(|_| 0);
-        let mut out = vec![];
-        for row in &st.rows {
-            let Row { cur, deleted, blobs, new, .. } = row;
-            let changed = |c: usize| *new || row.original()[c] != cur[c];
-            let cols: Vec<usize> = (0..st.cols.len())
-                .filter(|&c| Some(c) != skip && (blobs.contains_key(&c) || (changed(c) && dml::text_needs_bind(self.db, &st.cols[c], &cur[c]))))
-                .collect();
-            let binds = || {
-                cols.iter()
-                    .map(|c| match blobs.get(c) {
-                        Some(b) => Bind::Bytes(b.to_vec()),
-                        None => Bind::Text(cur[*c].as_deref().map(|s| rsqldev_core::lob::expand(s).into_owned()).unwrap_or_default()),
-                    })
-                    .collect::<Vec<_>>()
-            };
-            match (new, deleted) {
-                (true, true) => {}
-                (true, false) => out.push((dml::insert(self.db, &table, &st.cols, skip, cur, &cols), binds())),
-                (false, true) => out.push((dml::delete(self.db, &table, &st.cols, &key, row.original()), vec![])),
-                (false, false) if row.dirty() => out.extend(dml::update(self.db, &table, &st.cols, &key, skip, row.original(), cur, &cols).map(|s| (s, binds()))),
-                (false, false) => {}
-            }
-        }
-        out
-    }
-
+    /// Commit Changes (F11): post every pending row, then COMMIT.
     pub fn commit(&self) {
-        let Some(d) = &self.data else { return };
-        if d.busy.get() {
-            return;
+        if let Some(ed) = self.data.as_ref().and_then(|d| d.ed.get()) {
+            ed.commit();
         }
-        let stmts = self.pending_dml();
-        if stmts.is_empty() {
-            return;
-        }
-        d.busy.set(true);
-        self.post(stmts, 0);
     }
 
-    fn post(&self, stmts: Vec<(String, Vec<Bind>)>, i: usize) {
-        let d = self.data.as_ref().unwrap();
-        let me = self.me.clone();
-        if i == stmts.len() {
-            return Conn::tx(&self.conn, Cmd::Commit, move |r| {
-                let Some(me) = me.upgrade() else { return };
-                let d = me.data.as_ref().unwrap();
-                d.busy.set(false);
-                match r {
-                    Ok(_) => {
-                        me.load_data();
-                        d.status.set_label(&format!("Commit successful: {} statement(s)", stmts.len()));
-                    }
-                    Err(e) => crate::ui::error(&me.panel, &e),
-                }
-            });
-        }
-        let (sql, binds) = stmts[i].clone();
-        let run = sql.clone();
-        let done = move |r: Result<Option<u64>, String>| {
-            let Some(me) = me.upgrade() else { return };
-            match r {
-                Ok(Some(0)) => {
-                    me.data.as_ref().unwrap().busy.set(false);
-                    crate::ui::error(&me.panel, &format!("Row was not found (changed by another session?):\n{sql}"));
-                    Conn::tx(&me.conn, Cmd::Rollback, |_| {});
-                }
-                Ok(_) => me.post(stmts, i + 1),
-                Err(e) => {
-                    me.data.as_ref().unwrap().busy.set(false);
-                    crate::ui::error(&me.panel, &format!("One error saving changes to table {}:\n{sql}\n\n{e}", me.name));
-                    Conn::tx(&me.conn, Cmd::Rollback, |_| {});
-                }
-            }
-        };
-        if binds.is_empty() {
-            Conn::work_query(&self.conn, &run, move |r| done(r.map(|r| r.affected)));
-        } else {
-            Conn::work_binds(&self.conn, &run, binds, done);
-        }
-        let _ = d;
-    }
-
+    /// Rollback Changes (F12).
     pub fn rollback(&self) {
-        let me = self.me.clone();
-        Conn::tx(&self.conn, Cmd::Rollback, move |_| {
-            if let Some(me) = me.upgrade() {
-                me.load_data();
-            }
-        });
+        if let Some(ed) = self.data.as_ref().and_then(|d| d.ed.get()) {
+            ed.rollback();
+        }
+    }
+
+    /// Sort… : several columns, ASC / DESC, NULLS FIRST / LAST, re-queried with ORDER BY.
+    fn sort_dialog(&self) {
+        let Some(d) = &self.data else { return };
+        let names: Vec<String> = {
+            let st = d.grid.st.borrow();
+            st.cols.iter().skip(st.hidden).map(|c| c.name.clone()).collect()
+        };
+        if names.is_empty() {
+            return;
+        }
+        let nulls_ok = !matches!(self.db, Kind::Mysql | Kind::Mssql);
+        let dlg = Dialog::builder(&self.panel, "Sort").with_style(DialogStyle::DefaultDialogStyle).build();
+        let head = StaticText::builder(&dlg).with_label("Select columns to sort by").build();
+        let g = FlexGridSizer::builder(0, 3).with_vgap(4).with_hgap(6).build();
+        let cols: Vec<String> = std::iter::once("(none)".to_string()).chain(names.iter().cloned()).collect();
+        let cur = d.order.borrow().clone();
+        let mut rows = vec![];
+        for i in 0..4 {
+            let c = Choice::builder(&dlg).with_choices(cols.clone()).build();
+            let dir = Choice::builder(&dlg).with_choices(vec!["ASC".into(), "DESC".into()]).build();
+            let nl = Choice::builder(&dlg).with_choices(vec!["Nulls default".into(), "Nulls First".into(), "Nulls Last".into()]).build();
+            let k = cur.get(i);
+            c.set_selection(k.and_then(|k| names.iter().position(|n| *n == k.0)).map_or(0, |p| p + 1) as u32);
+            dir.set_selection(u32::from(k.is_some_and(|k| k.1)));
+            nl.set_selection(match k.and_then(|k| k.2) {
+                Some(true) => 1,
+                Some(false) => 2,
+                None => 0,
+            });
+            nl.show(nulls_ok);
+            g.add(&c, 0, SizerFlag::Expand, 0);
+            g.add(&dir, 0, SizerFlag::empty(), 0);
+            g.add(&nl, 0, SizerFlag::empty(), 0);
+            rows.push((c, dir, nl));
+        }
+        let bs = BoxSizer::builder(Orientation::Horizontal).build();
+        let clear = Button::builder(&dlg).with_label("Clear").with_id(ID_NO).build();
+        clear.on_click(move |_| dlg.end_modal(ID_NO));
+        bs.add(&clear, 0, SizerFlag::All, 4);
+        bs.add_stretch_spacer(1);
+        bs.add(&Button::builder(&dlg).with_label("Cancel").with_id(ID_CANCEL).build(), 0, SizerFlag::All, 4);
+        bs.add(&Button::builder(&dlg).with_label("OK").with_id(ID_OK).build(), 0, SizerFlag::All, 4);
+        let s = BoxSizer::builder(Orientation::Vertical).build();
+        s.add(&head, 0, SizerFlag::All, 8);
+        s.add_sizer(&g, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
+        s.add_sizer(&bs, 0, SizerFlag::Expand | SizerFlag::All, 6);
+        dlg.set_sizer_and_fit(s, true);
+        let keys = match dlg.show_modal() {
+            ID_OK => rows
+                .iter()
+                .filter_map(|(c, dir, nl)| {
+                    let i = c.get_selection().unwrap_or(0) as usize;
+                    let nulls = match nl.get_selection().unwrap_or(0) {
+                        1 => Some(true),
+                        2 => Some(false),
+                        _ => None,
+                    };
+                    (i > 0).then(|| (names[i - 1].clone(), dir.get_selection() == Some(1), nulls))
+                })
+                .collect(),
+            ID_NO => vec![],
+            _ => return dlg.destroy(),
+        };
+        dlg.destroy();
+        *d.order.borrow_mut() = keys;
+        self.refresh_data();
     }
 
     /// Import CSV / Excel rows as pending inserts: headers matched to columns by name, review
@@ -419,6 +437,20 @@ Review them in the grid, then Commit (F11) to insert.",
             d.grid.delete_selected_rows();
         }
     }
+
+    /// The Data tab is the selected tab (keys F11, F12, Ctrl+I, Ctrl+D, Ctrl+R, paste go to it).
+    pub fn data_active(&self) -> bool {
+        let sel = self.nb.get_selection();
+        sel >= 0 && matches!(self.pages.get(sel as usize), Some(Page::Data))
+    }
+
+    /// Paste into the data grid, unless the filter box has the keyboard.
+    pub fn paste(&self) -> bool {
+        match &self.data {
+            Some(d) if !d.filter.has_focus() => d.grid.paste(),
+            _ => false,
+        }
+    }
 }
 
 fn set_text(e: StyledTextCtrl, text: &str) {
@@ -457,11 +489,18 @@ impl DataTab {
         let grid = ResultGrid::new(&p);
         grid.st.borrow_mut().db = Some(db);
         let status = StaticText::builder(&p).with_label(" ").build();
+        let log = TextCtrl::builder(&p).with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::DontWrap).build();
+        log.set_min_size(Size::new(-1, 90));
+        log.set_tooltip("Messages - Log: statements posted, errors per row, commit / rollback");
+        crate::copy::text(log);
         let s = BoxSizer::builder(Orientation::Vertical).build();
         s.add_sizer(&bar, 0, SizerFlag::Expand, 0);
         s.add(&grid.grid, 1, SizerFlag::Expand, 0);
         s.add(&status, 0, SizerFlag::Expand | SizerFlag::All, 3);
+        s.add(&log, 0, SizerFlag::Expand, 0);
+        log.show(dq.editable);
         p.set_sizer(s, true);
-        (p, DataTab { grid, filter, status, pk: RefCell::default(), hidden: dq.hidden, editable: dq.editable, busy: Cell::new(false), buttons, import })
+        let d = DataTab { grid, filter, status, log, order: RefCell::default(), ed: Default::default(), hidden: dq.hidden, editable: dq.editable, buttons, import };
+        (p, d)
     }
 }

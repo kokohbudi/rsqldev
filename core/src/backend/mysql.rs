@@ -28,7 +28,11 @@ impl My {
             b = b.ssl_opts(Some(SslOpts::default().with_danger_accept_invalid_certs(trust_any).with_danger_skip_domain_validation(trust_any)));
         }
         let opts = Opts::from(b);
-        Ok(My { c: Conn::new(opts.clone())?, opts })
+        let mut c = Conn::new(opts.clone())?;
+        // A grid that stops reading leaves the server blocked on the socket; at the default 60 s
+        // net_write_timeout it drops the connection. Best effort: not every MySQL-wire engine has it.
+        let _ = c.query_drop("SET SESSION net_write_timeout = 3600");
+        Ok(My { c, opts })
     }
 }
 
@@ -72,6 +76,16 @@ fn column(c: &mysql::Column) -> (Column, Shape) {
 
 impl Backend for My {
     fn execute(&mut self, sql: &str, fetch: usize, sink: &mut dyn FnMut(Event) -> bool) -> Result<Option<u64>> {
+        // The grid stopped reading (closed, refreshed, next statement): the text protocol has no
+        // cursor and dropping the result would read every remaining row. KILL QUERY first, from
+        // a second connection, so the server stops sending; it runs before the drop, so it can
+        // only hit this statement.
+        let (id, opts) = (self.c.connection_id(), self.opts.clone());
+        let stop = move || {
+            if let Ok(mut k) = Conn::new(opts) {
+                let _ = k.query_drop(format!("KILL QUERY {id}"));
+            }
+        };
         let mut r = self.c.query_iter(sql)?;
         let mut b = Batcher::new(sink, fetch);
         let mut had_rows = false;
@@ -88,11 +102,12 @@ impl Backend for My {
             }
             had_rows = true;
             if !b.columns(cols) {
-                // ponytail: dropping the result drains remaining rows; KILL QUERY if that gets slow.
+                stop();
                 return Ok(None);
             }
             for row in set {
                 if !b.push(row?.unwrap().into_iter().zip(&shapes).map(|(v, s)| text(v, *s)).collect()) {
+                    stop();
                     return Ok(None);
                 }
             }

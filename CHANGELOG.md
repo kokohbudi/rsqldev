@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.5.0 — 2026-10-27
+
+### Features
+- **Data editor like SQL Developer**: Insert Row after the cursor row (Ctrl+I / Cmd+I), Duplicate Row, Delete Selected Row(s) (Ctrl+D / Cmd+D), Set to NULL, Revert Row, Paste of copied cells (tab-separated, from Excel too), Single Record View, Sort… on several columns (server side, Nulls First / Last). Commit (F11), Rollback (F12) and Refresh (Ctrl+R / Cmd+R) work in a table's Data tab.
+- **Messages - Log** under the Data tab: every statement posted, errors as "Row n: …", commit and rollback.
+- Preference **Post edits on row change**: a row goes to the database when the cursor leaves it; Commit then only commits.
+- **Editable query results**: a worksheet query of one table (no joins, grouping or subqueries) can be edited in the grid and posted with Commit.
+- View Value: date picker for DATE / TIMESTAMP cells.
+- **Create / Edit Table** redone after SQL Developer: Columns with Column Properties (BYTE / CHAR units, Default on NULL, virtual columns, identity columns with start, increment, min, max, cache, cycle, order), Primary Key with column order, Unique Constraints, Foreign Keys (referenced table list, column pickers, On Delete), Check Constraints, Indexes with an expression picker, Storage Options (Oracle), table comment and temporary tables. Existing constraints can be renamed and enabled / disabled.
+- **Table submenus** in the Connections tree: Table ▸ (rename, copy with or without data, drop with cascade / purge, truncate, lock, comment, parallel, logging, count rows), Column ▸ (add, rename, drop, comment), Constraint ▸ (add primary key / foreign key / unique / check, enable / disable single, all or related foreign keys, rename, drop), Index ▸ (create, drop, rebuild online), Trigger ▸ (template, PK from sequence, enable / disable, drop). Each shows the exact SQL before it runs.
+
+### Bug fixes
+- Uncommitted grid edits are no longer lost silently: running another statement, refreshing / filtering / sorting the Data tab or closing the worksheet asks Commit, Discard or Cancel.
+- MySQL / SQL Server: closing or refreshing a large, partly fetched result no longer downloads every remaining row before the next statement runs.
+- MySQL: a result grid left idle for more than a minute no longer loses the connection.
+- PostgreSQL (autocommit): an idle result grid no longer keeps a transaction open with its locks; fetching continues when the grid is scrolled again.
+- The data editor shortcuts shown in tooltips (Ctrl+I, Ctrl+D, F11, F12) now work in the Data tab.
+
 ## v0.4.0 — 2026-10-23
 
 ### Features

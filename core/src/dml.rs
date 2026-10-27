@@ -175,9 +175,81 @@ pub fn delete(db: Db, table: &str, cols: &[Column], key: &Key, row: &[Cell]) -> 
     format!("DELETE{top} FROM {table} WHERE {}{tail}", cond(db, cols, key, row))
 }
 
+/// The one table a worksheet query reads, when its rows can be edited in the grid:
+/// `SELECT … FROM [owner.]table [alias] [WHERE …] [ORDER BY …]` without joins, grouping, set
+/// operators, DISTINCT or subqueries. Names come back as typed (`"Emp"` keeps its quotes;
+/// `[x]` / `` `x` `` become `"x"`), for `ddl::ident`.
+// ponytail: keyword scan, not a parser (a ' FROM ' inside a string literal can fool it); the
+// caller also checks every result column is a column of that table.
+pub fn single_table(sql: &str) -> Option<(Option<String>, String)> {
+    let s = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let s = s.trim_end_matches(';').trim();
+    let u = s.to_uppercase();
+    if !u.starts_with("SELECT ") || u.contains("(SELECT") || u.contains("( SELECT") {
+        return None;
+    }
+    let bad = [" JOIN ", " UNION ", " INTERSECT ", " EXCEPT ", " MINUS ", " GROUP BY ", " HAVING ", "DISTINCT ", " CONNECT BY ", " OVER (", " OVER(", " PIVOT", " MODEL "];
+    if bad.iter().any(|b| u.contains(b)) {
+        return None;
+    }
+    let from = u.find(" FROM ")? + " FROM ".len();
+    let rest = &s[from..];
+    let ru = &u[from..];
+    let end = [" WHERE ", " ORDER BY ", " FETCH ", " LIMIT ", " FOR UPDATE", " OFFSET ", " WITH "].iter().filter_map(|k| ru.find(k)).min().unwrap_or(rest.len());
+    let clause = rest[..end].trim();
+    if clause.contains([',', '(']) || clause.is_empty() {
+        return None;
+    }
+    let mut words = clause.split(' ');
+    let tref = words.next()?;
+    let tail: Vec<&str> = words.collect();
+    let alias_ok = match tail.as_slice() {
+        [] => true,
+        [a] => !a.eq_ignore_ascii_case("AS") && !a.contains('.'),
+        [as_, a] => as_.eq_ignore_ascii_case("AS") && !a.contains('.'),
+        _ => false,
+    };
+    if !alias_ok {
+        return None;
+    }
+    // Split owner.table outside quotes; [x] and `x` become "x".
+    let mut parts: Vec<String> = vec![String::new()];
+    let mut quote: Option<char> = None;
+    for ch in tref.chars() {
+        match (quote, ch) {
+            (None, '"' | '[' | '`') => {
+                quote = Some(if ch == '[' { ']' } else { ch });
+                parts.last_mut()?.push('"');
+            }
+            (Some(q), c) if c == q => {
+                quote = None;
+                parts.last_mut()?.push('"');
+            }
+            (None, '.') => parts.push(String::new()),
+            (_, c) => parts.last_mut()?.push(c),
+        }
+    }
+    match parts.as_slice() {
+        [t] if !t.is_empty() => Some((None, t.clone())),
+        [o, t] if !o.is_empty() && !t.is_empty() => Some((Some(o.clone()), t.clone())),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_table_queries() {
+        assert_eq!(single_table("select * from emp"), Some((None, "emp".into())));
+        assert_eq!(single_table("SELECT e.id, e.name\nFROM hr.emp e WHERE id > 1 ORDER BY 2;"), Some((Some("hr".into()), "emp".into())));
+        assert_eq!(single_table(r#"select * from "HR"."Emp" as x"#), Some((Some("\"HR\"".into()), "\"Emp\"".into())));
+        assert_eq!(single_table("select * from [dbo].[t]"), Some((Some("\"dbo\"".into()), "\"t\"".into())));
+        for q in ["select * from a, b", "select * from a join b on 1=1", "select count(*) from t group by x", "select distinct x from t", "select * from (select 1 from dual)", "select * from t where id in (select id from u)", "update t set x = 1", "select 1 from a union select 1 from b"] {
+            assert_eq!(single_table(q), None, "{q}");
+        }
+    }
 
     fn col(n: &str, t: &str, numeric: bool) -> Column {
         Column { name: n.into(), type_name: t.into(), numeric }

@@ -5,13 +5,15 @@ use wxdragon::prelude::*;
 pub fn show(parent: &Frame) {
     let app = crate::app();
     let mut p = app.prefs();
-    let dlg = Dialog::builder(parent, "Preferences").with_style(DialogStyle::DefaultDialogStyle).with_size(480, 340).build();
+    let dlg = Dialog::builder(parent, "Preferences").with_style(DialogStyle::DefaultDialogStyle).with_size(480, 370).build();
     let g = FlexGridSizer::builder(0, 2).with_vgap(8).with_hgap(10).build();
     g.add_growable_col(1, 1);
     let font = TextCtrl::builder(&dlg).with_value(&p.editor_font).build();
     let size = SpinCtrl::builder(&dlg).with_range(6, 48).with_initial_value(p.editor_font_size).build();
     let auto = CheckBox::builder(&dlg).with_label("Autocommit").build();
     auto.set_value(p.autocommit);
+    let post = CheckBox::builder(&dlg).with_label("Post edits on row change (data editor)").build();
+    post.set_value(p.post_on_row_change);
     let upd = CheckBox::builder(&dlg).with_label("Check for updates on start").build();
     upd.set_value(p.check_updates);
     let nls = TextCtrl::builder(&dlg).with_value(&p.nls_date_format).build();
@@ -22,6 +24,7 @@ pub fn show(parent: &Frame) {
     crate::ui::row(&dlg, &g, "Editor font", &font);
     crate::ui::row(&dlg, &g, "Font size", &size);
     crate::ui::row(&dlg, &g, "", &auto);
+    crate::ui::row(&dlg, &g, "", &post);
     crate::ui::row(&dlg, &g, "", &upd);
     crate::ui::row(&dlg, &g, "Oracle NLS date format", &nls);
     let note = StaticText::builder(&dlg).with_label("Connection settings apply to new connections.").build();
@@ -42,6 +45,7 @@ pub fn show(parent: &Frame) {
         p.editor_font_size = size.value();
         p.autocommit = auto.get_value();
         p.check_updates = upd.get_value();
+        p.post_on_row_change = post.get_value();
         p.nls_date_format = nls.get_value();
         let new_theme = THEMES[theme.get_selection().unwrap_or(0) as usize].0.to_string();
         let changed = new_theme != p.theme;

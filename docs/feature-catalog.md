@@ -1,6 +1,6 @@
 # rsqldev — Feature Catalog (spec from Oracle SQL Developer 26.2)
 
-Clean-room spec. Built only from the declarative metadata shipped with SQL Developer 26.2: extension.xml, accelerators*.xml, dialogs/actions XML, navigator/viewer XML, connection XML, English `.properties` bundles, and jar listings. No class files were decompiled and no SQL was copied. Each row says what a feature does or shows, not how SQL Developer builds it.
+Clean-room spec. Built only from the declarative metadata shipped with SQL Developer 26.2: extension.xml, accelerators*.xml, dialogs/actions XML, navigator/viewer XML, connection XML, English `.properties` bundles, and jar listings. No class files were decompiled and no SQL was copied. §4.2 / §4.3 come from the Data Modeler table editor bundles, `CreateDialogArb` and the table action XML of 26.2. Reports (§7.1) are out of scope for the table / row editor work. Each row says what a feature does or shows, not how SQL Developer builds it.
 
 **Priority tags:** `MVP` = needed for the first usable release. `P2` = next wave. `P3` = niche, or tied to a specific Oracle option.
 **Shortcut notation:** `W` = Windows/Linux, `M` = macOS. If no `M` value is given, the Mac preset (`Default MacOS X`) has no override and uses the same key as Windows.
@@ -373,6 +373,36 @@ Generic object viewer features: a **Freeze/Pin** view toggle (Ctrl+Shift+P / Cmd
 | Services | Create, Edit, Start, Stop, Delete | Details |
 | Status / Instance Viewer | — | Database Status, Host, Home, Listener; live instance dashboard (`P2`) |
 
+### 4.2 Create / Edit Table dialog (ext:datamodeler, core `CreateDialogArb`)
+
+Same dialog for Tables ▸ New Table… and Table ▸ Edit…; title "Create Table" / "Edit Table". Panels (left list): Columns, Primary Key, Unique Constraints, Indexes, Foreign Keys, Table Constraints, Comments, Storage Options, DDL, Summary. Every change is shown as DDL before it runs.
+
+| Panel | Fields | Priority |
+|---|---|---|
+| Header | Schema, Name, Temporary Table (Session / Transaction), Comment | MVP |
+| Columns | grid PK, Name, Data Type, Size, Scale, Not Null, Default, Comment; Add (Shift = insert before, Ctrl = after), Remove, Move Up / Down; **Column Properties**: Data type Simple / Complex, Type, Size / Precision, Scale, Units (BYTE / CHAR), Default, Default on NULL, Cannot be NULL, Virtual (Expression), Identity / Auto Increment (Generate ALWAYS / BY DEFAULT / BY DEFAULT ON NULL, Start With, Increment By, Min Value, Max Value, Cycle, Cache, Order) | MVP (identity, virtual: P2) |
+| Primary Key | Name, Enabled, Available ↔ Selected columns with Move Up / Down | MVP |
+| Unique Constraints | list (Add / Remove); Name, Enabled, Available ↔ Selected columns | MVP |
+| Foreign Keys | list; Name, Enabled, Referenced Schema, Referenced Table, Referenced Constraint, Associations (local column ↔ referenced column), On Delete (No Action / Cascade / Set Null) | MVP |
+| Table Constraints (check) | list; Name, Condition, Enabled | MVP |
+| Indexes | list (Add / Remove); Name, Unique, Index Expressions (Add / Remove / Move Up / Down, Order ASC / DESC) | MVP |
+| Storage Options | Tablespace, Pct Free, Pct Used, Ini Trans, Max Trans, extents, Buffer Pool, Logging | P2 |
+| DDL / Summary | the exact statements; OK runs them | MVP |
+
+Validation messages: a table must include at least one column; duplicate column name; size / scale out of range for the type; "Reducing the size of a column is not supported"; "An object named X already exists".
+
+### 4.3 Table actions (`META-INF/actions/oracle/table*.xml`)
+
+Each action opens a small form, then a confirmation that shows the exact SQL.
+
+| Submenu | Actions | Priority |
+|---|---|---|
+| Table | Rename, Copy (new owner, new name, Include Data), Drop (Cascade Constraints, Purge), Truncate (Storage), Lock (Lock Mode, No Wait), Comment, Parallel (Degree) / No Parallel, Logging, Count Rows, Generate Table API | MVP (Generate Table API: P3) |
+| Column | Add (name, data type, precision, scale), Rename, Drop, Comment, Normalize | MVP (Normalize: P3) |
+| Constraint | Add Primary Key / Foreign Key / Unique / Check, Enable all / Disable all, Enable / Disable Single (VALIDATE / NOVALIDATE), Enable / Disable Related Foreign Keys, Rename Single, Drop | MVP |
+| Index | Create Index, Drop, Rebuild (Online) | MVP |
+| Trigger | Create, Create (PK from Sequence) (trigger name, sequence name, column), Enable All / Disable All, Enable / Disable Single, Drop | MVP |
+
 ---
 
 ## 5. SQL Worksheet
@@ -477,7 +507,7 @@ Top-level: `/`, `@`, `@@`, `ACCEPT`, `APPEND`, `ARCHIVE LOG`, `BREAK`, `BTITLE`,
 | Zebra / checkerboard rows | pref | P2 |
 | Struct / XML / LOB display | struct values inline (pref); XML in grid (pref); LOB/large text cell → popup editor (…); BLOB: view as image/text, load/save to file, external editor | P2 |
 | Cell popup editor | Alt+Enter: view/edit long text, date picker | MVP |
-| Data editing (Data tab and editable queries) | Insert Row (Ctrl+I / Cmd+I), Duplicate Row, Delete Selected Row(s) (Ctrl+D / Cmd+D), edit cells inline; changed rows marked; Commit Changes (F11), Rollback Changes (F12), Refresh (Ctrl+R / Cmd+R); "Post edits on row change" and autocommit prefs; errors reported per row ("Row n: message") | MVP |
+| Data editing (Data tab and editable queries) | Insert Row (Ctrl+I / Cmd+I), Duplicate Row, Delete Selected Row(s) (Ctrl+D / Cmd+D), edit cells inline; changed rows marked; Commit Changes (F11), Rollback Changes (F12), Refresh (Ctrl+R / Cmd+R); "Post edits on row change" and autocommit prefs; errors reported per row ("Row n: message") in the Messages - Log; Rollback asks "Do you want to rollback changes ?"; context menu Insert Row, Duplicate Row, Delete Selected Row(s), Paste (reports values it cannot paste), Single Record View, Count Rows…, Sort… (multi-column), Filter Column…, Remove All Filters | MVP |
 | Date/number formatting | follows NLS prefs (date/timestamp formats) | MVP |
 | Charts / graphical view in reports | | P3 |
 
