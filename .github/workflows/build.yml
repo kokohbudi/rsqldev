@@ -20,7 +20,7 @@ env:
   SAVE_CACHE: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' }}
   # rust-cache keys hash dependencies only, not [profile.*]: bump this after changing a
   # profile, or every run restores stale artifacts, rebuilds everything and never re-saves.
-  CACHE_PREFIX: v1-rust
+  CACHE_PREFIX: v2-rust
 jobs:
   macos:
     runs-on: macos-latest

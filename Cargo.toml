@@ -13,3 +13,8 @@ version = "0.5.0"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+# Dependencies (DuckDB, wxWidgets, SQLite C/C++ code) without debug info: a debug DuckDB alone
+# was 2.8 GB per build variant. Our own crates keep it for backtraces.
+[profile.dev.package."*"]
+debug = false
