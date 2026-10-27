@@ -95,7 +95,10 @@ impl Conn {
         let work = lane(Session::open(cfg.clone(), password.clone(), prefs.clone()));
         // DuckDB locks the file per database instance: one session only. In-memory SQLite too.
         let shared = kind == Kind::Duckdb || (kind == Kind::Sqlite && cfg.database.is_empty());
-        let meta = (!shared).then(|| lane(Session::open(cfg.clone(), password, prefs.clone())));
+        // The metadata session only reads: always autocommit. Without it every catalog query
+        // opened a transaction that never ended, holding SQLite's shared lock (the work
+        // session's COMMIT failed with "database is locked") and a PostgreSQL snapshot.
+        let meta = (!shared).then(|| lane(Session::open(cfg.clone(), password, Prefs { autocommit: true, ..prefs.clone() })));
         let c = Rc::new(RefCell::new(Conn { cfg, kind, prefs, schema: String::new(), work, meta, state: State::Connecting, ready: false, schema_asked: false, waiters: vec![], open_fetch: None, names: HashMap::new(), columns: HashMap::new() }));
         let weak = Rc::downgrade(&c);
         crate::hub::every_tick(move || match weak.upgrade() {
