@@ -1386,6 +1386,9 @@ fn start(prefs0: config::Prefs) {
             app.autosave_tick();
             app.open.borrow_mut().clear();
             rsqldev_core::lob::cleanup_mine();
+            // The event loop outlives the frame while other top-level windows remain (an
+            // editor's completion / call tip popup): the tick would then reach a freed frame.
+            app._timer.stop();
             e.skip(true);
         });
         frame.show(true);
@@ -1447,7 +1450,7 @@ fn selftest(name: String) {
                 }
                 // Data editor: a table edited in its Data tab, then as an editable query result.
                 2 => {
-                    ws.editor.set_text("create table rsq_edit (id int primary key, name varchar(20));\ninsert into rsq_edit values (1, 'a');\ninsert into rsq_edit values (2, 'b');\ncommit;\n");
+                    ws.editor.set_text("drop table rsq_edit;\ncreate table rsq_edit (id int primary key, name varchar(20));\ninsert into rsq_edit values (1, 'a');\ninsert into rsq_edit values (2, 'b');\ncommit;\n");
                     ws.run_script();
                     step = 10;
                 }
