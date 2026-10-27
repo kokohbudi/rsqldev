@@ -1413,6 +1413,18 @@ fn selftest(name: String) {
             match step {
                 0 if rows > 0 || el > 15.0 => {
                     eprintln!("SELFTEST run_statement rows={rows} done={done}");
+                    ws.results.fetch_all(|| {});
+                    step = 30;
+                }
+                // Fetch All drains every batch, then a sort (descending on the second click).
+                30 if done || el > 20.0 => {
+                    ws.results.sort_by(0);
+                    ws.results.sort_by(0);
+                    let st = ws.results.st.borrow();
+                    let first = st.rows.first().and_then(|r| r.cur[0].clone());
+                    let last = st.rows.last().and_then(|r| r.cur[0].clone());
+                    eprintln!("SELFTEST fetch_all rows={} done={} sorted desc first={first:?} last={last:?}", st.rows.len(), st.done);
+                    drop(st);
                     ws.editor.set_text("create table rsq_ui (id int, name varchar(20));\ninsert into rsq_ui values (1, 'a');\nselect * from rsq_ui;\ndrop table rsq_ui;\n");
                     ws.run_script();
                     step = 1;

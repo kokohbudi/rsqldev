@@ -867,7 +867,7 @@ impl ResultGrid {
         self.changed();
     }
 
-    fn sort_by(&self, col: usize) {
+    pub(crate) fn sort_by(&self, col: usize) {
         {
             let mut st = self.st.borrow_mut();
             let asc = !matches!(st.sort, Some((c, true)) if c == col);
