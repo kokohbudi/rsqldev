@@ -169,7 +169,7 @@ fn confirm_run(parent: &dyn WxWidget, conn: &ConnRef, stmts: Result<Vec<String>,
         Err(e) => return crate::ui::error(parent, &e),
     };
     let text = stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
-    if crate::ui::confirm(parent, &format!("Run on {}?\n\n{text}", conn.borrow().cfg.name)) {
+    if crate::ui::confirm_sql(parent, &format!("Run on {}?", conn.borrow().cfg.name), &text) {
         crate::table_editor::run(conn.clone(), stmts, 0, done);
     }
 }

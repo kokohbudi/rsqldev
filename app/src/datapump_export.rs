@@ -232,11 +232,7 @@ fn dialog(conn: ConnRef, env: Env, dirs: Vec<String>) {
 
     // PL/SQL.
     let pp = Panel::builder(&nb).build();
-    let text = TextCtrl::builder(&pp).with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::DontWrap).build();
-    let prefs = crate::app().prefs();
-    if let Some(f) = Font::new_with_details(prefs.editor_font_size, FontFamily::Teletype as i32, 0, 400, false, &prefs.editor_font) {
-        text.set_font(&f);
-    }
+    let text = crate::editor::sql_view(&pp, "");
     let ps = BoxSizer::builder(Orientation::Vertical).build();
     ps.add(&text, 1, SizerFlag::Expand, 0);
     pp.set_sizer(ps, true);
@@ -328,7 +324,7 @@ fn dialog(conn: ConnRef, env: Env, dirs: Vec<String>) {
         Some(2) => sy(),
         Some(3) => {
             sy();
-            text.set_value(&match bl() {
+            crate::editor::show(&text, &match bl() {
                 Ok(b) => b,
                 Err(e) => format!("-- Cannot generate the block yet:\n-- {e}"),
             });
@@ -369,7 +365,7 @@ fn dialog(conn: ConnRef, env: Env, dirs: Vec<String>) {
             Ok(x) => x,
             Err(e) => return ui::error(&dlg, &e),
         };
-        if ui::confirm(&dlg, &format!("Start this export on {cn}?\n\n{b}")) {
+        if ui::confirm_sql(&dlg, &format!("Start this export on {cn}?"), &b) {
             let password = spec.encrypt.then(|| pw.get_value());
             *p2.borrow_mut() = Some(Picked::Run(spec, b, password));
             dlg.end_modal(ID_OK);

@@ -23,9 +23,9 @@ pub struct Worksheet {
     conn_choice: Choice,
     bottom: AuiNotebook,
     pub results: ResultGrid,
-    script_out: TextCtrl,
+    script_out: StyledTextCtrl,
     explain: ResultGrid,
-    dbms: TextCtrl,
+    dbms: StyledTextCtrl,
     /// Query Result pane message ("All Rows Fetched: 14 in 0.003 seconds").
     status: StaticText,
     /// Script Output pane message ("Task completed in 0.04 seconds").
@@ -124,14 +124,8 @@ impl Worksheet {
         let split = SplitterWindow::builder(&panel).build();
         let editor = editor::new_editor(&split, &prefs.editor_font, prefs.editor_font_size);
         let bottom = AuiNotebook::builder(&split).with_style(AuiNotebookStyle::from_bits_retain(0x1 | 0x20 | 0x100)).build();
-        let mono = |p: &Panel| {
-            let t = TextCtrl::builder(p).with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::DontWrap).build();
-            crate::copy::text(t);
-            if let Some(f) = Font::new_with_details(prefs.editor_font_size, FontFamily::Teletype as i32, 0, 400, false, &prefs.editor_font) {
-                t.set_font(&f);
-            }
-            t
-        };
+        // Output panes: read-only, highlighted like the editor.
+        let mono = |p: &Panel| editor::sql_view(p, "");
         let (qp, qs, qb, status) = pane(&bottom, &[("refresh", "Refresh (re-run)"), ("export", "Export…"), ("edit", "View / Edit Value… (Alt+Enter)")]);
         let results = ResultGrid::new(&qp);
         results.st.borrow_mut().db = Some(conn.borrow().kind);
@@ -214,11 +208,11 @@ impl Worksheet {
             (qb[0], Worksheet::rerun),
             (qb[1], |w| w.results.export_dialog()),
             (qb[2], |w| w.results.edit_value()),
-            (sb[0], |w| w.script_out.clear()),
-            (sb[1], |w| save_text(&w.panel, &w.script_out.get_value())),
+            (sb[0], |w| editor::show(&w.script_out, "")),
+            (sb[1], |w| save_text(&w.panel, &w.script_out.get_text())),
             (db[0], |w| w.set_output(true)),
-            (db[1], |w| w.dbms.clear()),
-            (db[2], |w| save_text(&w.panel, &w.dbms.get_value())),
+            (db[1], |w| editor::show(&w.dbms, "")),
+            (db[2], |w| save_text(&w.panel, &w.dbms.get_text())),
         ];
         for (b, f) in acts {
             let w = Rc::downgrade(&ws);
@@ -390,10 +384,8 @@ impl Worksheet {
     }
 
     fn out(&self, text: &str) {
-        self.script_out.append_text(text);
-        if !text.ends_with('\n') {
-            self.script_out.append_text("\n");
-        }
+        let nl = if text.ends_with('\n') { "" } else { "\n" };
+        editor::append(&self.script_out, &format!("{text}{nl}"));
         if let Some(mut f) = self.spool.borrow().as_ref() {
             use std::io::Write;
             let _ = writeln!(f, "{}", text.trim_end_matches('\n'));
@@ -401,8 +393,8 @@ impl Worksheet {
     }
 
     fn dbms_lines(&self, lines: &[String]) {
-        for l in lines {
-            self.dbms.append_text(&format!("{l}\n"));
+        if !lines.is_empty() {
+            editor::append(&self.dbms, &(lines.join("\n") + "\n"));
         }
         if !lines.is_empty() {
             self.bottom.set_selection(P_DBMS);
@@ -437,8 +429,7 @@ impl Worksheet {
     /// DELETE / UPDATE without WHERE: ask before it touches every row.
     fn allow(&self, sql: &str) -> bool {
         let Some(verb) = script::unbounded_dml(sql) else { return true };
-        let head: String = sql.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
-        crate::ui::confirm(&self.panel, &format!("{verb} without WHERE changes every row of the table:\n\n{head}\n\nRun it anyway?"))
+        crate::ui::confirm_sql(&self.panel, &format!("{verb} without WHERE changes every row of the table. Run it anyway?"), sql)
     }
 
     /// Tint editor lines named in a compile-error report (`LINE/COL  ERROR` rows, numbered from
@@ -503,7 +494,7 @@ impl Worksheet {
         };
         let Some(item) = item else { return };
         if item.kind == script::Kind::Command {
-            self.script_out.clear();
+            editor::show(&self.script_out, "");
             self.run_items(vec![item], 0);
             return;
         }
@@ -541,7 +532,7 @@ impl Worksheet {
             let secs = format!("{:.3} seconds", d.elapsed.as_secs_f32());
             match d.result {
                 Err(e) => {
-                    me.script_out.clear();
+                    editor::show(&me.script_out, "");
                     me.out(&format!("Error starting at line : {line} in command -\n{sql2}\nError report -\n{e}"));
                     me.mark_errors(line, &e);
                     me.bottom.set_selection(P_SCRIPT);
@@ -550,7 +541,7 @@ impl Worksheet {
                     el.set_label(&secs);
                 }
                 Ok(aff) if !query => {
-                    me.script_out.clear();
+                    editor::show(&me.script_out, "");
                     me.out(&script::feedback(&sql2, aff));
                     me.bottom.set_selection(P_SCRIPT);
                     task.set_label(&format!("Task completed in {secs}"));
@@ -659,7 +650,7 @@ impl Worksheet {
         if items.is_empty() {
             return;
         }
-        self.script_out.clear();
+        editor::show(&self.script_out, "");
         self.bottom.set_selection(P_SCRIPT);
         self.started.set(Some(Instant::now()));
         self.running.set(true);
@@ -691,7 +682,7 @@ impl Worksheet {
                 Action::Run(sql) => return self.script_sql(sql, item.start, items, i, Box::new(next)),
                 Action::Print(t) => self.out(&t),
                 Action::Output(on) => self.set_output(on),
-                Action::Clear => self.script_out.clear(),
+                Action::Clear => editor::show(&self.script_out, ""),
                 Action::Nothing => {}
                 Action::Spool(p) => {
                     *self.spool.borrow_mut() = None;
@@ -924,7 +915,7 @@ impl Worksheet {
     /// (fetched rows, all fetched, script output) for the self-test.
     pub fn probe(&self) -> (usize, bool, String) {
         let st = self.results.st.borrow();
-        (st.rows.len(), st.done, self.script_out.get_value())
+        (st.rows.len(), st.done, self.script_out.get_text())
     }
 
     pub fn open_file(&self, p: PathBuf) -> std::io::Result<()> {

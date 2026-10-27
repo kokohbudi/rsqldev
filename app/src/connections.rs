@@ -457,7 +457,7 @@ impl Navigator {
                     },
                     M_COMPILE => format!("ALTER {} {q} COMPILE", if kind == dialect::PACKAGE { "PACKAGE" } else { kind }),
                     M_REBUILD => match rsqldev_core::ddl::rebuild_index(db, &owner, "", &name) {
-                        Some(s) if crate::ui::confirm(&self.tree, &format!("Rebuild index {q}?\n\n{s}")) => s,
+                        Some(s) if crate::ui::confirm_sql(&self.tree, &format!("Rebuild index {q}?"), &s) => s,
                         _ => return,
                     },
                     _ => return,

@@ -556,11 +556,7 @@ fn dialog(conn: ConnRef, owner: String, old: Option<TableDef>, start: Start, don
 
     // DDL.
     let dp = Panel::builder(&nb).build();
-    let ddl_text = TextCtrl::builder(&dp).with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::DontWrap).build();
-    let prefs = crate::app().prefs();
-    if let Some(f) = Font::new_with_details(prefs.editor_font_size, FontFamily::Teletype as i32, 0, 400, false, &prefs.editor_font) {
-        ddl_text.set_font(&f);
-    }
+    let ddl_text = crate::editor::sql_view(&dp, "");
     let ds = BoxSizer::builder(Orientation::Vertical).build();
     ds.add(&ddl_text, 1, SizerFlag::Expand, 0);
     dp.set_sizer(ds, true);
@@ -923,7 +919,7 @@ fn dialog(conn: ConnRef, owner: String, old: Option<TableDef>, start: Start, don
     };
     let b2 = build.clone();
     let show_ddl = move || {
-        ddl_text.set_value(&match b2() {
+        crate::editor::show(&ddl_text, &match b2() {
             Ok(s) if s.is_empty() => "-- No changes.".into(),
             Ok(s) => script(&s),
             Err(e) => format!("-- Cannot generate the DDL yet:\n-- {e}"),
@@ -964,7 +960,7 @@ fn dialog(conn: ConnRef, owner: String, old: Option<TableDef>, start: Start, don
     ok.on_click(move |_| match b4() {
         Ok(s) if s.is_empty() => crate::ui::info(&dlg, "No changes."),
         Ok(s) => {
-            if crate::ui::confirm(&dlg, &format!("Run on {conn_name}?\n\n{}", script(&s))) {
+            if crate::ui::confirm_sql(&dlg, &format!("Run on {conn_name}?"), &script(&s)) {
                 *p2.borrow_mut() = Some((true, s));
                 dlg.end_modal(ID_OK);
             }

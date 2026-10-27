@@ -132,6 +132,29 @@ pub fn new_editor(parent: &dyn WxWidget, font_face: &str, font_size: i32) -> Sty
     stc
 }
 
+/// Read-only highlighted SQL (DDL panes, script previews, confirmations), editor font.
+pub fn sql_view(parent: &dyn WxWidget, text: &str) -> StyledTextCtrl {
+    let prefs = crate::app().prefs();
+    let stc = new_editor(parent, &prefs.editor_font, prefs.editor_font_size);
+    show(&stc, text);
+    stc
+}
+
+/// Replace the text of a read-only [`sql_view`].
+pub fn show(stc: &StyledTextCtrl, text: &str) {
+    stc.set_read_only(false);
+    stc.set_text(text);
+    stc.set_read_only(true);
+}
+
+/// Append to a read-only [`sql_view`] and scroll to the end.
+pub fn append(stc: &StyledTextCtrl, text: &str) {
+    stc.set_read_only(false);
+    stc.append_text(text);
+    stc.set_read_only(true);
+    stc.goto_pos(stc.get_length());
+}
+
 /// Bracket at or just before the caret, if any.
 fn brace_at(stc: &StyledTextCtrl) -> Option<i32> {
     let p = stc.get_current_pos();

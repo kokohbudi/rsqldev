@@ -37,7 +37,7 @@ struct DataTab {
     filter: TextCtrl,
     status: StaticText,
     /// Messages - Log: executed DML, "Row n: error", commit / rollback.
-    log: TextCtrl,
+    log: StyledTextCtrl,
     /// Sort… keys, appended as ORDER BY.
     order: RefCell<Vec<dialect::SortKey>>,
     /// Posts the grid edits (editable tables).
@@ -197,7 +197,7 @@ impl ObjectView {
                 &self.name,
                 d.grid.clone(),
                 d.hidden,
-                move |line| log.append_text(&format!("{line}\n")),
+                move |line| crate::editor::append(&log, &format!("{line}\n")),
                 move || {
                     if let Some(me) = me.upgrade() {
                         me.load_data()
@@ -489,10 +489,9 @@ impl DataTab {
         let grid = ResultGrid::new(&p);
         grid.st.borrow_mut().db = Some(db);
         let status = StaticText::builder(&p).with_label(" ").build();
-        let log = TextCtrl::builder(&p).with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::DontWrap).build();
+        let log = crate::editor::sql_view(&p, "");
         log.set_min_size(Size::new(-1, 90));
         log.set_tooltip("Messages - Log: statements posted, errors per row, commit / rollback");
-        crate::copy::text(log);
         let s = BoxSizer::builder(Orientation::Vertical).build();
         s.add_sizer(&bar, 0, SizerFlag::Expand, 0);
         s.add(&grid.grid, 1, SizerFlag::Expand, 0);
