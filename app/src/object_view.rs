@@ -445,6 +445,11 @@ Review them in the grid, then Commit (F11) to insert.",
         }
     }
 
+    /// The Data tab's grid (self-test).
+    pub fn data_grid(&self) -> Option<ResultGrid> {
+        self.data.as_ref().map(|d| d.grid.clone())
+    }
+
     /// The Data tab is the selected tab (keys F11, F12, Ctrl+I, Ctrl+D, Ctrl+R, paste go to it).
     pub fn data_active(&self) -> bool {
         let sel = self.nb.get_selection();

@@ -457,6 +457,11 @@ impl Worksheet {
         }
     }
 
+    /// The Query Result is editable (self-test).
+    pub fn result_editable(&self) -> bool {
+        self.dml.borrow().is_some()
+    }
+
     /// Query Result edits not committed yet (closing the worksheet asks).
     pub fn has_unsaved_edits(&self) -> bool {
         self.dml.borrow().as_ref().is_some_and(|e| e.pending())

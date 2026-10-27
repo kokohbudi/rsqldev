@@ -1368,7 +1368,74 @@ fn selftest(name: String) {
                     eprintln!("SELFTEST run_script output:\n{out}");
                     step = 2;
                 }
+                // Data editor: a table edited in its Data tab, then as an editable query result.
                 2 => {
+                    ws.editor.set_text("create table rsq_edit (id int primary key, name varchar(20));\ninsert into rsq_edit values (1, 'a');\ninsert into rsq_edit values (2, 'b');\ncommit;\n");
+                    ws.run_script();
+                    step = 10;
+                }
+                10 if out.contains("Commit") || el > 45.0 => {
+                    let conn = ws.conn().borrow().cfg.name.clone();
+                    let schema = ws.conn().borrow().schema.clone();
+                    app().open_object(&conn, &schema, rsqldev_core::dialect::TABLE, &rsqldev_core::dialect::fold(kind, "rsq_edit"));
+                    step = 11;
+                }
+                11 | 12 | 13 => {
+                    let a = app();
+                    let v = a.pages.borrow().iter().find_map(|p| if let Page::Obj(o) = p { Some(o.clone()) } else { None });
+                    let Some(v) = v else { return true };
+                    if step == 11 {
+                        v.select_tab("Data");
+                        step = 12;
+                        return true;
+                    }
+                    let Some(g) = v.data_grid() else { return true };
+                    let n = g.st.borrow().rows.len();
+                    if step == 12 && n >= 2 && g.st.borrow().done {
+                        let w = g.st.borrow().cols.len();
+                        let name_col = w - 1;
+                        g.set_cell(0, name_col, Some("a2".into()));
+                        g.move_cursor(1, name_col as i32, false);
+                        g.delete_selected_rows();
+                        g.move_cursor(1, name_col as i32, false);
+                        g.insert_row();
+                        g.set_cell(2, name_col - 1, Some("3".into()));
+                        g.set_cell(2, name_col, Some("c".into()));
+                        eprintln!("SELFTEST data tab: {} rows, pending edits, commit", g.st.borrow().rows.len());
+                        v.commit();
+                        step = 13;
+                    } else if step == 13 && !g.st.borrow().rows.iter().any(|r| r.dirty()) && g.st.borrow().done {
+                        eprintln!("SELFTEST data tab after commit: {:?}", g.st.borrow().rows.iter().map(|r| r.cur.iter().skip(g.st.borrow().hidden).cloned().collect::<Vec<_>>()).collect::<Vec<_>>());
+                        a.nb.set_selection(a.nb.get_page_index(&ws.panel) as usize);
+                        ws.editor.set_text("select id, name from rsq_edit order by id");
+                        ws.run_statement();
+                        step = 14;
+                    } else if el > 90.0 {
+                        eprintln!("SELFTEST data tab timed out at step {step}");
+                        step = 20;
+                    }
+                }
+                14 if ws.result_editable() && done => {
+                    ws.results.set_cell(0, 1, Some("w".into()));
+                    ws.commit();
+                    step = 15;
+                }
+                15 if !ws.has_unsaved_edits() && el > 1.0 => {
+                    step = 16;
+                }
+                16 if done && rows > 0 => {
+                    let st = ws.results.st.borrow();
+                    eprintln!("SELFTEST worksheet after commit: {:?}", st.rows.iter().map(|r| r.cur.clone()).collect::<Vec<_>>());
+                    drop(st);
+                    ws.editor.set_text("drop table rsq_edit");
+                    ws.run_statement();
+                    step = 20;
+                }
+                14..=16 if el > 120.0 => {
+                    eprintln!("SELFTEST worksheet edit timed out at step {step} editable={}", ws.result_editable());
+                    step = 20;
+                }
+                20 => {
                     let a = app();
                     eprintln!("SELFTEST pages={} history={}", a.pages.borrow().len(), a.history().len());
                     if std::env::var("RSQLDEV_SELFTEST_KEEP").is_ok() {
