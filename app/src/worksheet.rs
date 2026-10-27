@@ -271,6 +271,16 @@ impl Worksheet {
                 w.unsaved.set(true);
             }
         });
+        // Ctrl/Cmd+F7 formats too (SQL Developer's key; the menu shows Ctrl/Cmd+Shift+F).
+        let w = Rc::downgrade(&ws);
+        ws.editor.on_key_down(move |e| {
+            if let (WindowEventData::Keyboard(k), Some(w)) = (&e, w.upgrade()) {
+                if k.cmd_down() && k.get_key_code() == Some(wxdragon::keycode::WXK_F7) {
+                    return w.format_sql();
+                }
+            }
+            e.skip(true);
+        });
         // Ctrl+Click (Cmd+Click on macOS): open the object under the caret.
         let w = Rc::downgrade(&ws);
         ws.editor.on_mouse_left_up(move |_| {

@@ -1039,7 +1039,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_SELECTALL, "Select &All\tCtrl+A", "")
         .append_separator()
         .append_item(ID_COMPLETE, "Completion &Insight\tRawCtrl+Space", "Complete keywords, tables and columns")
-        .append_item(ID_FORMAT, "F&ormat SQL\tCtrl+F7", "Format the selection, or the whole worksheet")
+        .append_item(ID_FORMAT, "F&ormat SQL\tCtrl+Shift+F", "Format the selection, or the whole worksheet (also Ctrl+F7)")
         .append_item(ID_SNIPPET, "Insert S&nippet…\tCtrl+Shift+J", "Insert a SQL template at the caret")
         .append_item(ID_SNIPPET_SAVE, "Save Selection as Snippet…", "Keep the selected SQL as one of your snippets")
         .append_separator()
@@ -1159,7 +1159,7 @@ Data tab (table editor)
 
 Editor
   Completion Insight       Ctrl+Space (also after typing alias.)
-  Format SQL               Ctrl/Cmd+F7
+  Format SQL               Ctrl/Cmd+Shift+F (or Ctrl/Cmd+F7)
   Insert Snippet           Ctrl/Cmd+Shift+J
   Duplicate Lines          Ctrl/Cmd+Shift+D
   Move Lines Up / Down     Alt+Up / Alt+Down
