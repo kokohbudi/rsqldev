@@ -14,7 +14,7 @@ Native SQL Developer clone. Rust + wxWidgets via wxDragon 0.9.23 (real Cocoa / W
 - `docs/feature-catalog.md` — SQL Developer feature spec. `docs/superpowers/` — specs + plans. `site/index.html` — download page (GitHub Pages, English).
 
 ## Commands
-- Check before every commit: `cargo check --workspace --message-format short` (<1 s warm; `target/` ≈10 GB on purpose, keep it).
+- Check before every commit: `cargo check --workspace --message-format short` (<1 s warm; `target/` ≈8 GB with tests: dependencies build without debug info, keep it).
 - Core tests: `cargo test -p rsqldev-core` (fast: unit + SQLite/DuckDB). CI runs it on Linux.
 - NEVER locally: release builds, `scripts/bundle-macos.sh` (universal), Docker / `--ignored` backend suite — slow, CI does them.
 - UI self-test: `RSQLDEV_CONFIG_DIR=/tmp/cfg RSQLDEV_SELFTEST="<conn>" RSQLDEV_SELFTEST_PW=<pw> cargo run -p rsqldev`.
