@@ -38,6 +38,17 @@ pub fn confirm_no(parent: &dyn WxWidget, msg: &str) -> bool {
         == ID_YES
 }
 
+/// Uncommitted grid edits: Some(true) Commit, Some(false) Discard, None Cancel.
+pub fn commit_discard(parent: &dyn WxWidget, msg: &str) -> Option<bool> {
+    let d = MessageDialog::builder(parent, &format!("{msg}\n\nCommit them first?"), "rsqldev").with_style(MessageDialogStyle::YesNo | MessageDialogStyle::Cancel | MessageDialogStyle::IconQuestion).build();
+    d.set_yes_no_labels("Commit", "Discard");
+    match d.show_modal() {
+        ID_YES => Some(true),
+        ID_NO => Some(false),
+        _ => None,
+    }
+}
+
 pub fn ask(parent: &dyn WxWidget, msg: &str, title: &str, default: &str) -> Option<String> {
     let d = TextEntryDialog::builder(parent, msg, title).with_default_value(default).build();
     (d.show_modal() == ID_OK).then(|| d.get_value()).flatten()

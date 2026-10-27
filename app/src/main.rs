@@ -635,6 +635,9 @@ impl App {
             if s.editor.is_modified() && !s.editor.get_text().trim().is_empty() && !ui::confirm(&self.frame, "Close worksheet without saving?") {
                 return;
             }
+            if s.has_unsaved_edits() && !ui::confirm(&self.frame, "The Query Result has changes that are not committed. Close and discard them?") {
+                return;
+            }
         }
         if let Some(Page::Sheet(s)) = self.pages.borrow().get(i) {
             autosave::remove(s.autosave_id);
@@ -673,7 +676,7 @@ impl App {
                 ID_ROLLBACK => o.rollback(),
                 ID_INSERT_ROW => o.insert_row(),
                 ID_CLEAR => o.delete_rows(),
-                ID_REPLACE => o.load_data(),
+                ID_REPLACE => o.refresh_data(),
                 ID_PASTE if o.paste() => {}
                 _ => return self.menu_rest(id, sheet, editor_focus),
             }

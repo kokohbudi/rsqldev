@@ -33,6 +33,8 @@ pub struct Editor {
     log: Box<dyn Fn(&str)>,
     /// Show the rows again after COMMIT / ROLLBACK.
     reload: Box<dyn Fn()>,
+    /// Runs instead of `reload` after the next successful COMMIT ([`Editor::commit_then`]).
+    then: RefCell<Option<Box<dyn FnOnce()>>>,
     me: Weak<Editor>,
 }
 
@@ -53,6 +55,7 @@ impl Editor {
             posted: Cell::new(false),
             log: Box::new(log),
             reload: Box::new(reload),
+            then: RefCell::default(),
             me: me.clone(),
         });
         if let Some(sql) = dialect::pk_sql(db, owner, name) {
@@ -135,6 +138,25 @@ impl Editor {
         true
     }
 
+    /// Commit, then run `f` (the statement the user started) instead of reloading.
+    pub fn commit_then(&self, f: Box<dyn FnOnce()>) {
+        *self.then.borrow_mut() = Some(f);
+        if !self.commit() {
+            if let Some(f) = self.then.take() {
+                f()
+            }
+        }
+    }
+
+    /// Discard: forget grid edits; rows already posted (row change) are rolled back.
+    pub fn discard(&self) {
+        if self.posted.get() {
+            self.posted.set(false);
+            self.log("Rollback Done");
+            Conn::tx(&self.conn, Cmd::Rollback, |_| {});
+        }
+    }
+
     /// "Post edits on row change": the row the cursor left goes to the database now.
     fn post_row(&self, r: usize) {
         if self.busy.get() {
@@ -166,9 +188,13 @@ impl Editor {
                 match r {
                     Ok(_) => {
                         me.log(&format!("Commit Successful: {} statement(s)", stmts.len()));
-                        (me.reload)();
+                        match me.then.take() {
+                            Some(f) => f(),
+                            None => (me.reload)(),
+                        }
                     }
                     Err(e) => {
+                        me.then.take();
                         me.log(&format!("Commit failed: {e}"));
                         crate::ui::error(&me.grid.grid, &e)
                     }
@@ -184,6 +210,7 @@ impl Editor {
         let done = move |r: Result<Option<u64>, String>| {
             let Some(me) = me.upgrade() else { return };
             let fail = |msg: String| {
+                me.then.take();
                 me.busy.set(false);
                 me.posted.set(false);
                 me.log(&format!("Row {}: {msg}", row + 1));

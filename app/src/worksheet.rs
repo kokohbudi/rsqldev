@@ -433,7 +433,38 @@ impl Worksheet {
         self.editor.line_from_position(pos as i32) + 1
     }
 
+    /// Uncommitted edits in the Query Result: Commit (then `again`), Discard or Cancel.
+    /// True = do not go on now.
+    fn unsaved_edits(&self, again: fn(&Worksheet)) -> bool {
+        let Some(ed) = self.dml.borrow().clone().filter(|e| e.pending()) else { return false };
+        match crate::ui::commit_discard(&self.panel, "The Query Result has changes that are not committed.") {
+            Some(true) => {
+                let me = self.weak();
+                ed.commit_then(Box::new(move || {
+                    if let Some(me) = me.upgrade() {
+                        again(&me)
+                    }
+                }));
+                true
+            }
+            Some(false) => {
+                ed.discard();
+                *self.dml.borrow_mut() = None;
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// Query Result edits not committed yet (closing the worksheet asks).
+    pub fn has_unsaved_edits(&self) -> bool {
+        self.dml.borrow().as_ref().is_some_and(|e| e.pending())
+    }
+
     pub fn run_statement(&self) {
+        if self.unsaved_edits(Worksheet::run_statement) {
+            return;
+        }
         let sel = self.editor.get_selected_text();
         let item = if !sel.trim().is_empty() {
             script::split(&sel, self.kind()).into_iter().next()
@@ -503,6 +534,7 @@ impl Worksheet {
         if query {
             self.results.load(rows, 0, false);
             self.results.st.borrow_mut().count = Conn::counter(&self.conn(), &sql, self.status);
+            self.results.st.borrow_mut().resume = Conn::resume(&self.conn(), &sql);
             self.bottom.set_selection(P_RESULT);
             self.last_line.set(line);
             self.editable_result(&sql);
@@ -583,6 +615,9 @@ impl Worksheet {
     }
 
     pub fn run_script(&self) {
+        if self.unsaved_edits(Worksheet::run_script) {
+            return;
+        }
         self.editor.marker_delete_all(editor::MARK_ERROR);
         let (text, base) = self.source();
         let items: Vec<Item> = script::split(&text, self.kind())

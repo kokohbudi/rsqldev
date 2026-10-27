@@ -182,7 +182,7 @@ impl ObjectView {
                     set_text(e, text.trim_start());
                 });
             }
-            (View::Data, Page::Data) => self.load_data(),
+            (View::Data, Page::Data) => self.refresh_data(),
             _ => {}
         }
     }
@@ -221,7 +221,7 @@ impl ObjectView {
                 me.sort_dialog()
             }
         }));
-        let acts: [fn(&ObjectView); 5] = [ObjectView::insert_row, ObjectView::delete_rows, ObjectView::commit, ObjectView::rollback, ObjectView::load_data];
+        let acts: [fn(&ObjectView); 5] = [ObjectView::insert_row, ObjectView::delete_rows, ObjectView::commit, ObjectView::rollback, ObjectView::refresh_data];
         for (b, f) in d.buttons.iter().zip(acts) {
             let me = self.me.clone();
             b.on_click(move |_| {
@@ -239,7 +239,7 @@ impl ObjectView {
         let me = self.me.clone();
         d.filter.on_text_enter(move |_| {
             if let Some(me) = me.upgrade() {
-                me.load_data()
+                me.refresh_data()
             }
         });
     }
@@ -250,6 +250,22 @@ impl ObjectView {
         let f = d.filter.get_value();
         let sql = if f.trim().is_empty() { dq.sql } else { format!("{} WHERE {}", dq.sql, f.trim()) };
         (sql + &dialect::order_by(self.db, &d.order.borrow()), d)
+    }
+
+    /// Refresh / filter / sort: uncommitted edits ask Commit, Discard or Cancel first.
+    pub fn refresh_data(&self) {
+        let Some(ed) = self.data.as_ref().and_then(|d| d.ed.get()).filter(|e| e.pending()) else { return self.load_data() };
+        match crate::ui::commit_discard(&self.panel, &format!("Table {} has changes that are not committed.", self.name)) {
+            // The commit reloads the data.
+            Some(true) => {
+                ed.commit();
+            }
+            Some(false) => {
+                ed.discard();
+                self.load_data()
+            }
+            None => {}
+        }
     }
 
     pub fn load_data(&self) {
@@ -265,6 +281,7 @@ impl ObjectView {
         });
         d.grid.load(rows, d.hidden.map_or(0, |_| 1), d.editable);
         d.grid.st.borrow_mut().count = Conn::counter(&self.conn, &sql, d.status);
+        d.grid.st.borrow_mut().resume = Conn::resume(&self.conn, &sql);
     }
 
     /// Commit Changes (F11): post every pending row, then COMMIT.
@@ -346,7 +363,7 @@ impl ObjectView {
         };
         dlg.destroy();
         *d.order.borrow_mut() = keys;
-        self.load_data();
+        self.refresh_data();
     }
 
     /// Import CSV / Excel rows as pending inserts: headers matched to columns by name, review

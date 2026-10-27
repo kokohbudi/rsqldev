@@ -79,7 +79,20 @@ pub struct State {
     pub sort_dialog: Option<Rc<dyn Fn()>>,
     /// The cursor left this row ("Post edits on row change").
     pub on_row_leave: Option<Rc<dyn Fn(usize)>>,
+    /// Continue the result from row n with a new statement ([`crate::conn::Conn::resume`]):
+    /// set, an idle grid closes its cursor after [`IDLE_RELEASE`].
+    pub resume: Option<Rc<dyn Fn(usize) -> Rows>>,
+    /// The last batch arrived (idle measure).
+    last_batch: Option<std::time::Instant>,
+    /// Cursor closed while idle; the next fetch resumes.
+    released: bool,
+    /// Resumed statement: its column header is already shown.
+    resumed: bool,
 }
+
+/// Idle time before a resumable result closes its cursor (PostgreSQL autocommit transaction).
+// ponytail: fixed 30 s; servers with a shorter idle_in_transaction_session_timeout still cut it.
+const IDLE_RELEASE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct ResultGrid {
@@ -272,9 +285,32 @@ impl ResultGrid {
 
     fn pump(&self) {
         let (rx, hidden, fetch_all, n) = {
-            let st = self.st.borrow();
+            let mut st = self.st.borrow_mut();
+            let idle = st.last_batch.is_some_and(|t| t.elapsed() > IDLE_RELEASE);
+            if st.resume.is_some() && st.rx.is_some() && !st.done && !st.fetch_all && idle {
+                // Close the cursor (its transaction ends) until the grid wants more.
+                if let Some(rx) = st.rx.take() {
+                    rx.borrow_mut().take();
+                }
+                st.released = true;
+                drop(st);
+                crate::app().status(0, "Fetching paused while idle (the database transaction is released); scroll to continue");
+                return;
+            }
             match &st.rx {
                 Some(rx) => (rx.clone(), st.hidden, st.fetch_all, st.rows.len()),
+                None if st.released && !st.done => {
+                    let n = st.rows.len();
+                    let wants = st.fetch_all || self.grid.is_visible(n as i32 - 1, st.hidden as i32, false);
+                    let Some(f) = st.resume.clone().filter(|_| wants) else { return };
+                    st.released = false;
+                    st.resumed = true;
+                    st.last_batch = Some(std::time::Instant::now());
+                    drop(st);
+                    let rows = f(n);
+                    self.st.borrow_mut().rx = Some(rows);
+                    return;
+                }
                 None => return,
             }
         };
@@ -290,6 +326,7 @@ impl ResultGrid {
             }
         };
         match ev {
+            Ok(Event::Columns(_)) if self.st.borrow().resumed => {}
             Ok(Event::Columns(c)) => {
                 self.st.borrow_mut().cols = c;
                 self.redraw_all();
@@ -300,6 +337,7 @@ impl ResultGrid {
                 {
                     let mut st = self.st.borrow_mut();
                     st.rows.extend(batch.into_iter().map(Row::fetched));
+                    st.last_batch = Some(std::time::Instant::now());
                 }
                 self.append_rows(start);
                 if last {
