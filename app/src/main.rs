@@ -23,6 +23,7 @@ mod record;
 mod sessions;
 mod snippets;
 mod table_editor;
+mod table_menu;
 mod topsql;
 mod transfer;
 mod ui;

@@ -214,7 +214,7 @@ pub fn shown(db: Db, stored: &str) -> String {
     if ident(db, stored) == stored { stored.to_string() } else { format!("\"{}\"", stored.replace('"', "\"\"")) }
 }
 
-fn q(db: Db, name: &str) -> String {
+pub(crate) fn q(db: Db, name: &str) -> String {
     quote(db, &ident(db, name))
 }
 
@@ -224,7 +224,7 @@ fn table_q(db: Db, t: &TableDef) -> String {
 }
 
 /// `a, b DESC` → quoted, comma-joined.
-fn col_list(db: Db, s: &str, order: bool) -> Result<String, String> {
+pub(crate) fn col_list(db: Db, s: &str, order: bool) -> Result<String, String> {
     let mut out = vec![];
     for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         let (name, dir) = match part.rsplit_once(char::is_whitespace) {
@@ -333,7 +333,7 @@ fn sqlite_autoinc(db: Db, t: &TableDef) -> Result<bool, String> {
 }
 
 /// `name TYPE [DEFAULT x] [NOT NULL] [COMMENT '...']`, with identity / virtual clauses.
-fn col_def(db: Db, c: &ColumnDef) -> Result<String, String> {
+pub(crate) fn col_def(db: Db, c: &ColumnDef) -> Result<String, String> {
     let name = ident(db, &c.name);
     let expr = c.virtual_expr.trim();
     let default = c.default.trim();
@@ -371,7 +371,7 @@ fn col_def(db: Db, c: &ColumnDef) -> Result<String, String> {
     Ok(s)
 }
 
-fn con_def(db: Db, c: &ConstraintDef) -> Result<String, String> {
+pub(crate) fn con_def(db: Db, c: &ConstraintDef) -> Result<String, String> {
     let name = if c.name.trim().is_empty() { String::new() } else { format!("CONSTRAINT {} ", q(db, &c.name)) };
     if db == Db::Clickhouse && c.kind != ConKind::Check {
         return Err("ClickHouse has CHECK constraints only".into());
@@ -415,7 +415,7 @@ fn enable_sql(db: Db, t: &str, c: &ConstraintDef) -> Result<String, String> {
 }
 
 /// Rename a constraint (existing constraint or primary key with a new name).
-fn rename_constraint(db: Db, t: &str, owner: &str, old: &str, new: &str) -> Result<String, String> {
+pub(crate) fn rename_constraint(db: Db, t: &str, owner: &str, old: &str, new: &str) -> Result<String, String> {
     let nn = ident(db, new);
     match db {
         Db::Oracle | Db::Postgres => Ok(format!("ALTER TABLE {t} RENAME CONSTRAINT {} TO {}", quote(db, old), quote(db, &nn))),
@@ -468,7 +468,7 @@ fn check_columns(t: &TableDef, db: Db) -> Result<(), String> {
 }
 
 /// Table comment after CREATE / in Edit Table (MySQL and ClickHouse on create: table option).
-fn table_comment_sql(db: Db, table: &str, text: &str) -> Option<String> {
+pub(crate) fn table_comment_sql(db: Db, table: &str, text: &str) -> Option<String> {
     let t = lit(text);
     match db {
         Db::Oracle | Db::Postgres | Db::Duckdb => Some(format!("COMMENT ON TABLE {table} IS '{t}'")),
@@ -507,7 +507,7 @@ fn storage_clause(db: Db, st: &Storage) -> Result<String, String> {
     Ok(s)
 }
 
-fn comment_sql(db: Db, table: &str, col: &str, text: &str) -> Option<String> {
+pub(crate) fn comment_sql(db: Db, table: &str, col: &str, text: &str) -> Option<String> {
     match db {
         Db::Oracle | Db::Postgres | Db::Duckdb => Some(format!("COMMENT ON COLUMN {table}.{} IS '{}'", quote(db, col), lit(text))),
         Db::Clickhouse => Some(format!("ALTER TABLE {table} COMMENT COLUMN {} '{}'", quote(db, col), lit(text))),
@@ -778,7 +778,7 @@ pub fn alter_table(db: Db, old: &TableDef, new: &TableDef) -> Result<Vec<String>
     Ok(drops.into_iter().chain(body).chain(tail).collect())
 }
 
-fn engine(db: Db) -> &'static str {
+pub(crate) fn engine(db: Db) -> &'static str {
     match db {
         Db::Oracle => "Oracle",
         Db::Postgres => "PostgreSQL",
