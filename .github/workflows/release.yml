@@ -20,8 +20,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # main's run appears seconds after the push that precedes the tag; then wait for it.
-          for i in $(seq 1 240); do
+          # main's run appears seconds after the push that precedes the tag; then wait for it
+          # (two hours: an uncached universal macOS build takes about 40 minutes).
+          for i in $(seq 1 480); do
             json=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build.yml --branch main --commit "$GITHUB_SHA" --limit 1 --json databaseId,status,conclusion)
             id=$(jq -r '.[0].databaseId // empty' <<<"$json")
             if [ -z "$id" ] && [ "$i" -ge 8 ]; then
@@ -45,7 +46,7 @@ jobs:
             fi
             sleep 15
           done
-          echo "main build of $GITHUB_SHA did not finish within an hour"
+          echo "main build of $GITHUB_SHA did not finish within two hours"
           exit 1
 
   build:
