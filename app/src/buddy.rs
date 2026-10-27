@@ -64,6 +64,41 @@ impl Frames {
     }
 }
 
+/// Startup splash: the buddy beaming hello. Shown only while the main window is being built
+/// (no delay of its own); the caller destroys it once the main window is up.
+pub fn splash() -> Frame {
+    let pal = crate::theme::p();
+    let c = crate::theme::c;
+    let f = Frame::builder().with_title("rsqldev").with_style(FrameStyle::StayOnTop | FrameStyle::NoTaskbar).with_size(Size::new(300, 230)).build();
+    let p = Panel::builder(&f).build();
+    p.set_background_color(c(pal.bg));
+    let s = BoxSizer::builder(Orientation::Vertical).build();
+    s.add_stretch_spacer(1);
+    if let Some(b) = bundle_at(&svg(0.0, false, true), 96) {
+        let pic = StaticBitmap::new_with_bitmap_bundle(&p, ID_ANY as i32, &b);
+        s.add(&pic, 0, SizerFlag::AlignCenterHorizontal, 0);
+    }
+    let name = StaticText::builder(&p).with_label("rsqldev").build();
+    if let Some(font) = Font::new_with_details(22, FontFamily::Swiss as i32, 0, 700, false, "") {
+        name.set_font(&font);
+    }
+    name.set_foreground_color(c(pal.text));
+    s.add(&name, 0, SizerFlag::AlignCenterHorizontal | SizerFlag::Top, 8);
+    let note = StaticText::builder(&p).with_label(&format!("v{}  ·  starting…", env!("CARGO_PKG_VERSION"))).build();
+    note.set_foreground_color(c(pal.muted));
+    s.add(&note, 0, SizerFlag::AlignCenterHorizontal | SizerFlag::Top, 4);
+    s.add_stretch_spacer(1);
+    p.set_sizer(s, true);
+    f.center_on_screen();
+    f.show(true);
+    f.update();
+    f
+}
+
+fn bundle_at(s: &str, px: i32) -> Option<BitmapBundle> {
+    BitmapBundle::from_svg_text(s, Size::new(px, px))
+}
+
 /// Horizontal offset at tick `t` within `width` pixels: back and forth, 1 px per tick.
 pub fn walk(t: u32, width: i32) -> i32 {
     if width <= 0 {

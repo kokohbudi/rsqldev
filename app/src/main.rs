@@ -949,21 +949,29 @@ fn check_updates(manual: bool) {
 fn activity_bar(sb: StatusBar) {
     const F_TIME: usize = 4;
     const F_BAR: usize = 5;
-    // The buddy hops while the database works and beams for a second when it is done.
-    let Some(frames) = buddy::Frames::new() else { return };
-    let pet = StaticBitmap::new_with_bitmap_bundle(&sb, ID_ANY as i32, &frames.happy);
-    pet.show(false);
+    // The buddy hops while the database works and beams for a second when it is done. Its
+    // frames and widget are made on the first busy tick, not at startup.
+    let mut buddy: Option<(buddy::Frames, StaticBitmap)> = None;
     let mut since: Option<std::time::Instant> = None;
     let mut tick: u32 = 0;
     let mut cheer = 0;
     hub::every_tick(move || {
-        if !pet.is_valid() {
+        let busy = rsqldev_core::worker::busy() > 0 || conn::meta_pending() > 0;
+        // Idle (nearly always): nothing to do, nothing to repaint.
+        if !busy && since.is_none() && cheer == 0 {
+            return sb.is_valid();
+        }
+        if !sb.is_valid() {
             return false;
         }
-        let busy = rsqldev_core::worker::busy() > 0 || conn::meta_pending() > 0;
-        let r = sb.get_field_rect(F_BAR);
-        let x = |t| r.x + 4 + buddy::walk(t, r.width - 28);
-        let y = r.y + (r.height - 20) / 2;
+        if buddy.is_none() {
+            let Some(f) = buddy::Frames::new() else { return false };
+            let pet = StaticBitmap::new_with_bitmap_bundle(&sb, ID_ANY as i32, &f.happy);
+            pet.show(false);
+            buddy = Some((f, pet));
+        }
+        let (frames, pet) = buddy.as_ref().unwrap();
+        let pet = *pet;
         match (busy, since) {
             (true, None) => since = Some(std::time::Instant::now()),
             (false, Some(_)) => {
@@ -976,10 +984,16 @@ fn activity_bar(sb: StatusBar) {
             _ => {}
         }
         if let Some(t) = since {
-            // Shown at once: a click that waits on the database must never look like a hang.
+            // 20 frames a second is plenty for a 20 px hop: repaint every other tick.
             tick = tick.wrapping_add(1);
-            pet.set_bitmap_bundle(frames.at(tick));
-            pet.set_size_with_pos(x(tick), y, 20, 20);
+            if tick % 2 == 1 {
+                return true;
+            }
+            let r = sb.get_field_rect(F_BAR);
+            let f = tick / 2;
+            pet.set_bitmap_bundle(frames.at(f));
+            // Shown at once: a click that waits on the database must never look like a hang.
+            pet.set_size_with_pos(r.x + 4 + buddy::walk(f * 2, r.width - 28), r.y + (r.height - 20) / 2, 20, 20);
             pet.show(true);
             sb.set_status_text(&format!("Working {:.1} s", t.elapsed().as_secs_f32()), F_TIME);
         } else if cheer > 0 {
@@ -1258,6 +1272,27 @@ fn main() {
                 _ => wxdragon::appearance::Appearance::Light,
             });
         }
+        // Splash while the main window is built: shown first, the build runs on the next
+        // event loop turn (so the splash gets painted), and it goes once the window is up.
+        let splash = buddy::splash();
+        let go = Timer::new(&splash);
+        let once = std::cell::Cell::new(Some(prefs0.clone()));
+        go.on_tick(move |_| {
+            if let Some(p) = once.take() {
+                start(p);
+                splash.destroy();
+            }
+        });
+        go.start(1, true);
+        // ponytail: leaked on purpose; destroying the timer from its own tick is unsafe, and
+        // this one fires once at startup.
+        std::mem::forget(go);
+    });
+}
+
+/// Build and show the main window.
+fn start(prefs0: config::Prefs) {
+    {
         // Fit the usable screen area (menu bar / Dock / taskbar excluded), never off-screen.
         let (pos, size) = match wxdragon::display::Display::new(0).map(|d| d.client_area()) {
             Some(r) if r.width > 0 && r.height > 0 => {
@@ -1343,7 +1378,7 @@ fn main() {
         } else if a.prefs().check_updates {
             check_updates(false);
         }
-    });
+    }
 }
 
 /// RSQLDEV_SELFTEST=<connection> RSQLDEV_SELFTEST_PW=<pw>: drive the UI end to end, log, exit.
