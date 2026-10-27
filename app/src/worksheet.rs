@@ -246,6 +246,7 @@ impl Worksheet {
                 app.status(1, &format!("Line {} Column {col}", line + 1));
                 app.status(2, "Insert");
                 app.status(3, if e.is_modified() { "Modified" } else { "" });
+                crate::complete::insert_tip(e, &w.conn());
             }
         });
         let w = Rc::downgrade(&ws);

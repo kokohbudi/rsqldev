@@ -3,8 +3,8 @@
 //! (or the tables of schema `x`). Names come from the connection's metadata cache.
 
 use crate::conn::{Conn, ConnRef};
-use rsqldev_core::complete::{context, expects_table, filter, match_case, resolve, stored, tables};
-use std::cell::Cell;
+use rsqldev_core::complete::{context, expects_table, filter, insert_hint, match_case, resolve, stored, tables};
+use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 use rsqldev_core::registry::Kind;
 use rsqldev_core::script;
@@ -49,6 +49,83 @@ pub fn show(editor: StyledTextCtrl, conn: &ConnRef, explicit: bool) {
             });
         }
     }
+}
+
+thread_local! {
+    /// The INSERT column tip on screen (shown again only when its text changes).
+    static TIP: RefCell<String> = const { RefCell::new(String::new()) };
+    /// Table whose columns are being fetched for the tip (one query, not one per keystroke).
+    static ASKED: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+}
+
+/// Caret inside an INSERT's VALUES tuple: a call tip listing the columns with the one being
+/// typed highlighted, like an IDE's parameter info. Columns the statement lists are shown as
+/// written; without a list they come from the table (metadata cache).
+/// ponytail: copies the editor text per caret move (no ranged GetText in wxDragon); fine for MB scripts.
+pub fn insert_tip(editor: StyledTextCtrl, conn: &ConnRef) {
+    let (text, pos) = (editor.get_text(), editor.get_current_pos() as usize);
+    let hint = crate::editor::statement_start(&editor, &text, pos)
+        .filter(|&s| text.as_bytes()[s..pos].windows(6).any(|w| w.eq_ignore_ascii_case(b"values")))
+        .and_then(|s| insert_hint(&text[s..], pos - s));
+    let Some(h) = hint else { return hide_tip(editor) };
+    let arg = h.arg;
+    match h.columns {
+        Some(cols) => show_tip(editor, &cols, arg),
+        None => {
+            let (db, schema) = {
+                let c = conn.borrow();
+                (c.kind, c.schema.clone())
+            };
+            let (o, n) = (h.owner.as_deref().map_or(schema, |o| stored(db, o)), stored(db, &h.table));
+            // Names go into a metadata query as string literals.
+            if o.contains(['\'', '\\']) || n.contains(['\'', '\\']) {
+                return hide_tip(editor);
+            }
+            let key = Some((o.clone(), n.clone()));
+            if ASKED.with(|a| *a.borrow() == key) {
+                return;
+            }
+            ASKED.with(|a| *a.borrow_mut() = key);
+            Conn::columns(conn, &o, &n, move |cols| {
+                ASKED.with(|a| *a.borrow_mut() = None);
+                if editor.get_current_pos() as usize == pos && !cols.is_empty() {
+                    show_tip(editor, &cols, arg);
+                }
+            });
+        }
+    }
+}
+
+/// The INSERT column tip on screen ("" = none); the self-test reads it.
+pub fn tip_text() -> String {
+    TIP.with(|t| t.borrow().clone())
+}
+
+fn show_tip(e: StyledTextCtrl, cols: &[String], arg: usize) {
+    let mut tip = cols.join(", ");
+    let at = cols.iter().take(arg).map(|c| c.len() + 2).sum::<usize>();
+    let hl = cols.get(arg).map(|c| (at, at + c.len()));
+    if hl.is_none() {
+        tip.push_str("   (more values than columns)");
+    }
+    TIP.with(|t| {
+        let mut t = t.borrow_mut();
+        if !e.call_tip_active() || *t != tip {
+            e.call_tip_show(e.get_current_pos(), &tip);
+            *t = tip;
+        }
+    });
+    let (a, b) = hl.unwrap_or((0, 0));
+    e.call_tip_set_highlight(a as i32, b as i32);
+}
+
+fn hide_tip(e: StyledTextCtrl) {
+    TIP.with(|t| {
+        if !t.borrow().is_empty() {
+            t.borrow_mut().clear();
+            e.call_tip_cancel();
+        }
+    });
 }
 
 thread_local! {

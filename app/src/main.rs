@@ -1497,6 +1497,14 @@ fn selftest(name: String) {
                     let st = ws.results.st.borrow();
                     eprintln!("SELFTEST worksheet after commit: {:?}", st.rows.iter().map(|r| r.cur.clone()).collect::<Vec<_>>());
                     drop(st);
+                    // INSERT column tip: columns from the table, second value highlighted.
+                    ws.editor.set_text("insert into rsq_edit values\n  (9, ");
+                    ws.editor.goto_pos(ws.editor.get_length());
+                    complete::insert_tip(ws.editor, &ws.conn());
+                    step = 17;
+                }
+                17 if !complete::tip_text().is_empty() || el > 130.0 => {
+                    eprintln!("SELFTEST insert tip: {:?} active={}", complete::tip_text(), ws.editor.call_tip_active());
                     ws.editor.set_text("drop table rsq_edit");
                     ws.run_statement();
                     step = 20;
