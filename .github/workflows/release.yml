@@ -30,6 +30,16 @@ jobs:
             fi
             if [ -n "$id" ] && [ "$(jq -r '.[0].status' <<<"$json")" = completed ]; then
               echo "main build $id: $(jq -r '.[0].conclusion' <<<"$json")"
+              # macOS, Windows and Linux x86_64 (it runs the tests) must have passed; a failed
+              # aarch64 build is just left out of the release.
+              jobs=$(gh run view "$id" --repo "$GITHUB_REPOSITORY" --json jobs)
+              for job in macos windows 'linux (x86_64'; do
+                ok=$(jq -r --arg j "$job" '[.jobs[] | select(.name | startswith($j)) | .conclusion] | (length > 0 and all(. == "success"))' <<<"$jobs")
+                if [ "$ok" != true ]; then
+                  echo "main build $id: job '$job' did not succeed, not publishing"
+                  exit 1
+                fi
+              done
               echo "run=$id" >> "$GITHUB_OUTPUT"
               exit 0
             fi
