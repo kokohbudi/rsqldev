@@ -33,7 +33,7 @@ impl Backend for Lite {
         if st.column_count() == 0 {
             return Ok(Some(st.execute([])? as u64));
         }
-        let cols = st
+        let mut cols: Vec<Column> = st
             .columns()
             .iter()
             .map(|c| {
@@ -43,11 +43,19 @@ impl Backend for Lite {
             .collect();
         let n = st.column_count();
         let mut b = Batcher::new(sink, fetch);
-        if !b.columns(cols) {
-            return Ok(None);
-        }
         let mut rows = st.query([])?;
+        // Columns go out with the first row: expression / CTE columns have no declared type, so
+        // they are numeric when that row's value is (the grid then sorts them as numbers).
+        let mut first = true;
         while let Some(r) = rows.next()? {
+            if std::mem::take(&mut first) {
+                for (i, c) in cols.iter_mut().enumerate().filter(|(_, c)| c.type_name.is_empty()) {
+                    c.numeric = matches!(r.get_ref(i), Ok(ValueRef::Integer(_) | ValueRef::Real(_)));
+                }
+                if !b.columns(std::mem::take(&mut cols)) {
+                    return Ok(None);
+                }
+            }
             let row = (0..n)
                 .map(|i| match r.get_ref(i) {
                     Ok(ValueRef::Null) | Err(_) => None,
@@ -60,6 +68,9 @@ impl Backend for Lite {
             if !b.push(row) {
                 return Ok(None);
             }
+        }
+        if first && !b.columns(cols) {
+            return Ok(None);
         }
         b.finish();
         Ok(None)
