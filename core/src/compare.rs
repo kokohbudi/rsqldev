@@ -53,10 +53,9 @@ pub fn diff(src: &Schema, tgt: &Schema) -> Vec<((&'static str, String), Diff)> {
                 _ => {}
             }
         }
-        for (n, _, _) in &t.columns {
-            if !s.columns.iter().any(|c| c.0 == *n) {
-                notes.push(format!("column {n} only in target"));
-            }
+        let scols: std::collections::HashSet<&str> = s.columns.iter().map(|c| c.0.as_str()).collect();
+        for (n, _, _) in t.columns.iter().filter(|c| !scols.contains(c.0.as_str())) {
+            notes.push(format!("column {n} only in target"));
         }
         if norm(&s.code) != norm(&t.code) {
             notes.push("source code differs".into());
@@ -184,6 +183,16 @@ mod tests {
         assert!(out.contains("CREATE OR REPLACE VIEW \"QA\".\"V\" AS SELECT 1 x FROM dual;"), "{out}");
         assert!(out.contains("ALTER TABLE \"QA\".\"EMP\" ADD (\"NAME\" VARCHAR2(50 BYTE));"));
         assert!(out.contains("-- DROP TABLE \"QA\".\"OLD\";"));
+    }
+
+    #[test]
+    fn columns_only_in_target() {
+        let (mut s, mut t) = (Schema::new(), Schema::new());
+        s.insert((TABLE, "T".into()), table(&[("A", "NUMBER")]));
+        t.insert((TABLE, "T".into()), table(&[("A", "NUMBER"), ("B", "DATE"), ("C", "DATE")]));
+        let d = diff(&s, &t);
+        let Diff::Changed(n) = &d[0].1 else { panic!("{d:?}") };
+        assert_eq!(n, &vec!["column B only in target".to_string(), "column C only in target".to_string()]);
     }
 
     #[test]

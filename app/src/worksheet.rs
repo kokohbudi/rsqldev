@@ -36,7 +36,8 @@ pub struct Worksheet {
     binds: RefCell<std::collections::HashMap<String, String>>,
     pub path: RefCell<Option<PathBuf>>,
     last: RefCell<Option<String>>,
-    spool: RefCell<Option<PathBuf>>,
+    /// SPOOL target, open for appending (unbuffered: the file shows output as it comes).
+    spool: RefCell<Option<std::fs::File>>,
     running: Cell<bool>,
     started: Cell<Option<Instant>>,
     me: Weak<Worksheet>,
@@ -44,7 +45,8 @@ pub struct Worksheet {
     busy: Cell<bool>,
     /// Autosave slot (`<config>/worksheets/<id>.toml`).
     pub autosave_id: u64,
-    pub autosaved: RefCell<String>,
+    /// Text changed since the last autosave (set by the editor's change event).
+    pub unsaved: Cell<bool>,
     /// Posts edits of a single-table query result (SQL Developer: editable query results).
     dml: RefCell<Option<Rc<crate::data_editor::Editor>>>,
     /// Bumped per Run Statement: a late editability check of an older run is dropped.
@@ -193,7 +195,7 @@ impl Worksheet {
             b_cancel,
             busy: Cell::new(false),
             autosave_id: crate::autosave::next_id(),
-            autosaved: RefCell::default(),
+            unsaved: Cell::new(false),
         });
         let acts: Vec<(BitmapButton, fn(&Worksheet))> = vec![
             (b_run, Worksheet::run_statement),
@@ -260,6 +262,13 @@ impl Worksheet {
                 } else if let Some(c) = char::from_u32(k as u32) {
                     crate::complete::typed(w.editor, &w.conn(), c);
                 }
+            }
+        });
+        // Autosave copies the text only after a change (no 2-second full-text copy and compare).
+        let w = Rc::downgrade(&ws);
+        ws.editor.on_stc_change(move |_| {
+            if let Some(w) = w.upgrade() {
+                w.unsaved.set(true);
             }
         });
         // Ctrl+Click (Cmd+Click on macOS): open the object under the caret.
@@ -370,11 +379,9 @@ impl Worksheet {
         if !text.ends_with('\n') {
             self.script_out.append_text("\n");
         }
-        if let Some(p) = self.spool.borrow().as_ref() {
+        if let Some(mut f) = self.spool.borrow().as_ref() {
             use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(p) {
-                let _ = writeln!(f, "{}", text.trim_end_matches('\n'));
-            }
+            let _ = writeln!(f, "{}", text.trim_end_matches('\n'));
         }
     }
 
@@ -671,7 +678,15 @@ impl Worksheet {
                 Action::Output(on) => self.set_output(on),
                 Action::Clear => self.script_out.clear(),
                 Action::Nothing => {}
-                Action::Spool(p) => *self.spool.borrow_mut() = p.map(PathBuf::from),
+                Action::Spool(p) => {
+                    *self.spool.borrow_mut() = None;
+                    if let Some(p) = p {
+                        match std::fs::OpenOptions::new().append(true).create(true).open(&p) {
+                            Ok(f) => *self.spool.borrow_mut() = Some(f),
+                            Err(e) => self.out(&format!("SPOOL {p}: {e}")),
+                        }
+                    }
+                }
                 Action::Rerun => {
                     if let Some(sql) = self.last.borrow().clone() {
                         return self.script_sql(sql.trim_start_matches('\u{1}').to_string(), item.start, items, i, Box::new(next));

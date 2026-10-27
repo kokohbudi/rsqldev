@@ -150,6 +150,8 @@ pub struct App {
     pages: RefCell<Vec<Page>>,
     history: RefCell<Vec<String>>,
     _timer: Timer<Frame>,
+    /// Tab count at the last prune of `pages` (pruning only when it changes).
+    tabs_seen: std::cell::Cell<usize>,
 }
 
 thread_local! {
@@ -524,13 +526,9 @@ impl App {
 
     /// Mirror worksheet text to autosave slots (called every ~2 s).
     fn autosave_tick(&self) {
-        for s in self.sheets() {
-            let text = s.editor.get_text();
-            if *s.autosaved.borrow() != text {
-                let path = s.path.borrow().as_ref().map(|p| p.display().to_string());
-                autosave::write(s.autosave_id, &s.conn().borrow().cfg.name, path, &text);
-                *s.autosaved.borrow_mut() = text;
-            }
+        for s in self.sheets().into_iter().filter(|s| s.unsaved.replace(false)) {
+            let path = s.path.borrow().as_ref().map(|p| p.display().to_string());
+            autosave::write(s.autosave_id, &s.conn().borrow().cfg.name, path, &s.editor.get_text());
         }
     }
 
@@ -580,7 +578,11 @@ impl App {
     /// Drop pages whose tab was closed with the × button (AuiNotebook destroys them itself),
     /// and keep the title / status bar in sync with the selected tab.
     fn sync_tabs(&self) {
-        self.pages.borrow_mut().retain(|p| p.panel().is_valid() && self.nb.get_page_index(&p.panel()) >= 0);
+        // A closed tab changes the count: prune then, not on every 25 ms tick.
+        let n = self.nb.page_count();
+        if n != self.tabs_seen.replace(n) {
+            self.pages.borrow_mut().retain(|p| p.panel().is_valid() && self.nb.get_page_index(&p.panel()) >= 0);
+        }
         let title = match self.current().map(|i| self.pages.borrow()[i].panel()) {
             Some(p) => self.nb.get_page_text(self.nb.get_page_index(&p) as usize),
             None => String::new(),
@@ -1347,6 +1349,7 @@ fn start(prefs0: config::Prefs) {
             pages: RefCell::default(),
             history: RefCell::new(history.entries),
             _timer: timer,
+            tabs_seen: std::cell::Cell::new(usize::MAX),
         });
         APP.with(|g| *g.borrow_mut() = Some(a.clone()));
         nav.reload(&a.conns.borrow());

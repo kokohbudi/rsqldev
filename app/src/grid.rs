@@ -570,8 +570,25 @@ impl ResultGrid {
     }
 
     fn mark_row(g: Grid, st: &State, ri: usize) {
+        Self::label_row(g, st, ri);
         let row = &st.rows[ri];
         let r = ri as i32;
+        let edited = crate::theme::c(crate::theme::p().edited_bg);
+        let removed = crate::theme::c(crate::theme::p().deleted_bg);
+        for ci in 0..row.cur.len() {
+            let changed = row.changed(ci);
+            if row.deleted {
+                g.set_cell_background_colour(r, ci as i32, &removed);
+            } else if changed && st.editable {
+                g.set_cell_background_colour(r, ci as i32, &edited);
+            }
+        }
+    }
+
+    /// Row number and marker (✓ posted, ✕ deleted, + new, * changed). wx row labels do not
+    /// move when rows are inserted or deleted: rows after one need relabelling (labels only).
+    fn label_row(g: Grid, st: &State, ri: usize) {
+        let row = &st.rows[ri];
         let label = if row.posted {
             format!("{} ✓", ri + 1)
         } else if row.deleted {
@@ -583,17 +600,7 @@ impl ResultGrid {
         } else {
             (ri + 1).to_string()
         };
-        g.set_row_label_value(r, &label);
-        let edited = crate::theme::c(crate::theme::p().edited_bg);
-        let removed = crate::theme::c(crate::theme::p().deleted_bg);
-        for ci in 0..row.cur.len() {
-            let changed = row.changed(ci);
-            if row.deleted {
-                g.set_cell_background_colour(r, ci as i32, &removed);
-            } else if changed && st.editable {
-                g.set_cell_background_colour(r, ci as i32, &edited);
-            }
-        }
+        g.set_row_label_value(ri as i32, &label);
     }
 
     fn cell_edited(&self, r: i32, c: i32) {
@@ -652,7 +659,7 @@ impl ResultGrid {
             let st = self.st.borrow();
             Self::fill_row(g, &st, at, false);
             for ri in at + 1..st.rows.len() {
-                Self::mark_row(g, &st, ri);
+                Self::label_row(g, &st, ri);
             }
             g.end_batch();
             drop(st);
@@ -745,7 +752,7 @@ impl ResultGrid {
                 st.rows.remove(r);
                 g.delete_rows(r as i32, 1, true);
                 for ri in r..st.rows.len() {
-                    Self::mark_row(g, &st, ri);
+                    Self::label_row(g, &st, ri);
                 }
                 continue;
             }
@@ -865,17 +872,7 @@ impl ResultGrid {
             let mut st = self.st.borrow_mut();
             let asc = !matches!(st.sort, Some((c, true)) if c == col);
             let numeric = st.cols.get(col).is_some_and(|c| c.numeric);
-            st.rows.sort_by(|a, b| {
-                let (x, y) = (&a.cur[col], &b.cur[col]);
-                let o = match (x, y) {
-                    (None, None) => std::cmp::Ordering::Equal,
-                    (None, _) => std::cmp::Ordering::Greater, // nulls last
-                    (_, None) => std::cmp::Ordering::Less,
-                    (Some(x), Some(y)) if numeric => x.parse::<f64>().unwrap_or(f64::NAN).total_cmp(&y.parse::<f64>().unwrap_or(f64::NAN)),
-                    (Some(x), Some(y)) => x.cmp(y),
-                };
-                if asc { o } else { o.reverse() }
-            });
+            sort_rows(&mut st.rows, col, asc, numeric);
             st.sort = Some((col, asc));
         }
         // ponytail: sorts fetched rows only; re-query with ORDER BY if users expect server-side sort.
@@ -1396,6 +1393,28 @@ fn rows_to_mark(selected: Vec<i32>, blocks: &[GridBlockCoords], cursor: (i32, i3
     rows
 }
 
+/// Sort rows by one column, keys computed once per row (not parsed again per comparison):
+/// numbers as numbers (text in a numeric column after them), NULLs last when ascending.
+fn sort_rows(rows: &mut [Row], col: usize, asc: bool, numeric: bool) {
+    if numeric {
+        rows.sort_by_cached_key(|r| match &r.cur[col] {
+            None => (true, 0),
+            Some(s) => (false, ordered(s.parse::<f64>().unwrap_or(f64::NAN))),
+        });
+    } else {
+        rows.sort_by_cached_key(|r| (r.cur[col].is_none(), r.cur[col].clone()));
+    }
+    if !asc {
+        rows.reverse();
+    }
+}
+
+/// An f64 as an integer with the same order as `f64::total_cmp` (NaN after every number).
+fn ordered(x: f64) -> i64 {
+    let b = x.to_bits() as i64;
+    b ^ ((((b >> 63) as u64) >> 1) as i64)
+}
+
 /// Clipboard text as rows of tab-separated cells (trailing line break ignored).
 // ponytail: no quoted cells (Excel quotes values holding tabs / line breaks); add when users paste those.
 fn parse_tsv(s: &str) -> Vec<Vec<String>> {
@@ -1421,6 +1440,34 @@ mod tests {
 
     fn block(top: i32, left: i32, bottom: i32, right: i32) -> GridBlockCoords {
         GridBlockCoords { top_row: top, left_col: left, bottom_row: bottom, right_col: right }
+    }
+
+    fn rows_of(vals: &[Option<&str>]) -> Vec<Row> {
+        vals.iter().map(|v| Row::fetched(vec![v.map(str::to_owned)])).collect()
+    }
+
+    fn col0(rows: &[Row]) -> Vec<Option<String>> {
+        rows.iter().map(|r| r.cur[0].clone()).collect()
+    }
+
+    #[test]
+    fn sort_numbers_as_numbers_nulls_last() {
+        let mut rows = rows_of(&[Some("10"), None, Some("9"), Some("-1.5")]);
+        sort_rows(&mut rows, 0, true, true);
+        assert_eq!(col0(&rows), vec![Some("-1.5".into()), Some("9".into()), Some("10".into()), None]);
+        sort_rows(&mut rows, 0, false, true);
+        assert_eq!(col0(&rows), vec![None, Some("10".into()), Some("9".into()), Some("-1.5".into())]);
+    }
+
+    #[test]
+    fn sort_text_and_unparsable_numbers() {
+        let mut rows = rows_of(&[Some("b"), Some("a"), None, Some("c")]);
+        sort_rows(&mut rows, 0, true, false);
+        assert_eq!(col0(&rows), vec![Some("a".into()), Some("b".into()), Some("c".into()), None]);
+        // Text in a numeric column sorts after the numbers (NaN), before NULL.
+        let mut rows = rows_of(&[Some("x"), Some("2"), None, Some("1")]);
+        sort_rows(&mut rows, 0, true, true);
+        assert_eq!(col0(&rows), vec![Some("1".into()), Some("2".into()), Some("x".into()), None]);
     }
 
     #[test]
