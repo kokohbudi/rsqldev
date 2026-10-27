@@ -58,14 +58,14 @@ thread_local! {
     static ASKED: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
 }
 
-/// Caret inside an INSERT's VALUES tuple: a call tip listing the columns with the one being
-/// typed highlighted, like an IDE's parameter info. Columns the statement lists are shown as
+/// Caret inside an INSERT's VALUES tuple or column list: a call tip listing the columns with
+/// the one being typed highlighted, like an IDE's parameter info. Columns the statement lists are shown as
 /// written; without a list they come from the table (metadata cache).
 /// ponytail: copies the editor text per caret move (no ranged GetText in wxDragon); fine for MB scripts.
 pub fn insert_tip(editor: StyledTextCtrl, conn: &ConnRef) {
     let (text, pos) = (editor.get_text(), editor.get_current_pos() as usize);
     let hint = crate::editor::statement_start(&editor, &text, pos)
-        .filter(|&s| text.as_bytes()[s..pos].windows(6).any(|w| w.eq_ignore_ascii_case(b"values")))
+        .filter(|&s| text.as_bytes()[s..pos].windows(4).any(|w| w.eq_ignore_ascii_case(b"into")))
         .and_then(|s| insert_hint(&text[s..], pos - s));
     let Some(h) = hint else { return hide_tip(editor) };
     let arg = h.arg;

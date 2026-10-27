@@ -184,8 +184,8 @@ pub struct InsertHint {
     pub arg: usize,
 }
 
-/// [`InsertHint`] for the caret at byte `pos` of statement `sql`. Only the text before the
-/// caret is read: tuples on later lines / rows (`values (..), (..)`) and Oracle
+/// [`InsertHint`] for the caret at byte `pos` of statement `sql`, in a VALUES tuple or in the
+/// column list (then the table's columns). Only the text before the caret is read: tuples on later lines / rows (`values (..), (..)`) and Oracle
 /// `INSERT ALL INTO .. VALUES ..` (the nearest INTO) work.
 pub fn insert_hint(sql: &str, pos: usize) -> Option<InsertHint> {
     let t = tokens(&sql[..pos.min(sql.len())]);
@@ -224,24 +224,38 @@ pub fn insert_hint(sql: &str, pos: usize) -> Option<InsertHint> {
         }
         o = opener[o - 2];
     };
-    // Innermost open bracket that is a tuple (the caret may be inside a function call in it).
-    let (v, arg) = open.iter().rev().find_map(|&(o, commas)| values_of(o).map(|v| (v, commas)))?;
-    let mut i = v.checked_sub(1)?;
-    let columns = if punct(i, ')') && opener[i] != usize::MAX {
-        let o = opener[i];
-        let cols: Vec<String> = t[o + 1..i].split(|x| *x == Tok::Punct(',')).filter_map(|c| match c.last() {
-            Some(Tok::Word(w)) => Some(w.clone()),
-            _ => None,
-        }).collect();
-        i = o.checked_sub(1)?;
-        Some(cols)
-    } else {
-        None
+    // `INTO [owner.]table` ending at token `i`.
+    let target = |i: usize| {
+        let name = word(i)?.to_string();
+        let owner = if i >= 2 && punct(i - 1, '.') { word(i - 2).map(str::to_string) } else { None };
+        let into = i.checked_sub(if owner.is_some() { 3 } else { 1 })?;
+        kw(into, "INTO").then_some((owner, name))
     };
-    let name = word(i)?.to_string();
-    let owner = if i >= 2 && punct(i - 1, '.') { word(i - 2).map(str::to_string) } else { None };
-    let into = i.checked_sub(if owner.is_some() { 3 } else { 1 })?;
-    kw(into, "INTO").then_some(InsertHint { owner, table: name, columns, arg })
+    // Innermost open bracket that is a VALUES tuple or the column list (the caret may be
+    // inside a function call in it).
+    for &(o, arg) in open.iter().rev() {
+        if let Some(v) = values_of(o) {
+            let mut i = v.checked_sub(1)?;
+            let columns = if punct(i, ')') && opener[i] != usize::MAX {
+                let o = opener[i];
+                let cols = t[o + 1..i].split(|x| *x == Tok::Punct(',')).filter_map(|c| match c.last() {
+                    Some(Tok::Word(w)) => Some(w.clone()),
+                    _ => None,
+                });
+                i = o.checked_sub(1)?;
+                Some(cols.collect())
+            } else {
+                None
+            };
+            let (owner, table) = target(i)?;
+            return Some(InsertHint { owner, table, columns, arg });
+        }
+        // `INSERT INTO t (a, b, |`: the table's columns, in order.
+        if let Some((owner, table)) = o.checked_sub(1).and_then(target) {
+            return Some(InsertHint { owner, table, columns: None, arg });
+        }
+    }
+    None
 }
 
 /// The table a qualifier (`e` in `e.`) points at: alias first, then table name.
@@ -372,8 +386,16 @@ mod tests {
     }
 
     #[test]
+    fn insert_hint_in_the_column_list_offers_the_table_columns() {
+        let h = hint("insert into hr.account_hist_dtl(|").unwrap();
+        assert_eq!((h.owner.as_deref(), h.table.as_str(), h.columns, h.arg), (Some("hr"), "account_hist_dtl", None, 0));
+        assert_eq!(hint("insert into emp (id,\n name, |").map(|h| h.arg), Some(2));
+    }
+
+    #[test]
     fn no_insert_hint_outside_a_values_tuple() {
-        assert_eq!(hint("insert into emp (id, |"), None);
+        assert_eq!(hint("create table emp (id, |"), None);
+        assert_eq!(hint("merge into emp using (|"), None);
         assert_eq!(hint("insert into emp values (1) |"), None);
         assert_eq!(hint("select f(1, |"), None);
         assert_eq!(hint("insert into emp select max(|"), None);
