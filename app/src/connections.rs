@@ -443,9 +443,12 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let text = || TextCtrl::builder(&dlg).build();
     let name = text();
     let drivers = ordered_drivers();
-    let dbtype = Choice::builder(&dlg)
-        .with_choices(drivers.iter().map(|d| if POPULAR.contains(&d.id.as_str()) { d.label.clone() } else { format!("{}  ({}-compatible)", d.label, d.category) }).collect())
-        .build();
+    // Engine icons, as in the Connections tree.
+    let dbtype = BitmapComboBox::builder(&dlg).with_style(ComboBoxStyle::ReadOnly).build();
+    for d in &drivers {
+        let label = if POPULAR.contains(&d.id.as_str()) { d.label.clone() } else { format!("{}  ({}-compatible)", d.label, d.category) };
+        dbtype.append(&label, crate::icons::bitmap(&crate::icons::conn_icon(&d.id, false), 16).as_ref());
+    }
     let folder = text();
     let user = text();
     let pw = TextCtrl::builder(&dlg).with_style(TextCtrlStyle::Password).build();
@@ -497,7 +500,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
 
     let load = move |c: &ConnConfig| {
         name.set_value(&c.name);
-        dbtype.set_selection(ordered_drivers().iter().position(|d| d.id == c.driver).unwrap_or(0) as u32);
+        dbtype.set_selection(ordered_drivers().iter().position(|d| d.id == c.driver).unwrap_or(0) as i32);
         folder.set_value(&c.folder);
         user.set_value(&c.user);
         pw.set_value(&if c.name.is_empty() { String::new() } else { config::get_password(&c.name).unwrap_or_default() });
@@ -524,7 +527,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let sync = {
         let (ru, rd) = (rows_user.clone(), rows_det.clone());
         move || {
-            let d = ordered_drivers()[dbtype.get_selection().unwrap_or(0) as usize];
+            let d = ordered_drivers()[dbtype.get_selection().max(0) as usize];
             let ora = d.backend == Kind::Oracle;
             let file_db = d.backend.is_file();
             let ct = ctype.get_selection().unwrap_or(0);
@@ -580,7 +583,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     });
 
     let read = move || {
-        let d = ordered_drivers()[dbtype.get_selection().unwrap_or(0) as usize];
+        let d = ordered_drivers()[dbtype.get_selection().max(0) as usize];
         let mut c = ConnConfig {
             name: name.get_value().trim().to_string(),
             driver: d.id.clone(),
