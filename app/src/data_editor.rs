@@ -10,12 +10,25 @@ use rsqldev_core::{Bind, dialect, dml};
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
-/// One generated DML statement and the grid row it came from (for "Row n:" errors).
+/// One generated DML statement and the grid rows it came from (for "Row n:" errors).
 #[derive(Clone)]
 struct Stmt {
-    row: usize,
+    rows: Vec<usize>,
     sql: String,
     binds: Vec<Bind>,
+}
+
+/// New rows sent together in one INSERT (one round trip each 500 rows).
+const INSERT_BATCH: usize = 500;
+
+impl Stmt {
+    fn rows_label(&self) -> String {
+        match self.rows.as_slice() {
+            [r] => format!("Row {}", r + 1),
+            [a, .., b] => format!("Rows {}–{}", a + 1, b + 1),
+            [] => "Row".into(),
+        }
+    }
 }
 
 pub struct Editor {
@@ -99,6 +112,19 @@ impl Editor {
         let key = dml::Key::new(&st.cols, self.hidden, &self.pk.borrow());
         let skip = self.hidden.map(|_| 0);
         let mut out = vec![];
+        // Plain new rows (no bind values) naming the same columns, waiting to go as one INSERT.
+        let mut group: (Vec<usize>, Vec<usize>) = (vec![], vec![]);
+        let flush = |g: &mut (Vec<usize>, Vec<usize>), out: &mut Vec<Stmt>| {
+            let (idx, rows) = std::mem::take(g);
+            match rows.as_slice() {
+                [] => {}
+                [r] => out.push(Stmt { rows: vec![*r], sql: dml::insert(self.db, &table, &st.cols, skip, &st.rows[*r].cur, &[]), binds: vec![] }),
+                _ => {
+                    let cells: Vec<&[rsqldev_core::Cell]> = rows.iter().map(|&r| st.rows[r].cur.as_slice()).collect();
+                    out.push(Stmt { sql: dml::insert_many(self.db, &table, &st.cols, &idx, &cells), rows, binds: vec![] });
+                }
+            }
+        };
         for (ri, row) in st.rows.iter().enumerate().filter(|(ri, r)| want(*ri) && !r.posted) {
             let Row { cur, deleted, blobs, new, .. } = row;
             let changed = |c: usize| *new || row.original()[c] != cur[c];
@@ -113,14 +139,26 @@ impl Editor {
                     })
                     .collect::<Vec<_>>()
             };
+            if *new && !*deleted && cols.is_empty() {
+                let idx = dml::insert_columns(&st.cols, skip, cur);
+                // Rows naming no column use DEFAULT VALUES: each on its own.
+                if idx.is_empty() || idx != group.0 || group.1.len() == INSERT_BATCH {
+                    flush(&mut group, &mut out);
+                }
+                group.0 = idx;
+                group.1.push(ri);
+                continue;
+            }
+            flush(&mut group, &mut out);
             match (new, deleted) {
                 (true, true) => {}
-                (true, false) => out.push(Stmt { row: ri, sql: dml::insert(self.db, &table, &st.cols, skip, cur, &cols), binds: binds() }),
-                (false, true) => out.push(Stmt { row: ri, sql: dml::delete(self.db, &table, &st.cols, &key, row.original()), binds: vec![] }),
-                (false, false) if row.dirty() => out.extend(dml::update(self.db, &table, &st.cols, &key, skip, row.original(), cur, &cols).map(|sql| Stmt { row: ri, sql, binds: binds() })),
+                (true, false) => out.push(Stmt { rows: vec![ri], sql: dml::insert(self.db, &table, &st.cols, skip, cur, &cols), binds: binds() }),
+                (false, true) => out.push(Stmt { rows: vec![ri], sql: dml::delete(self.db, &table, &st.cols, &key, row.original()), binds: vec![] }),
+                (false, false) if row.dirty() => out.extend(dml::update(self.db, &table, &st.cols, &key, skip, row.original(), cur, &cols).map(|sql| Stmt { rows: vec![ri], sql, binds: binds() })),
                 (false, false) => {}
             }
         }
+        flush(&mut group, &mut out);
         out
     }
 
@@ -178,7 +216,7 @@ impl Editor {
             if !commit {
                 self.busy.set(false);
                 self.posted.set(true);
-                let rows: Vec<usize> = stmts.iter().map(|s| s.row).collect();
+                let rows: Vec<usize> = stmts.iter().flat_map(|s| s.rows.iter().copied()).collect();
                 self.grid.mark_posted(&rows);
                 return;
             }
@@ -187,7 +225,7 @@ impl Editor {
                 me.busy.set(false);
                 match r {
                     Ok(_) => {
-                        me.log(&format!("Commit Successful: {} statement(s)", stmts.len()));
+                        me.log(&format!("Commit Successful: {} statement(s), {} row(s)", stmts.len(), stmts.iter().map(|s| s.rows.len()).sum::<usize>()));
                         match me.then.take() {
                             Some(f) => f(),
                             None => (me.reload)(),
@@ -204,8 +242,13 @@ impl Editor {
         if i == 0 && crate::app().prefs().autocommit {
             self.log("Autocommit is on: every statement is committed as it runs, Rollback cannot undo it.");
         }
-        let Stmt { row, sql, binds } = stmts[i].clone();
-        self.log(&format!("{sql};"));
+        let Stmt { rows, sql, binds } = stmts[i].clone();
+        let what = stmts[i].rows_label();
+        // A many-row INSERT is logged by its first line, not every row.
+        match rows.len() {
+            1 => self.log(&format!("{sql};")),
+            n => self.log(&format!("{} … ({n} rows)", sql.lines().take(2).collect::<Vec<_>>().join(" "))),
+        }
         let run = sql.clone();
         let done = move |r: Result<Option<u64>, String>| {
             let Some(me) = me.upgrade() else { return };
@@ -213,9 +256,10 @@ impl Editor {
                 me.then.take();
                 me.busy.set(false);
                 me.posted.set(false);
-                me.log(&format!("Row {}: {msg}", row + 1));
+                me.log(&format!("{what}: {msg}"));
                 me.log("Rollback Done");
-                crate::ui::error(&me.grid.grid, &format!("One error saving changes to table {}:\nRow {}: {msg}\n\n{sql}", me.name, row + 1));
+                let shown: String = sql.lines().take(12).collect::<Vec<_>>().join("\n");
+                crate::ui::error(&me.grid.grid, &format!("One error saving changes to table {}:\n{what}: {msg}\n\n{shown}", me.name));
                 Conn::tx(&me.conn, Cmd::Rollback, |_| {});
             };
             match r {
