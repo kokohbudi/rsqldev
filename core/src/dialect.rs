@@ -659,6 +659,21 @@ pub fn children_sql(db: Db, kind: &str) -> Option<String> {
     }
 }
 
+/// More child nodes in the tree, after the columns: (name, detail) rows for package members,
+/// routine arguments and table partitions. Templates unfilled (use [`fill`]).
+pub fn extra_children_sql(db: Db, kind: &str) -> Option<&'static str> {
+    Some(match (db, kind) {
+        (Db::Oracle, PACKAGE) => "SELECT procedure_name, NULL FROM all_procedures WHERE owner = '{o}' AND object_name = '{n}' AND procedure_name IS NOT NULL GROUP BY procedure_name ORDER BY MIN(subprogram_id)",
+        (Db::Oracle, PROCEDURE | FUNCTION) => "SELECT NVL(argument_name, 'RETURN'), LTRIM(NVL2(argument_name, in_out, '') || ' ' || data_type) FROM all_arguments WHERE owner = '{o}' AND object_name = '{n}' AND package_name IS NULL AND data_level = 0 AND (argument_name IS NOT NULL OR position = 0) ORDER BY overload, position",
+        (Db::Oracle, TABLE) => "SELECT partition_name, 'PARTITION' FROM all_tab_partitions WHERE table_owner = '{o}' AND table_name = '{n}' ORDER BY partition_position",
+        (Db::Postgres, TABLE) => "SELECT c.relname, 'PARTITION' FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid JOIN pg_class p ON p.oid = i.inhparent WHERE p.relkind = 'p' AND i.inhparent = '{lq}'::regclass ORDER BY 1",
+        (Db::Mysql, TABLE) => "SELECT partition_name, CONCAT('PARTITION ', partition_method) FROM information_schema.partitions WHERE table_schema = '{o}' AND table_name = '{n}' AND partition_name IS NOT NULL ORDER BY partition_ordinal_position",
+        (Db::Mysql, PROCEDURE | FUNCTION) => "SELECT COALESCE(parameter_name, 'RETURN'), CONCAT_WS(' ', parameter_mode, dtd_identifier) FROM information_schema.parameters WHERE specific_schema = '{o}' AND specific_name = '{n}' ORDER BY ordinal_position",
+        (Db::Mssql, PROCEDURE | FUNCTION) => "SELECT CASE WHEN p.name = '' THEN 'RETURN' ELSE p.name END, CASE WHEN p.is_output = 1 AND p.parameter_id > 0 THEN 'OUT ' ELSE '' END + TYPE_NAME(p.user_type_id) FROM sys.parameters p WHERE p.object_id = OBJECT_ID('{lq}') ORDER BY p.parameter_id",
+        _ => return None,
+    })
+}
+
 /// Data tab query. `hidden` = leading row-locator column (ROWID, ctid, rowid) kept out of view
 /// and used as the edit key.
 pub struct DataQuery {
@@ -993,6 +1008,9 @@ mod tests {
             for (_, kind) in folders(db) {
                 let s = list_sql(db, kind, "O'X").unwrap_or_else(|| panic!("{db:?} {kind}"));
                 assert!(!s.contains('{'), "{db:?} {kind}: {s}");
+                if let Some(x) = extra_children_sql(db, kind) {
+                    assert!(!fill(db, x, "O'X", "T").contains('{'), "{db:?} {kind} children");
+                }
                 for t in tabs(db, kind) {
                     if let View::Grid(s) | View::Details(s) | View::Code(s) | View::Ddl(s, _) = t.view {
                         let f = fill(db, &s, "O'X", "T");

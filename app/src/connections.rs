@@ -295,7 +295,7 @@ impl Navigator {
                 let sql = dialect::list_sql(db, kind, &owner);
                 let pat = filter_of(&conn, &owner, kind);
                 self.load(i, &conn.clone(), sql, move |nav, item, db, rows| {
-                    let expandable = dialect::children_sql(db, kind).is_some();
+                    let expandable = dialect::children_sql(db, kind).is_some() || dialect::extra_children_sql(db, kind).is_some();
                     let red = crate::theme::c(crate::theme::p().invalid);
                     for r in rows {
                         let Some(name) = r.first().cloned().flatten() else { continue };
@@ -316,14 +316,30 @@ impl Navigator {
             Node::Obj { conn, owner, kind, name } => {
                 let c = crate::app().open_conn(&conn);
                 let db = c.map(|c| c.borrow().kind).unwrap_or(Kind::Sqlite);
-                let sql = dialect::children_sql(db, kind).map(|s| dialect::fill(db, &s, &owner, &name));
-                self.load(i, &conn, sql, move |nav, item, _, rows| {
+                let extra = dialect::extra_children_sql(db, kind).map(|s| dialect::fill(db, s, &owner, &name));
+                let leaves = |nav: &Navigator, item: &TreeItemId, rows: Vec<Vec<rsqldev_core::Cell>>| {
                     for r in rows {
-                        let col = r.first().cloned().flatten().unwrap_or_default();
-                        let ty = r.get(1).cloned().flatten().unwrap_or_default();
-                        nav.add(item, &format!("{col} ({})", ty.to_uppercase()), Node::Leaf, false);
+                        let name = r.first().cloned().flatten().unwrap_or_default();
+                        let detail = r.get(1).cloned().flatten().unwrap_or_default();
+                        let text = if detail.trim().is_empty() { name } else { format!("{name} ({})", detail.trim().to_uppercase()) };
+                        nav.add(item, &text, Node::Leaf, false);
                     }
-                });
+                };
+                // Columns first (if any), then members / arguments / partitions.
+                match dialect::children_sql(db, kind).map(|s| dialect::fill(db, &s, &owner, &name)) {
+                    Some(cols) => self.load(i, &conn.clone(), Some(cols), move |nav, item, _, rows| {
+                        leaves(nav, item, rows);
+                        if let (Some(extra), Some(c)) = (extra, crate::app().open_conn(&conn)) {
+                            let (nav, item) = (*nav, item.clone());
+                            Conn::meta_query(&c, &extra, move |r| {
+                                if let Ok(r) = r {
+                                    crate::copy::quietly(|| leaves(&nav, &item, r.rows));
+                                }
+                            });
+                        }
+                    }),
+                    None => self.load(i, &conn, extra, move |nav, item, _, rows| leaves(nav, item, rows)),
+                }
             }
             _ => {}
         }

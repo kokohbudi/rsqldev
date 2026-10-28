@@ -46,7 +46,11 @@ fn exercise(c: ConnConfig, pw: &str, owner: &str) {
         // Compilation errors come back as an error listing ALL_ERRORS (SHOW ERRORS).
         let e = b.execute("CREATE OR REPLACE PROCEDURE rsq_bad AS\nBEGIN\n  no_such_thing;\nEND;", 1, &mut |_| true).unwrap_err().to_string();
         assert!(e.contains("Procedure RSQ_BAD compiled with errors") && e.contains("3/3") && e.contains("PLS-"), "{e}");
-        run(b, "CREATE OR REPLACE PROCEDURE rsq_bad AS\nBEGIN\n  NULL;\nEND;");
+        run(b, "CREATE OR REPLACE PROCEDURE rsq_bad (p_id IN NUMBER, p_out OUT VARCHAR2) AS\nBEGIN\n  NULL;\nEND;");
+        // Tree: the procedure's arguments as child nodes.
+        let args = dialect::fill(db, dialect::extra_children_sql(db, dialect::PROCEDURE).unwrap(), owner, "RSQ_BAD");
+        let r = query_all(b, &args).unwrap_or_else(|e| panic!("{args}\n=> {e:#}")).1;
+        assert_eq!(r.iter().map(|r| (r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default())).collect::<Vec<_>>(), [("P_ID".into(), "IN NUMBER".into()), ("P_OUT".into(), "OUT VARCHAR2".into())]);
         run(b, "DROP PROCEDURE rsq_bad");
     }
     if db == Kind::Mysql {
@@ -98,6 +102,13 @@ fn exercise(c: ConnConfig, pw: &str, owner: &str) {
     }
     let tables = query_all(b, &dialect::list_sql(db, dialect::TABLE, owner).unwrap()).unwrap().1;
     let name = tables.iter().filter_map(|r| r[0].clone()).find(|n| n.eq_ignore_ascii_case("rsq_t")).expect("rsq_t listed");
+    // Tree child queries (members, arguments, partitions) run on every engine; no rows is fine.
+    for (_, kind) in dialect::folders(db) {
+        if let Some(x) = dialect::extra_children_sql(db, kind) {
+            let sql = dialect::fill(db, x, owner, if *kind == dialect::TABLE { &name } else { "rsq_none" });
+            query_all(b, &sql).unwrap_or_else(|e| panic!("{kind} children: {sql}\n=> {e:#}"));
+        }
+    }
     // Completion: the columns query's first column is the column name.
     let dsql = dialect::describe_sql(db, owner, &name).unwrap();
     let names: Vec<String> = query_all(b, &dsql).unwrap().1.into_iter().filter_map(|r| r[0].clone()).collect();
