@@ -327,11 +327,16 @@ impl App {
             let Some(mut r) = connections::edit_dialog(&self.frame, Some(&c), &saved) else { return };
             // The dialog has no field for the tree's name filters: keep them.
             r.1.filters = c.filters;
-            self.store(r);
+            self.end_work(Some(&c.name), move || app().store(r));
         }
     }
 
     pub fn delete_connection(&self, name: &str) {
+        let n = name.to_string();
+        self.end_work(Some(name), move || app().delete_now(&n));
+    }
+
+    fn delete_now(&self, name: &str) {
         self.disconnect(name);
         config::delete_password(name);
         self.conns.borrow_mut().retain(|c| c.name != name);
@@ -340,6 +345,63 @@ impl App {
 
     pub fn open_conn(&self, name: &str) -> Option<ConnRef> {
         self.open.borrow().get(name).filter(|c| c.borrow().is_up()).cloned()
+    }
+
+    /// Before a session ends (disconnect, delete, edit, quit): sessions of connection `name`
+    /// (all with None), worksheets' unshared ones too, that may hold uncommitted changes are
+    /// committed or rolled back as the user picks; `then` runs once the server confirmed.
+    /// Cancel, or a failed commit / rollback, keeps everything open.
+    pub fn end_work(&self, name: Option<&str>, then: impl FnOnce() + 'static) {
+        let dirty = self.dirty_conns(name);
+        if dirty.is_empty() {
+            return then();
+        }
+        let mut names: Vec<String> = dirty.iter().map(|c| c.borrow().cfg.name.clone()).collect();
+        names.dedup();
+        let d = MessageDialog::builder(
+            &self.frame,
+            &format!("{} may have changes that are not committed.\n\nCommit or roll them back?", names.join(", ")),
+            "Uncommitted Changes",
+        )
+        .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::Cancel | MessageDialogStyle::IconWarning)
+        .build();
+        d.set_yes_no_labels("Commit", "Rollback");
+        let commit = match d.show_modal() {
+            ID_YES => true,
+            ID_NO => false,
+            _ => return,
+        };
+        let left = Rc::new(std::cell::Cell::new(dirty.len()));
+        let failed = Rc::new(RefCell::new(Vec::<String>::new()));
+        let then = Rc::new(RefCell::new(Some(then)));
+        for c in dirty {
+            let (left, failed, then, name) = (left.clone(), failed.clone(), then.clone(), c.borrow().cfg.name.clone());
+            Conn::tx(&c, if commit { rsqldev_core::worker::Cmd::Commit } else { rsqldev_core::worker::Cmd::Rollback }, move |r| {
+                if let Err(e) = r {
+                    failed.borrow_mut().push(format!("{name}: {e}"));
+                }
+                left.set(left.get() - 1);
+                if left.get() == 0 {
+                    if failed.borrow().is_empty() {
+                        if let Some(f) = then.borrow_mut().take() {
+                            f();
+                        }
+                    } else {
+                        ui::error(&app().frame, &format!("{} failed, nothing was closed:\n{}", if commit { "Commit" } else { "Rollback" }, failed.borrow().join("\n")));
+                    }
+                }
+            });
+        }
+    }
+
+    /// Sessions (shared and worksheets' unshared ones) that may hold uncommitted changes.
+    fn dirty_conns(&self, name: Option<&str>) -> Vec<ConnRef> {
+        let mut all: Vec<ConnRef> = self.open.borrow().values().cloned().collect();
+        all.extend(self.pages.borrow().iter().filter_map(|p| if let Page::Sheet(s) = p { Some(s.conn()) } else { None }));
+        all.retain(|c| c.borrow().dirty && c.borrow().is_up() && name.is_none_or(|n| c.borrow().cfg.name == n));
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|c| seen.insert(Rc::as_ptr(c)));
+        all
     }
 
     pub fn disconnect(&self, name: &str) {
@@ -1426,6 +1488,13 @@ fn start(prefs0: config::Prefs) {
         });
         frame.on_close(move |e| {
             let app = app();
+            // Uncommitted changes: keep the window, commit or roll back, then close again.
+            if let WindowEventData::General(ev) = &e {
+                if ev.can_veto() && !app.dirty_conns(None).is_empty() {
+                    ev.veto();
+                    return app.end_work(None, || crate::app().frame.close(true));
+                }
+            }
             app.save_history();
             app.autosave_tick();
             app.open.borrow_mut().clear();
@@ -1580,7 +1649,7 @@ fn selftest(name: String) {
                 }
                 20 => {
                     let a = app();
-                    eprintln!("SELFTEST pages={} history={}", a.pages.borrow().len(), a.history().len());
+                    eprintln!("SELFTEST pages={} history={} uncommitted={}", a.pages.borrow().len(), a.history().len(), a.dirty_conns(None).len());
                     if std::env::var("RSQLDEV_SELFTEST_KEEP").is_ok() {
                         // Leave a representative screen for screenshots: sample table, query, object viewer.
                         ws.editor.set_text("create table employees (employee_id int primary key, first_name varchar(30), last_name varchar(30), salary numeric(10,2), hire_date date);\ninsert into employees values (100, 'Steven', 'King', 24000, DATE '2003-06-17');\ninsert into employees values (101, 'Neena', 'Kochhar', 17000, DATE '2005-09-21');\ninsert into employees values (102, 'Lex', null, 17000, DATE '2001-01-13');\ncommit;\n");

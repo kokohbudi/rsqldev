@@ -470,11 +470,14 @@ impl Navigator {
             (M_FILTER | M_CLEAR_FILTER, Node::Kind { conn, owner, kind }) => self.set_filter(i, &conn, &owner, kind, id == M_FILTER),
             (M_CONNECT, Node::Conn(_)) => self.tree.expand(i),
             (M_DISCONNECT, Node::Conn(name)) => {
-                app.disconnect(&name);
-                self.set_conn_image(i, &name, false);
-                self.tree.collapse(i);
-                self.tree.delete_children(i);
-                self.tree.append_item_with_data(i, "Loading…", Node::Loading, None, None);
+                let (nav, i) = (*self, i.clone());
+                app.end_work(Some(&name.clone()), move || {
+                    crate::app().disconnect(&name);
+                    nav.set_conn_image(&i, &name, false);
+                    nav.tree.collapse(&i);
+                    nav.tree.delete_children(&i);
+                    nav.tree.append_item_with_data(&i, "Loading…", Node::Loading, None, None);
+                });
             }
             (M_WORKSHEET, Node::Conn(name)) => app.connect(&name, move |c| crate::app().open_worksheet(c)),
             (M_PROPS, Node::Conn(name)) => app.edit_connection(&name),

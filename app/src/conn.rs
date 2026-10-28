@@ -86,6 +86,8 @@ pub struct Conn {
     /// Completion cache: table + view names per owner, column names per (owner, table).
     names: HashMap<String, Vec<String>>,
     columns: HashMap<(String, String), Vec<String>>,
+    /// The work session may hold uncommitted changes (autocommit off): disconnect and quit ask.
+    pub dirty: bool,
 }
 
 impl Conn {
@@ -99,7 +101,7 @@ impl Conn {
         // opened a transaction that never ended, holding SQLite's shared lock (the work
         // session's COMMIT failed with "database is locked") and a PostgreSQL snapshot.
         let meta = (!shared).then(|| lane(Session::open(cfg.clone(), password, Prefs { autocommit: true, ..prefs.clone() })));
-        let c = Rc::new(RefCell::new(Conn { cfg, kind, prefs, schema: String::new(), work, meta, state: State::Connecting, ready: false, schema_asked: false, waiters: vec![], open_fetch: None, names: HashMap::new(), columns: HashMap::new() }));
+        let c = Rc::new(RefCell::new(Conn { cfg, kind, prefs, schema: String::new(), work, meta, state: State::Connecting, ready: false, schema_asked: false, waiters: vec![], open_fetch: None, names: HashMap::new(), columns: HashMap::new(), dirty: false }));
         let weak = Rc::downgrade(&c);
         crate::hub::every_tick(move || match weak.upgrade() {
             Some(c) => {
@@ -109,6 +111,15 @@ impl Conn {
             None => false,
         });
         c
+    }
+
+    /// Track a work-session statement's effect on the open transaction.
+    fn note(&mut self, sql: &str) {
+        if !self.prefs.autocommit {
+            if let Some(d) = rsqldev_core::tx_effect(sql, matches!(self.kind, Kind::Oracle | Kind::Mysql)) {
+                self.dirty = d;
+            }
+        }
     }
 
     /// A separate metadata session exists (not DuckDB / in-memory SQLite), so metadata queries
@@ -234,6 +245,7 @@ impl Conn {
     fn exec_on(this: &ConnRef, meta: bool, sql: &str, fetch: usize, done: impl FnOnce(Done) + 'static) -> Rows {
         let mut c = this.borrow_mut();
         if !meta {
+            c.note(sql);
             // A new worksheet statement closes the previous open cursor on the work session.
             if let Some(prev) = c.open_fetch.take() {
                 prev.borrow_mut().take();
@@ -322,6 +334,7 @@ impl Conn {
         if let Some(prev) = c.open_fetch.take() {
             prev.borrow_mut().take();
         }
+        c.note("INSERT");
         let id = c.work.s.exec_binds(sql, binds);
         c.work.pending.insert(id, Box::new(move |d: Done| cb(d.result)));
     }
@@ -331,7 +344,14 @@ impl Conn {
         if let Some(prev) = c.open_fetch.take() {
             prev.borrow_mut().take();
         }
-        c.work.tx.push_back(Box::new(cb));
+        let ends = matches!(cmd, Cmd::Commit | Cmd::Rollback);
+        let me = Rc::downgrade(this);
+        c.work.tx.push_back(Box::new(move |r: Result<&'static str, String>| {
+            if let (true, Ok(_), Some(me)) = (ends, &r, me.upgrade()) {
+                me.borrow_mut().dirty = false;
+            }
+            cb(r)
+        }));
         c.work.s.send(cmd);
     }
 
