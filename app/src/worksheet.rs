@@ -32,8 +32,6 @@ pub struct Worksheet {
     task: StaticText,
     elapsed: StaticText,
     defines: RefCell<Defines>,
-    /// Last value typed per bind name (upper case), offered again next run.
-    binds: RefCell<std::collections::HashMap<String, String>>,
     pub path: RefCell<Option<PathBuf>>,
     last: RefCell<Option<String>>,
     /// SPOOL target, open for appending (unbuffered: the file shows output as it comes).
@@ -181,7 +179,6 @@ impl Worksheet {
             task,
             elapsed,
             defines: RefCell::default(),
-            binds: RefCell::default(),
             path: RefCell::default(),
             last: RefCell::default(),
             spool: RefCell::default(),
@@ -443,13 +440,20 @@ impl Worksheet {
     fn substitute(&self, sql: &str) -> Option<String> {
         let p = self.panel;
         let sql = self.defines.borrow_mut().substitute(sql, &mut |name| crate::ui::ask(&p, &format!("Enter value for {name}:"), "Enter Substitution Variable", ""))?;
-        let mut last = self.binds.borrow_mut();
-        script::bind_literals(&sql, &mut |name| {
+        let app = crate::app();
+        let mut changed = false;
+        let out = script::bind_literals(&sql, &mut |name| {
             let key = name.to_uppercase();
-            let v = crate::ui::ask(&p, &format!("Value for :{name} (empty = NULL):"), "Enter Binds", last.get(&key).map_or("", String::as_str))?;
-            last.insert(key, v.clone());
+            let cur = app.binds.borrow().get(&key).cloned().unwrap_or_default();
+            let v = crate::ui::ask(&p, &format!("Value for :{name} (empty = NULL):"), "Enter Binds", &cur)?;
+            changed |= v != cur;
+            app.binds.borrow_mut().insert(key, v.clone());
             Some(v)
-        })
+        });
+        if changed {
+            app.save_binds();
+        }
+        out
     }
 
     /// DELETE / UPDATE without WHERE: ask before it touches every row.

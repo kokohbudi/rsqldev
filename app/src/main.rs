@@ -114,6 +114,7 @@ const ID_GOTO_LINE: i32 = ID_HIGHEST + 53;
 const ID_CLOSE_ALL: i32 = ID_HIGHEST + 54;
 const ID_NEXT_TAB: i32 = ID_HIGHEST + 55;
 const ID_PREV_TAB: i32 = ID_HIGHEST + 56;
+const ID_LOG: i32 = ID_HIGHEST + 57;
 
 enum Page {
     Sheet(SheetRef),
@@ -177,6 +178,11 @@ pub struct App {
     open: RefCell<HashMap<String, ConnRef>>,
     pages: RefCell<Vec<Page>>,
     history: RefCell<Vec<HistItem>>,
+    /// Last value typed per bind name (upper case), offered again in every worksheet; kept in
+    /// binds.toml when Preferences ▸ Save bind values is on.
+    pub binds: RefCell<std::collections::BTreeMap<String, String>>,
+    /// View ▸ Log: status messages and errors of this run, with their time.
+    log: RefCell<Vec<String>>,
     _timer: Timer<Frame>,
     /// Tab count at the last prune of `pages` (pruning only when it changes).
     tabs_seen: std::cell::Cell<usize>,
@@ -188,6 +194,11 @@ thread_local! {
 
 pub fn app() -> Rc<App> {
     APP.with(|a| a.borrow().clone().expect("app initialised"))
+}
+
+/// The app once it exists (errors can be shown before that).
+pub fn try_app() -> Option<Rc<App>> {
+    APP.with(|a| a.borrow().clone())
 }
 
 impl App {
@@ -790,6 +801,28 @@ impl App {
 
     pub fn status(&self, field: i32, text: &str) {
         self.frame.set_status_text(text, field);
+        if field == 0 && !text.trim().is_empty() {
+            self.log_line(text);
+        }
+    }
+
+    pub fn log_line(&self, text: &str) {
+        let mut l = self.log.borrow_mut();
+        l.push(format!("{}  {}", chrono::Local::now().format("%H:%M:%S"), text.trim()));
+        let n = l.len();
+        if n > 2000 {
+            l.drain(..n - 2000);
+        }
+    }
+
+    /// Bind values typed in a worksheet: remembered, and saved when the preference says so.
+    pub fn save_binds(&self) {
+        if !self.prefs.borrow().save_binds {
+            return;
+        }
+        if let Ok(s) = toml::to_string(&*self.binds.borrow()) {
+            let _ = std::fs::write(config::config_root().join("binds.toml"), s);
+        }
     }
 
     /// The selected tab's object viewer, when its Data tab is showing.
@@ -1082,6 +1115,28 @@ impl App {
                     }
                 }
             }
+            ID_LOG => {
+                let text = self.log.borrow().join("\n");
+                let dlg = Dialog::builder(&self.frame, "Log").with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(820, 480).build();
+                let view = editor::sql_view(&dlg, if text.is_empty() { "No messages yet." } else { &text });
+                view.goto_pos(view.get_length());
+                let s = BoxSizer::builder(Orientation::Vertical).build();
+                s.add(&view, 1, SizerFlag::Expand | SizerFlag::All, 6);
+                let bs = BoxSizer::builder(Orientation::Horizontal).build();
+                let clear = Button::builder(&dlg).with_label("Clear").build();
+                clear.on_click(move |_| {
+                    app().log.borrow_mut().clear();
+                    dlg.end_modal(ID_CANCEL);
+                });
+                bs.add(&clear, 0, SizerFlag::All, 4);
+                bs.add_stretch_spacer(1);
+                let close = Button::builder(&dlg).with_label("Close").with_id(ID_CANCEL).build();
+                bs.add(&close, 0, SizerFlag::All, 4);
+                s.add_sizer(&bs, 0, SizerFlag::Expand | SizerFlag::All, 4);
+                dlg.set_sizer(s, true);
+                dlg.show_modal();
+                dlg.destroy();
+            }
             ID_TOGGLE_NAV => {
                 if self.nav_shown.replace(!self.nav_shown.get()) {
                     self.split.unsplit(Some(&self.nav.panel));
@@ -1260,6 +1315,7 @@ fn menus(frame: &Frame) {
     let view = Menu::builder()
         .append_item(ID_TOGGLE_NAV, "&Connections\tCtrl+Shift+L", "Show or hide the Connections navigator")
         .append_item(ID_FIND_OBJECT, "Find DB &Object…\tCtrl+Shift+O", "Find tables, views, packages… by name in every schema")
+        .append_item(ID_LOG, "&Log…", "Status messages and errors of this session, with their time")
         .append_separator()
         .append_item(ID_NEXT_TAB, "&Next Tab\tAlt+PgDn", "")
         .append_item(ID_PREV_TAB, "&Previous Tab\tAlt+PgUp", "")
@@ -1561,6 +1617,8 @@ fn start(prefs0: config::Prefs) {
             open: RefCell::default(),
             pages: RefCell::default(),
             history: RefCell::new(history.entries.into_iter().map(|sql| HistItem { sql, ..Default::default() }).chain(history.items).collect()),
+            binds: RefCell::new(std::fs::read_to_string(config::config_root().join("binds.toml")).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default()),
+            log: RefCell::default(),
             _timer: timer,
             tabs_seen: std::cell::Cell::new(usize::MAX),
         });

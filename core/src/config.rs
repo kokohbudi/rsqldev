@@ -100,6 +100,8 @@ pub struct Prefs {
     pub nls_timestamp_format: String,
     /// Oracle DDL (DBMS_METADATA): include storage / tablespace / segment clauses.
     pub ddl_storage: bool,
+    /// Keep bind values typed in worksheets across restarts (binds.toml).
+    pub save_binds: bool,
 }
 
 impl Default for Prefs {
@@ -120,6 +122,7 @@ impl Default for Prefs {
             line_numbers: true,
             nls_timestamp_format: "DD-MON-RR HH.MI.SSXFF AM".into(),
             ddl_storage: true,
+            save_binds: true,
         }
     }
 }

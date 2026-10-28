@@ -26,6 +26,8 @@ pub fn show(parent: &Frame) {
     let on_connect = CheckBox::builder(&dlg).with_label("Open a worksheet on connect").build();
     on_connect.set_value(p.open_worksheet_on_connect);
     let hist = SpinCtrl::builder(&dlg).with_range(10, 10000).with_initial_value(p.history_limit.min(10000) as i32).build();
+    let binds = CheckBox::builder(&dlg).with_label("Save bind values between sessions").build();
+    binds.set_value(p.save_binds);
     let storage = CheckBox::builder(&dlg).with_label("Oracle DDL: storage and tablespace clauses").build();
     storage.set_value(p.ddl_storage);
     const THEMES: [(&str, &str); 3] = [("light", "Light (SQL Developer)"), ("dark", "Dark"), ("system", "Follow system")];
@@ -39,6 +41,7 @@ pub fn show(parent: &Frame) {
     crate::ui::row(&dlg, &g, "", &upd);
     crate::ui::row(&dlg, &g, "", &lines);
     crate::ui::row(&dlg, &g, "", &on_connect);
+    crate::ui::row(&dlg, &g, "", &binds);
     crate::ui::row(&dlg, &g, "SQL History limit", &hist);
     crate::ui::row(&dlg, &g, "Display NULL as", &null);
     crate::ui::row(&dlg, &g, "Tnsnames directory", &tns);
@@ -72,6 +75,10 @@ pub fn show(parent: &Frame) {
         p.open_worksheet_on_connect = on_connect.get_value();
         p.history_limit = hist.value().max(10) as usize;
         p.ddl_storage = storage.get_value();
+        p.save_binds = binds.get_value();
+        if !p.save_binds {
+            let _ = std::fs::remove_file(rsqldev_core::config::config_root().join("binds.toml"));
+        }
         let new_theme = THEMES[theme.get_selection().unwrap_or(0) as usize].0.to_string();
         let changed = new_theme != p.theme;
         p.theme = new_theme;
