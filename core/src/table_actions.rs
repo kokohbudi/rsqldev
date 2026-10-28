@@ -80,6 +80,109 @@ pub fn recycle(name: &str, restore: bool) -> String {
     if restore { format!("FLASHBACK TABLE {q} TO BEFORE DROP") } else { format!("PURGE TABLE {q}") }
 }
 
+// ---- Users (Oracle) ----
+
+/// New / Edit User. Empty fields leave the setting alone when editing.
+#[derive(Default, Debug, Clone)]
+pub struct UserSpec {
+    pub name: String,
+    pub password: String,
+    pub default_ts: String,
+    pub temp_ts: String,
+    pub quota_unlimited: bool,
+    /// Create: privileges / roles granted at once (CREATE SESSION, RESOURCE, ...).
+    pub grants: Vec<String>,
+    /// Edit: Some(true) lock, Some(false) unlock.
+    pub lock: Option<bool>,
+    pub expire: bool,
+}
+
+fn password(pw: &str) -> R<String> {
+    if pw.contains('"') || pw.contains('\0') {
+        return Err("A password cannot contain double quotes".into());
+    }
+    Ok(format!("\"{pw}\""))
+}
+
+/// Privilege / role list: words of letters, digits, _ $ # and spaces, comma separated.
+fn privs(list: &str) -> R<String> {
+    let items: Vec<String> = list.split(',').map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase()).filter(|s| !s.is_empty()).collect();
+    if items.is_empty() || items.iter().any(|p| !p.chars().all(|c| c.is_ascii_alphanumeric() || "_$# ".contains(c))) {
+        return Err("Privileges and roles are names separated by commas, e.g. CREATE SESSION, RESOURCE".into());
+    }
+    Ok(items.join(", "))
+}
+
+pub fn create_user(u: &UserSpec) -> R<Vec<String>> {
+    let n = quote(Db::Oracle, &ident(Db::Oracle, &u.name));
+    if u.name.trim().is_empty() || u.password.is_empty() {
+        return Err("A user name and a password are needed".into());
+    }
+    let mut s = format!("CREATE USER {n} IDENTIFIED BY {}", password(&u.password)?);
+    if !u.default_ts.trim().is_empty() {
+        s += &format!(" DEFAULT TABLESPACE {}", quote(Db::Oracle, &ident(Db::Oracle, &u.default_ts)));
+        if u.quota_unlimited {
+            s += &format!(" QUOTA UNLIMITED ON {}", quote(Db::Oracle, &ident(Db::Oracle, &u.default_ts)));
+        }
+    }
+    if !u.temp_ts.trim().is_empty() {
+        s += &format!(" TEMPORARY TABLESPACE {}", quote(Db::Oracle, &ident(Db::Oracle, &u.temp_ts)));
+    }
+    let mut out = vec![s];
+    if !u.grants.is_empty() {
+        out.push(format!("GRANT {} TO {n}", privs(&u.grants.join(","))?));
+    }
+    Ok(out)
+}
+
+pub fn alter_user(u: &UserSpec) -> R<Vec<String>> {
+    let n = quote(Db::Oracle, &u.name);
+    let mut parts = vec![];
+    if !u.password.is_empty() {
+        parts.push(format!("IDENTIFIED BY {}", password(&u.password)?));
+    }
+    if !u.default_ts.trim().is_empty() {
+        let ts = quote(Db::Oracle, &ident(Db::Oracle, &u.default_ts));
+        parts.push(format!("DEFAULT TABLESPACE {ts}"));
+        if u.quota_unlimited {
+            parts.push(format!("QUOTA UNLIMITED ON {ts}"));
+        }
+    }
+    if !u.temp_ts.trim().is_empty() {
+        parts.push(format!("TEMPORARY TABLESPACE {}", quote(Db::Oracle, &ident(Db::Oracle, &u.temp_ts))));
+    }
+    match u.lock {
+        Some(true) => parts.push("ACCOUNT LOCK".into()),
+        Some(false) => parts.push("ACCOUNT UNLOCK".into()),
+        None => {}
+    }
+    if u.expire {
+        parts.push("PASSWORD EXPIRE".into());
+    }
+    if parts.is_empty() {
+        return Err("Nothing to change".into());
+    }
+    Ok(vec![format!("ALTER USER {n} {}", parts.join(" "))])
+}
+
+pub fn grant(list: &str, user: &str, admin: bool, revoke: bool) -> R<String> {
+    let p = privs(list)?;
+    let u = quote(Db::Oracle, user);
+    Ok(if revoke { format!("REVOKE {p} FROM {u}") } else { format!("GRANT {p} TO {u}{}", if admin { " WITH ADMIN OPTION" } else { "" }) })
+}
+
+pub fn drop_user(user: &str, cascade: bool) -> String {
+    format!("DROP USER {}{}", quote(Db::Oracle, user), if cascade { " CASCADE" } else { "" })
+}
+
+/// Statements as shown and in error messages: the password replaced by asterisks.
+pub fn masked(stmts: &[String], pw: &str) -> Vec<String> {
+    if pw.is_empty() {
+        return stmts.to_vec();
+    }
+    stmts.iter().map(|s| s.replace(&format!("\"{pw}\""), "********")).collect()
+}
+
 /// Scheduler job node actions (Oracle DBMS_SCHEDULER): Run, Stop, Enable, Disable, Drop.
 pub fn job_action(owner: &str, name: &str, action: &str) -> String {
     let job = lit(&format!("{}.{}", quote(Db::Oracle, owner), quote(Db::Oracle, name)));
@@ -366,6 +469,20 @@ pub fn drop_trigger(db: Db, owner: &str, name: &str, trigger: &str) -> R<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn users() {
+        let u = UserSpec { name: "app".into(), password: "s3cret".into(), default_ts: "users".into(), quota_unlimited: true, grants: vec!["create session".into(), "RESOURCE".into()], ..Default::default() };
+        let s = create_user(&u).unwrap();
+        assert_eq!(s, ["CREATE USER \"APP\" IDENTIFIED BY \"s3cret\" DEFAULT TABLESPACE \"USERS\" QUOTA UNLIMITED ON \"USERS\"", "GRANT CREATE SESSION, RESOURCE TO \"APP\""]);
+        assert!(!masked(&s, "s3cret").concat().contains("s3cret"));
+        assert!(create_user(&UserSpec { password: "a\"b".into(), ..u.clone() }).is_err());
+        assert_eq!(alter_user(&UserSpec { name: "APP".into(), lock: Some(true), expire: true, ..Default::default() }).unwrap(), ["ALTER USER \"APP\" ACCOUNT LOCK PASSWORD EXPIRE"]);
+        assert!(alter_user(&UserSpec { name: "APP".into(), ..Default::default() }).is_err());
+        assert_eq!(grant("select any table", "APP", true, false).unwrap(), "GRANT SELECT ANY TABLE TO \"APP\" WITH ADMIN OPTION");
+        assert!(grant("dba; drop user x", "APP", false, true).is_err());
+        assert_eq!(drop_user("APP", true), "DROP USER \"APP\" CASCADE");
+    }
 
     #[test]
     fn scheduler_jobs() {

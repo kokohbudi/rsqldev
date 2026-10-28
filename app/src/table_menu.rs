@@ -119,14 +119,16 @@ pub fn append(m: &Menu, db: Kind) {
     }
 }
 
-enum F {
+pub(crate) enum F {
     Text(&'static str, String),
+    /// Masked, not trimmed.
+    Password(&'static str),
     Choice(&'static str, Vec<String>),
     Check(&'static str, bool),
 }
 
 /// A small options form: one value per field (`"1"` / `""` for check boxes). None = Cancel.
-fn form(parent: &dyn WxWidget, title: &str, fields: Vec<F>) -> Option<Vec<String>> {
+pub(crate) fn form(parent: &dyn WxWidget, title: &str, fields: Vec<F>) -> Option<Vec<String>> {
     let dlg = Dialog::builder(parent, title).with_style(DialogStyle::DefaultDialogStyle).build();
     let g = FlexGridSizer::builder(0, 2).with_vgap(6).with_hgap(10).build();
     g.add_growable_col(1, 1);
@@ -138,6 +140,12 @@ fn form(parent: &dyn WxWidget, title: &str, fields: Vec<F>) -> Option<Vec<String
                 t.set_min_size(Size::new(300, -1));
                 crate::ui::row(&dlg, &g, l, &t);
                 read.push(Box::new(move || t.get_value().trim().to_string()));
+            }
+            F::Password(l) => {
+                let t = TextCtrl::builder(&dlg).with_style(TextCtrlStyle::Password).build();
+                t.set_min_size(Size::new(300, -1));
+                crate::ui::row(&dlg, &g, l, &t);
+                read.push(Box::new(move || t.get_value()));
             }
             F::Choice(l, v) => {
                 let c = Choice::builder(&dlg).with_choices(v).build();

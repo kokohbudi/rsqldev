@@ -63,6 +63,64 @@ const M_JOB_RUN: i32 = 7138;
 const M_JOB_STOP: i32 = 7139;
 const M_JOB_ON: i32 = 7140;
 const M_JOB_OFF: i32 = 7141;
+const M_NEW_USER: i32 = 7142;
+const M_EDIT_USER: i32 = 7143;
+const M_GRANT: i32 = 7144;
+const M_REVOKE: i32 = 7145;
+const M_DROP_USER: i32 = 7146;
+
+/// New / Edit User, Grant, Revoke, Drop User (Oracle). Passwords stay out of the shown
+/// statements and error messages; `done` refreshes the tree.
+fn user_action(id: i32, c: ConnRef, user: String, done: std::rc::Rc<dyn Fn()>) {
+    use crate::table_menu::{F, form};
+    use rsqldev_core::table_actions as ta;
+    let p = crate::app().frame;
+    let (stmts, pw) = match id {
+        M_NEW_USER => {
+            let Some(v) = form(&p, "New User", vec![F::Text("User name:", String::new()), F::Password("Password:"), F::Password("Confirm password:"), F::Text("Default tablespace:", "USERS".into()), F::Text("Temporary tablespace:", "TEMP".into()), F::Check("Unlimited quota on the default tablespace", true), F::Text("Grant (comma separated):", "CREATE SESSION".into())]) else { return };
+            if v[1] != v[2] {
+                return crate::ui::error(&p, "The passwords differ.");
+            }
+            let u = ta::UserSpec { name: v[0].clone(), password: v[1].clone(), default_ts: v[3].clone(), temp_ts: v[4].clone(), quota_unlimited: v[5] == "1", grants: v[6].split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(), ..Default::default() };
+            (ta::create_user(&u), u.password)
+        }
+        M_EDIT_USER => {
+            let Some(v) = form(&p, &format!("Edit User {user}"), vec![F::Password("New password (empty = unchanged):"), F::Password("Confirm password:"), F::Text("Default tablespace (empty = unchanged):", String::new()), F::Text("Temporary tablespace (empty = unchanged):", String::new()), F::Check("Unlimited quota on the default tablespace", false), F::Choice("Account:", vec!["unchanged".into(), "Lock".into(), "Unlock".into()]), F::Check("Expire the password (change at next login)", false)]) else { return };
+            if v[0] != v[1] {
+                return crate::ui::error(&p, "The passwords differ.");
+            }
+            let lock = match v[5].as_str() {
+                "Lock" => Some(true),
+                "Unlock" => Some(false),
+                _ => None,
+            };
+            let u = ta::UserSpec { name: user.clone(), password: v[0].clone(), default_ts: v[2].clone(), temp_ts: v[3].clone(), quota_unlimited: v[4] == "1", lock, expire: v[6] == "1", ..Default::default() };
+            (ta::alter_user(&u), u.password)
+        }
+        M_GRANT | M_REVOKE => {
+            let revoke = id == M_REVOKE;
+            let mut f = vec![F::Text("Privileges / roles (comma separated):", String::new())];
+            if !revoke {
+                f.push(F::Check("With admin option", false));
+            }
+            let Some(v) = form(&p, &format!("{} {user}", if revoke { "Revoke from" } else { "Grant to" }), f) else { return };
+            (ta::grant(&v[0], &user, v.get(1).is_some_and(|a| a == "1"), revoke).map(|s| vec![s]), String::new())
+        }
+        _ => {
+            let Some(v) = form(&p, &format!("Drop User {user}"), vec![F::Check("Cascade (also drop the user's objects)", false)]) else { return };
+            (Ok(vec![ta::drop_user(&user, v[0] == "1")]), String::new())
+        }
+    };
+    let stmts = match stmts {
+        Ok(s) => s,
+        Err(e) => return crate::ui::error(&p, &e),
+    };
+    let shown = ta::masked(&stmts, &pw);
+    let text = shown.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
+    if crate::ui::confirm_sql(&p, &format!("Run on {}?", c.borrow().cfg.name), &text) {
+        crate::table_editor::run_shown(c, stmts, shown, 0, done);
+    }
+}
 
 /// "MATERIALIZED VIEW" → "Materialized View".
 fn title(kind: &str) -> String {
@@ -562,7 +620,20 @@ impl Navigator {
                 }
                 b = b.append_separator().append_item(M_REFRESH, "Refresh", "");
             }
-            Node::Schemas { .. } | Node::Schema { .. } => b = b.append_item(M_REFRESH, "Refresh", ""),
+            Node::Schemas { conn } | Node::Schema { conn, .. } => {
+                if crate::app().open_conn(conn).is_some_and(|c| c.borrow().kind == Kind::Oracle) {
+                    b = match &node {
+                        Node::Schemas { .. } => b.append_item(M_NEW_USER, "New User…", ""),
+                        _ => b
+                            .append_item(M_EDIT_USER, "Edit User…", "Password, tablespaces, quota, lock / unlock, expire")
+                            .append_item(M_GRANT, "Grant…", "System privileges or roles")
+                            .append_item(M_REVOKE, "Revoke…", "")
+                            .append_item(M_DROP_USER, "Drop User…", ""),
+                    };
+                    b = b.append_separator();
+                }
+                b = b.append_item(M_REFRESH, "Refresh", "");
+            }
             _ => return,
         }
         let mut m = b.build();
@@ -580,6 +651,7 @@ impl Navigator {
 
     fn menu(&self, id: i32, i: &TreeItemId, node: Node) {
         let app = crate::app();
+        let node_copy = node.clone();
         match (id, node) {
             (M_REFRESH, _) => self.refresh(i),
             (M_FILTER | M_CLEAR_FILTER, Node::Kind { conn, owner, kind }) => self.set_filter(i, &conn, &owner, kind, id == M_FILTER),
@@ -623,6 +695,14 @@ impl Navigator {
                 crate::table_menu::run(id, c, owner, name, done);
             }
             (M_OPEN, Node::Obj { conn, owner, kind, name }) => app.open_object(&conn, &owner, kind, &name),
+            (M_NEW_USER | M_EDIT_USER | M_GRANT | M_REVOKE | M_DROP_USER, Node::Schemas { conn } | Node::Schema { conn, .. }) => {
+                let Some(c) = app.open_conn(&conn) else { return };
+                let user = if let Node::Schema { owner, .. } = &node_copy { owner.clone() } else { String::new() };
+                let (nav, item) = (*self, i.clone());
+                // Refresh the user list (the Other Users folder) afterwards.
+                let target = if id == M_NEW_USER { item } else { nav.tree.get_item_parent(&item).unwrap_or(item) };
+                user_action(id, c, user, std::rc::Rc::new(move || nav.refresh(&target)));
+            }
             (M_COMPILE_INVALID | M_PURGE_ALL, Node::Kind { conn, owner, .. }) => {
                 let Some(c) = app.open_conn(&conn) else { return };
                 let (sql, what) = if id == M_PURGE_ALL { ("PURGE RECYCLEBIN".to_string(), "Purge the recycle bin? Dropped tables can no longer be restored.") } else { (rsqldev_core::table_actions::compile_invalid(&owner), "Recompile the invalid objects of the schema?") };

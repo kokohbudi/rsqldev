@@ -990,14 +990,20 @@ fn dialog(conn: ConnRef, owner: String, old: Option<TableDef>, start: Start, don
 
 /// Run the statements in order on the worksheet session; stop at the first error.
 pub fn run(conn: ConnRef, stmts: Vec<String>, i: usize, done: Rc<dyn Fn()>) {
+    let shown = stmts.clone();
+    run_shown(conn, stmts, shown, i, done)
+}
+
+/// Like [`run`], with `shown[i]` (secrets masked) in error messages instead of the statement.
+pub fn run_shown(conn: ConnRef, stmts: Vec<String>, shown: Vec<String>, i: usize, done: Rc<dyn Fn()>) {
     if i >= stmts.len() {
         crate::app().status(0, &format!("{} statement(s) run", stmts.len()));
         return done();
     }
     let c = conn.clone();
-    let (sql, q) = (stmts[i].clone(), stmts[i].clone());
+    let (sql, q) = (shown[i].clone(), stmts[i].clone());
     Conn::work_query(&conn, &q, move |r| match r {
-        Ok(_) => run(c, stmts, i + 1, done),
+        Ok(_) => run_shown(c, stmts, shown, i + 1, done),
         Err(e) => {
             let left = stmts.len() - i - 1;
             crate::ui::error(&crate::app().frame, &format!("{e}\n\nStatement:\n{sql}{}", if left > 0 { format!("\n\n{left} later statement(s) were not run.") } else { String::new() }));
