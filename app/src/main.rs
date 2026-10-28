@@ -115,6 +115,10 @@ const ID_CLOSE_ALL: i32 = ID_HIGHEST + 54;
 const ID_NEXT_TAB: i32 = ID_HIGHEST + 55;
 const ID_PREV_TAB: i32 = ID_HIGHEST + 56;
 const ID_LOG: i32 = ID_HIGHEST + 57;
+const ID_FORMAT_CLIP: i32 = ID_HIGHEST + 58;
+const ID_RENAME_TAB: i32 = ID_HIGHEST + 59;
+const ID_DISCONNECT_ALL: i32 = ID_HIGHEST + 60;
+const ID_DESCRIBE: i32 = ID_HIGHEST + 61;
 
 enum Page {
     Sheet(SheetRef),
@@ -1062,6 +1066,33 @@ impl App {
                     s.format_sql();
                 }
             }
+            ID_FORMAT_CLIP => {
+                if let Some(s) = sheet {
+                    s.format_to_clipboard();
+                }
+            }
+            ID_DESCRIBE => {
+                if let Some(s) = sheet {
+                    s.describe_at_caret();
+                }
+            }
+            ID_RENAME_TAB => {
+                let i = self.nb.get_selection();
+                if i >= 0 {
+                    let cur = self.nb.get_page_text(i as usize);
+                    if let Some(t) = ui::ask(&self.frame, "Tab name:", "Rename Tab", &cur).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+                        self.nb.set_page_text(i as usize, &t);
+                    }
+                }
+            }
+            ID_DISCONNECT_ALL => self.end_work(None, || {
+                let app = app();
+                let names: Vec<String> = app.open.borrow().keys().cloned().collect();
+                for n in names {
+                    app.disconnect(&n);
+                }
+                app.nav.reload(&app.conns.borrow());
+            }),
             ID_COMPLETE => {
                 if let Some(s) = sheet {
                     complete::show(s.editor, &s.conn(), true);
@@ -1276,6 +1307,8 @@ fn menus(frame: &Frame) {
         .append_item(ID_SAVEALL, "Save A&ll\tCtrl+Shift+S", "")
         .append_item(ID_CLOSE_TAB, "&Close\tCtrl+W", "Close the current tab")
         .append_item(ID_CLOSE_ALL, "Close A&ll\tCtrl+Shift+W", "Close every tab (asks for unsaved worksheets)")
+        .append_item(ID_RENAME_TAB, "Rena&me Tab…", "Rename the current tab")
+        .append_item(ID_DISCONNECT_ALL, "Disconnect All", "Close every connection (asks about uncommitted changes)")
         .append_item(ID_RECOVER, "&Recover Unsaved Worksheet…\tCtrl+Shift+T", "Reopen a worksheet closed without saving")
         .append_separator()
         .append_item(ID_EXIT, "E&xit\tCtrl+Q", "")
@@ -1293,6 +1326,8 @@ fn menus(frame: &Frame) {
         .append_separator()
         .append_item(ID_COMPLETE, "Completion &Insight\tRawCtrl+Space", "Complete keywords, tables and columns")
         .append_item(ID_FORMAT, "F&ormat SQL\tCtrl+Shift+F", "Format the selection, or the whole worksheet (also Ctrl+F7)")
+        .append_item(ID_FORMAT_CLIP, "Format to Clip&board", "The formatted selection (or worksheet) on the clipboard; the editor is unchanged")
+        .append_item(ID_DESCRIBE, "Popup Describe\tShift+F4", "Columns of the table or view under the caret")
         .append_item(ID_SNIPPET, "Insert S&nippet…\tCtrl+Shift+J", "Insert a SQL template at the caret")
         .append_item(ID_SNIPPET_SAVE, "Save Selection as Snippet…", "Keep the selected SQL as one of your snippets")
         .append_separator()
@@ -1393,6 +1428,7 @@ fn toolbar(frame: &Frame) {
     add(ID_FORWARD, "forward", "Forward", "Forward (next tab)");
     tb.add_separator();
     add(ID_WORKSHEET, "worksheet", "SQL Worksheet", "Open SQL Worksheet (Alt+F10)");
+    add(ID_FIND_OBJECT, "filter", "Find DB Object", "Find DB Object (Ctrl+Shift+O)");
     add(ID_DRIVERS, "drivers", "Drivers", "Drivers…");
     tb.realize();
 }
@@ -1425,6 +1461,7 @@ Editor
   Toggle Block Comment     Alt+Shift+C
   Upper / Lower / InitCap  Alt+'
   Go to Line               Ctrl/Cmd+G
+  Popup Describe           Shift+F4
   Duplicate Lines          Ctrl/Cmd+Shift+D
   Move Lines Up / Down     Alt+Up / Alt+Down
   Matching Bracket         Ctrl/Cmd+]

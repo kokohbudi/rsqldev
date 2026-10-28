@@ -289,6 +289,7 @@ impl Worksheet {
                 let (code, cmd, alt, shift) = (k.get_key_code().unwrap_or(0), k.cmd_down(), k.alt_down(), k.shift_down());
                 match code {
                     WXK_F7 if cmd => return w.format_sql(),
+                    wxdragon::keycode::WXK_F4 if shift && !cmd => return w.describe_at_caret(),
                     WXK_F9 if !cmd && !alt && !shift => return w.run_statement(),
                     WXK_UP | WXK_DOWN if cmd && !alt => return w.history_step(code == WXK_UP, shift),
                     c if c == '\'' as i32 && alt && !cmd => return w.toggle_case(),
@@ -362,6 +363,44 @@ impl Worksheet {
             e.set_target_end(b);
             e.replace_target(&out);
         }
+    }
+
+    /// Edit ▸ Format to Clipboard: the editor text stays as it is.
+    pub fn format_to_clipboard(&self) {
+        let e = self.editor;
+        let sel = e.get_selected_text();
+        let part = if sel.trim().is_empty() { e.get_text() } else { sel };
+        Clipboard::get().set_text(&rsqldev_core::format::script(&part, self.kind()));
+        crate::app().status(0, "Formatted SQL copied to the clipboard");
+    }
+
+    /// Shift+F4: the columns of the table / view named under the caret, in a popup.
+    pub fn describe_at_caret(&self) {
+        let ident = ident_at(&self.editor.get_text(), self.editor.get_current_pos() as usize);
+        if ident.is_empty() {
+            return;
+        }
+        let db = self.kind();
+        let (owner, name) = match ident.rsplit_once('.') {
+            Some((o, n)) => (dialect::fold(db, o.rsplit('.').next().unwrap_or(o)), dialect::fold(db, n)),
+            None => (self.conn().borrow().schema.clone(), dialect::fold(db, &ident)),
+        };
+        let Some(sql) = dialect::describe_sql(db, &owner, &name) else { return };
+        let panel = self.panel;
+        Conn::meta_query(&self.conn(), &sql, move |r| match r {
+            Ok(r) if r.rows.is_empty() => crate::ui::info(&panel, &format!("{ident}: no table or view with columns found.")),
+            Ok(r) => {
+                let text = script::format_table(&r.cols, &r.rows, &script::Settings { feedback: false, ..Default::default() });
+                let dlg = Dialog::builder(&panel, &format!("Describe {owner}.{name}")).with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(760, 420).build();
+                let view = editor::sql_view(&dlg, &text);
+                let s = BoxSizer::builder(Orientation::Vertical).build();
+                s.add(&view, 1, SizerFlag::Expand | SizerFlag::All, 6);
+                dlg.set_sizer(s, true);
+                dlg.show_modal();
+                dlg.destroy();
+            }
+            Err(e) => crate::ui::error(&panel, &e),
+        });
     }
 
     pub fn conn(&self) -> ConnRef {
