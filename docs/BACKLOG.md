@@ -3,17 +3,17 @@
 Ordered by value. Move an item into a spec (`docs/superpowers/specs/`) when work starts.
 
 ## Features
-1. **Space Manager & Optimize** (Toad-style, Oracle first) — tablespaces / datafiles (size, used, free, autoextend), largest segments per tablespace; table size incl. indexes / LOBs / partitions, rows, stats age, wasted space, chained rows, reorg score; actions shrink space, move / rebuild (+ rebuild UNUSABLE indexes), rebuild index online, gather stats, Segment Advisor — each with Execute or Generate Script.
-2. **Users, Roles & Privileges** — list users / roles / grants; create / alter user (password, default tablespace, quotas, lock / unlock, expire); grant / revoke with DDL preview.
-3. **Scheduler Jobs** (`DBMS_SCHEDULER`) — list, run / stop, enable / disable, run history with errors, create job dialog.
-4. **Data Compare** — compare table rows between schemas / connections by primary key; script INSERT / UPDATE / DELETE to sync.
-5. **User-Defined Reports** — saved parameterised queries with simple charts, shareable as files (SQL Developer Reports).
-6. **ER Diagram** — tables and FK relations of a schema, export PNG / SVG.
+1. **Space Manager & Optimize** (Toad-style, Oracle first) — tablespaces / datafiles (size, used, free, autoextend), largest segments per tablespace; table size incl. indexes / LOBs / partitions, rows, stats age, wasted space, chained rows, reorg score; actions shrink space, move / rebuild (+ rebuild UNUSABLE indexes), rebuild index online, Segment Advisor — each with Execute or Generate Script. (Read-only parts exist as Tools ▸ Reports; Gather Statistics is on the Table menu.)
+2. **Roles** — list roles with their grantees; create / drop role. (Users, grants and revokes are on the tree's Other Users nodes.)
+3. **User-Defined Reports** — saved parameterised queries with simple charts, shareable as files. (Shipped reports: Tools ▸ Reports.)
+4. **Editor folding** — needs SetMarginMask / SetMarginSensitive, which wxDragon 0.9.23 does not expose.
+5. **Explain Plan as a tree** (expand / collapse) instead of the indented grid; Autotrace V$MYSTAT statistics.
+6. **Script runner VARIABLE / PRINT** (real OUT binds) and CONNECT.
 7. **AWR mode for Top SQL** — `DBA_HIST_SQLSTAT` per snapshot range, only where the Diagnostics Pack is licensed.
 8. **"Ready for 1.0" checklist** — config formats stable with migrations, no known crash / data-loss bugs, core features tested on all three OSes against real databases.
 
 ## Data Pump follow-ups (deferred during review)
-- Connection rename → `datapump::rename_conn`; records greyed when a connection is deleted; Download by Name also offers Delete (spec gaps).
+- Records greyed when a connection is deleted; Download by Name also offers Delete (spec gaps).
 - Reconnect retry: status note that the earlier uncommitted transaction was lost.
 - Modal log viewer pauses all tickers while open → modeless viewer.
 - Files tab runs one query per record (+ per `%U` piece) every 5 s → refresh less often or on demand.
