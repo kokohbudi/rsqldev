@@ -126,6 +126,7 @@ const ID_EXPORT_CONNS: i32 = ID_HIGHEST + 65;
 const ID_IMPORT_FILE: i32 = ID_HIGHEST + 66;
 const ID_RECENT: i32 = ID_HIGHEST + 67;
 const ID_DATA_COMPARE: i32 = ID_HIGHEST + 68;
+const ID_DB_EXPORT: i32 = ID_HIGHEST + 69;
 const ID_DESCRIBE: i32 = ID_HIGHEST + 61;
 
 enum Page {
@@ -1298,6 +1299,7 @@ impl App {
             ID_DRIVERS => driver_manager::show(&self.frame),
             ID_COMPARE => compare::show(&self.frame),
             ID_DATA_COMPARE => compare::show_data(&self.frame),
+            ID_DB_EXPORT => compare::show_export(&self.frame),
             ID_PREFERENCES => prefs::show(&self.frame),
             ID_ABOUT => ui::info(
                 &self.frame,
@@ -1511,6 +1513,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_DP_JOBS, "Data Pump &Jobs && Files…", "Running Data Pump jobs and the dump and log files on the server (Oracle only)")
         .append_item(ID_COMPARE, "Schema &Compare…", "Compare two schemas and open a script that brings the target in line")
         .append_item(ID_DATA_COMPARE, "Data Co&mpare…", "Compare a table's rows on two connections / schemas by primary key; open the sync script")
+        .append_item(ID_DB_EXPORT, "Database E&xport…", "DDL of a schema's objects, with table data as INSERTs, into one .sql file")
         .append_item(ID_DRIVERS, "&Drivers…", "Download or locate native client drivers")
         .append_item(ID_PREFERENCES, "&Preferences…", "")
         .build();

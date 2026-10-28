@@ -128,6 +128,139 @@ pub fn show_data(frame: &Frame) {
     });
 }
 
+/// Tools ▸ Database Export: the DDL of the chosen object kinds of one schema, and table data
+/// as INSERT statements, into one .sql file (sequences, tables, data, then the rest). Read on
+/// the metadata session; Oracle DDL comes with its ; and / terminators.
+// ponytail: each table's rows are read whole before they are written; stream per batch if
+// huge tables need it (the grid's Export streams).
+pub fn show_export(frame: &Frame) {
+    let names = crate::app().connection_names();
+    if names.is_empty() {
+        return crate::ui::info(frame, "Create a connection first.");
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let d = SingleChoiceDialog::builder(frame, "Connection:", "Database Export", &refs).build();
+    if d.show_modal() != ID_OK || d.get_selection() < 0 {
+        return;
+    }
+    let conn = names[d.get_selection() as usize].clone();
+    let Some(schema) = crate::ui::ask(frame, "Schema (empty = the connection's current schema):", "Database Export", "") else { return };
+    let frame = *frame;
+    crate::app().connect(&conn, move |c| {
+        let db = c.borrow().kind;
+        let kinds: Vec<&'static str> = [dialect::SEQUENCE, dialect::TABLE, dialect::INDEX, dialect::VIEW, dialect::MVIEW, dialect::SYNONYM, dialect::TYPE, dialect::PACKAGE, dialect::PROCEDURE, dialect::FUNCTION, dialect::TRIGGER]
+            .into_iter()
+            .filter(|k| dialect::folders(db).iter().any(|f| f.1 == *k) && dialect::list_sql(db, k, "x").is_some())
+            .collect();
+        let labels: Vec<String> = kinds.iter().map(|k| k.to_lowercase()).collect();
+        let lrefs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let md = MultiChoiceDialog::builder(&frame, "Object types to export:", "Database Export", &lrefs).build();
+        md.set_selections(&(0..kinds.len() as i32).collect::<Vec<_>>());
+        if md.show_modal() != ID_OK {
+            return;
+        }
+        let picked: Vec<&'static str> = md.get_selections().into_iter().filter_map(|i| kinds.get(i as usize).copied()).collect();
+        if picked.is_empty() {
+            return;
+        }
+        let data = picked.contains(&dialect::TABLE) && crate::ui::confirm(&frame, "Include table data (INSERT statements)?");
+        let fd = FileDialog::builder(&frame).with_message("Export to").with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt).with_default_file("export.sql").with_wildcard("SQL files (*.sql)|*.sql").build();
+        let Some(path) = (fd.show_modal() == ID_OK).then(|| fd.get_path()).flatten() else { return };
+        let file = match std::fs::File::create(&path) {
+            Ok(f) => std::rc::Rc::new(std::cell::RefCell::new(std::io::BufWriter::new(f))),
+            Err(e) => return crate::ui::error(&frame, &format!("{path}: {e}")),
+        };
+        schema_of(&c.clone(), schema, move |owner| {
+            let lists: Vec<String> = picked.iter().filter_map(|k| dialect::list_sql(db, k, &owner)).collect();
+            let objs: std::rc::Rc<std::cell::RefCell<Vec<(&'static str, String)>>> = Default::default();
+            let o2 = objs.clone();
+            let c2 = c.clone();
+            crate::app().status(0, &format!("Database Export: listing {owner}…"));
+            chain(
+                c.clone(),
+                lists,
+                move |i, r| {
+                    for row in r.map(|r| r.rows).unwrap_or_default() {
+                        if let Some(Some(n)) = row.into_iter().next() {
+                            o2.borrow_mut().push((picked[i], n));
+                        }
+                    }
+                },
+                move || export_objects(c2, owner, objs.take(), data, file, path),
+                0,
+            );
+        });
+    });
+}
+
+/// What each export job's result is.
+enum Job {
+    Setting,
+    Ddl(String, usize),
+    Data(String),
+}
+
+fn export_objects(c: ConnRef, owner: String, objs: Vec<(&'static str, String)>, data: bool, file: std::rc::Rc<std::cell::RefCell<std::io::BufWriter<std::fs::File>>>, path: String) {
+    use std::io::Write;
+    let db = c.borrow().kind;
+    let mut jobs: Vec<String> = vec![];
+    let mut what: Vec<Job> = vec![];
+    if db == rsqldev_core::registry::Kind::Oracle {
+        jobs.push(compare::ORA_TERMINATORS_ON.into());
+        what.push(Job::Setting);
+    }
+    for (kind, name) in &objs {
+        if let Some((sql, col)) = dialect::ddl_sql(db, kind, &owner, name) {
+            jobs.push(sql);
+            what.push(Job::Ddl(format!("{} {name}", kind.to_lowercase()), col));
+        }
+        // Table data right after the tables (before views, code and triggers).
+        if data && *kind == dialect::TABLE {
+            jobs.push(format!("SELECT * FROM {}", dialect::qualified(db, &owner, name)));
+            what.push(Job::Data(dialect::qualified(db, &owner, name)));
+        }
+    }
+    if db == rsqldev_core::registry::Kind::Oracle {
+        jobs.push(compare::ORA_TERMINATORS_OFF.into());
+        what.push(Job::Setting);
+    }
+    let _ = writeln!(file.borrow_mut(), "-- rsqldev Database Export: {} objects of {owner}{}\n", objs.len(), if data { ", with table data" } else { "" });
+    let (f2, n) = (file.clone(), objs.len());
+    let oracle = db == rsqldev_core::registry::Kind::Oracle;
+    chain(
+        c,
+        jobs,
+        move |i, r| {
+            let mut f = f2.borrow_mut();
+            match (&what[i], r) {
+                (Job::Setting, _) => {}
+                (Job::Ddl(label, _), Err(e)) | (Job::Data(label), Err(e)) => {
+                    let _ = writeln!(f, "-- {label}: {}\n", e.replace('\n', " "));
+                }
+                (Job::Ddl(label, col), Ok(r)) => {
+                    let text: String = if *col == usize::MAX { r.rows.into_iter().filter_map(|row| row.into_iter().next().flatten()).collect() } else { r.rows.into_iter().next().and_then(|row| row.into_iter().nth(*col).flatten()).unwrap_or_default() };
+                    let text = text.trim();
+                    // Oracle brings its own terminators; others get a ; when missing.
+                    let end = if oracle || text.ends_with(';') { "" } else { ";" };
+                    let _ = writeln!(f, "-- {label}\n{text}{end}\n");
+                }
+                (Job::Data(table), Ok(r)) => {
+                    let opts = rsqldev_core::export::Options { table: table.clone(), ..Default::default() };
+                    let _ = write!(f, "{}\n", rsqldev_core::export::text_with(rsqldev_core::export::Format::Inserts, db, &opts, &r.cols, &r.rows));
+                }
+            }
+        },
+        move || {
+            let res = file.borrow_mut().flush();
+            match res {
+                Ok(()) => crate::app().status(0, &format!("Exported {n} objects to {path}")),
+                Err(e) => crate::ui::error(&crate::app().frame, &format!("{path}: {e}")),
+            }
+        },
+        0,
+    );
+}
+
 fn schema_of(c: &ConnRef, typed: String, cb: impl FnOnce(String) + 'static) {
     let db = c.borrow().kind;
     if !typed.trim().is_empty() {
