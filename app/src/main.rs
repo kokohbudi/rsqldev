@@ -1591,7 +1591,14 @@ fn start(prefs0: config::Prefs) {
         let nav = Navigator::new(&left);
         left.add_page(&nav.panel, "Connections", true);
         let nb = AuiNotebook::builder(&split).with_style(nb_flags(true)).build();
-        let recover = autosave::list();
+        // Worksheets open at the last quit come back by themselves when their connection
+        // needs no password prompt; the others stay on the Start Page.
+        let saved = config::load_connections();
+        let (reopen, recover): (Vec<autosave::Slot>, Vec<autosave::Slot>) = autosave::list().into_iter().partition(|s| {
+            prefs0.reopen_worksheets
+                && s.open
+                && saved.iter().any(|c| c.name == s.conn && (registry::find(&c.driver).is_some_and(|d| d.backend.is_file()) || (c.save_password && config::get_password(&c.name).is_some())))
+        });
         let start = start_page(&nb, &recover);
         nb.add_page(&start, "Start Page", true);
         split.split_vertically(&left, &nb, 300);
@@ -1659,6 +1666,10 @@ fn start(prefs0: config::Prefs) {
             }
             app.save_history();
             app.autosave_tick();
+            for s in app.sheets() {
+                let path = s.path.borrow().as_ref().map(|p| p.display().to_string());
+                autosave::write_open(s.autosave_id, &s.conn().borrow().cfg.name, path, &s.editor.get_text());
+            }
             app.open.borrow_mut().clear();
             rsqldev_core::lob::cleanup_mine();
             // The event loop outlives the frame while other top-level windows remain (an
@@ -1670,8 +1681,13 @@ fn start(prefs0: config::Prefs) {
         frame.set_status_text(if a.conns.borrow().is_empty() { "No connections yet: File ▸ New Connection…" } else { "Ready" }, 0);
         if let Ok(name) = std::env::var("RSQLDEV_SELFTEST") {
             selftest(name);
-        } else if a.prefs().check_updates {
-            check_updates(false);
+        } else {
+            for s in reopen {
+                a.recover(s);
+            }
+            if a.prefs().check_updates {
+                check_updates(false);
+            }
         }
     }
 }

@@ -26,6 +26,8 @@ pub fn show(parent: &Frame) {
     let on_connect = CheckBox::builder(&dlg).with_label("Open a worksheet on connect").build();
     on_connect.set_value(p.open_worksheet_on_connect);
     let hist = SpinCtrl::builder(&dlg).with_range(10, 10000).with_initial_value(p.history_limit.min(10000) as i32).build();
+    let reopen = CheckBox::builder(&dlg).with_label("Reopen worksheets at start (saved-password connections)").build();
+    reopen.set_value(p.reopen_worksheets);
     let binds = CheckBox::builder(&dlg).with_label("Save bind values between sessions").build();
     binds.set_value(p.save_binds);
     let storage = CheckBox::builder(&dlg).with_label("Oracle DDL: storage and tablespace clauses").build();
@@ -41,6 +43,7 @@ pub fn show(parent: &Frame) {
     crate::ui::row(&dlg, &g, "", &upd);
     crate::ui::row(&dlg, &g, "", &lines);
     crate::ui::row(&dlg, &g, "", &on_connect);
+    crate::ui::row(&dlg, &g, "", &reopen);
     crate::ui::row(&dlg, &g, "", &binds);
     crate::ui::row(&dlg, &g, "SQL History limit", &hist);
     crate::ui::row(&dlg, &g, "Display NULL as", &null);
@@ -76,6 +79,7 @@ pub fn show(parent: &Frame) {
         p.history_limit = hist.value().max(10) as usize;
         p.ddl_storage = storage.get_value();
         p.save_binds = binds.get_value();
+        p.reopen_worksheets = reopen.get_value();
         if !p.save_binds {
             let _ = std::fs::remove_file(rsqldev_core::config::config_root().join("binds.toml"));
         }

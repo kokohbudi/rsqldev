@@ -15,6 +15,9 @@ pub struct Slot {
     pub text: String,
     /// Seconds since the Unix epoch.
     pub saved: u64,
+    /// Still open when the app quit: reopened at the next start.
+    #[serde(default)]
+    pub open: bool,
     #[serde(skip)]
     pub file: PathBuf,
 }
@@ -36,11 +39,20 @@ fn file(id: u64) -> PathBuf {
 }
 
 pub fn write(id: u64, conn: &str, path: Option<String>, text: &str) {
+    write_slot(id, conn, path, text, false)
+}
+
+/// At quit: the worksheet was open, so the next start reopens it.
+pub fn write_open(id: u64, conn: &str, path: Option<String>, text: &str) {
+    write_slot(id, conn, path, text, true)
+}
+
+fn write_slot(id: u64, conn: &str, path: Option<String>, text: &str, open: bool) {
     if text.trim().is_empty() {
         return remove(id);
     }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let slot = Slot { conn: conn.into(), path, text: text.into(), saved: now, file: PathBuf::new() };
+    let slot = Slot { conn: conn.into(), path, text: text.into(), saved: now, open, file: PathBuf::new() };
     if let Ok(s) = toml::to_string(&slot) {
         let _ = std::fs::create_dir_all(dir());
         let _ = std::fs::write(file(id), s);

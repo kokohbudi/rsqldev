@@ -102,6 +102,8 @@ pub struct Prefs {
     pub ddl_storage: bool,
     /// Keep bind values typed in worksheets across restarts (binds.toml).
     pub save_binds: bool,
+    /// Reopen the worksheets left open at quit (connections with a saved password).
+    pub reopen_worksheets: bool,
 }
 
 impl Default for Prefs {
@@ -123,6 +125,7 @@ impl Default for Prefs {
             nls_timestamp_format: "DD-MON-RR HH.MI.SSXFF AM".into(),
             ddl_storage: true,
             save_binds: true,
+            reopen_worksheets: true,
         }
     }
 }
