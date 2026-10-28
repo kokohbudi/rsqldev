@@ -441,6 +441,10 @@ fn dialog(conn: ConnRef, owner: String, old: Option<TableDef>, start: Start, don
     let pp = Panel::builder(&nb).build();
     let pk_name = TextCtrl::builder(&pp).with_value(&old.as_ref().map(|t| if t.pk_name.is_empty() { String::new() } else { ddl::shown(db, &t.pk_name) }).unwrap_or_default()).build();
     pk_name.set_min_size(Size::new(260, -1));
+    // Oracle can keep a primary key DISABLEd.
+    let pk_on = CheckBox::builder(&pp).with_label("Enabled").build();
+    pk_on.set_value(!old.as_ref().is_some_and(|t| t.pk_disabled));
+    pk_on.show(db == Kind::Oracle);
     let rows = Rc::new(RefCell::new(Rows::default()));
     let rs = rows.clone();
     let apply_pk: Rc<RefCell<Option<Shuttle>>> = Rc::default();
@@ -463,6 +467,7 @@ fn dialog(conn: ConnRef, owner: String, old: Option<TableDef>, start: Start, don
     let pn = BoxSizer::builder(Orientation::Horizontal).build();
     pn.add(&label(&pp, "Name:"), 0, SizerFlag::AlignCenterVertical | SizerFlag::All, 6);
     pn.add(&pk_name, 0, SizerFlag::AlignCenterVertical, 0);
+    pn.add(&pk_on, 0, SizerFlag::AlignCenterVertical | SizerFlag::Left, 12);
     pps.add_sizer(&pn, 0, SizerFlag::empty(), 0);
     pps.add_sizer(&pk_row, 1, SizerFlag::Expand, 0);
     pp.set_sizer(pps, true);
@@ -838,6 +843,7 @@ fn dialog(conn: ConnRef, owner: String, old: Option<TableDef>, start: Start, don
             owner: o.map_or_else(|| schema.get_value().trim().to_string(), |t| t.owner.clone()),
             name: tname(),
             pk_name: pk_name.get_value().trim().to_string(),
+            pk_disabled: db == Kind::Oracle && !pk_on.get_value(),
             pk_order: rows.pk_order.clone(),
             comment: comment.get_value().trim().to_string(),
             temporary: (temp_ok && temp.get_value()).then(|| temp_kind.get_selection() != Some(1)),
