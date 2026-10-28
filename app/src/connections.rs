@@ -657,7 +657,9 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let db = text();
     let file = text();
     let browse = Button::builder(&dlg).with_label("Browse…").build();
-    let tns = text();
+    // TNS: aliases from tnsnames.ora to pick, or a typed alias / full descriptor.
+    let tns_admin = existing.and_then(|c| c.options.get("tns_admin").cloned());
+    let tns = ComboBox::builder(&dlg).with_choices(rsqldev_core::backend::tns_aliases(tns_admin.as_deref(), &crate::app().prefs())).build();
     let opts = text();
     opts.set_tooltip("Driver options, e.g. ssh=user@bastion[:22]; ssh_key=~/.ssh/id_ed25519 (SSH tunnel); sslmode=verify-full; trust_cert=true (SQL Server self-signed); ssl=true; verify=false (MySQL); https=true; allow_http=true (ClickHouse); tns_admin=/path");
     let status = StaticText::builder(&dlg).with_label("Status :").build();
