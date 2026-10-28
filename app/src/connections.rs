@@ -53,6 +53,12 @@ const M_TRIG_OFF: i32 = 7128;
 const M_RUN: i32 = 7129;
 const M_NEW_OBJ: i32 = 7130;
 const M_EDIT_SEQ: i32 = 7131;
+const M_COMPILE_INVALID: i32 = 7132;
+const M_MV_REFRESH: i32 = 7133;
+const M_LINK_TEST: i32 = 7134;
+const M_FLASHBACK: i32 = 7135;
+const M_PURGE: i32 = 7136;
+const M_PURGE_ALL: i32 = 7137;
 
 /// "MATERIALIZED VIEW" → "Materialized View".
 fn title(kind: &str) -> String {
@@ -339,7 +345,9 @@ impl Navigator {
                             continue;
                         }
                         let n = Node::Obj { conn: conn.clone(), owner: owner.clone(), kind, name: name.clone() };
-                        if let Some(ni) = nav.add(item, &name, n, expandable) {
+                        // A third column, when listed, is the label (Recycle Bin: original name).
+                        let label = r.get(2).cloned().flatten().unwrap_or_else(|| name.clone());
+                        if let Some(ni) = nav.add(item, &label, n, expandable) {
                             if r.get(1).and_then(|s| s.as_deref()) == Some("INVALID") {
                                 nav.tree.set_item_text_colour(&ni, red);
                             }
@@ -475,14 +483,23 @@ impl Navigator {
                     .append_item(M_REFRESH, "Refresh", "");
             }
             Node::Obj { kind, conn, .. } => {
-                b = b
-                    .append_item(M_OPEN, "Open", "")
-                    .append_item(M_REFRESH, "Refresh", "")
-                    .append_item(M_DDL, "Quick DDL ▸ Worksheet", "")
-                    .append_item(M_DDL_CLIP, "Quick DDL ▸ Clipboard", "")
-                    .append_item(M_DDL_FILE, "Quick DDL ▸ Save to File…", "")
-                    .append_separator();
+                b = b.append_item(M_OPEN, "Open", "").append_item(M_REFRESH, "Refresh", "");
+                // Directories, public synonyms and the recycle bin have no owner DDL here.
+                let special = matches!(*kind, dialect::DIRECTORY | dialect::PUBLIC_SYNONYM | dialect::RECYCLE);
+                if !special {
+                    b = b.append_item(M_DDL, "Quick DDL ▸ Worksheet", "").append_item(M_DDL_CLIP, "Quick DDL ▸ Clipboard", "").append_item(M_DDL_FILE, "Quick DDL ▸ Save to File…", "");
+                }
+                b = b.append_separator();
                 let db = crate::app().open_conn(conn).map(|c| c.borrow().kind);
+                if *kind == dialect::RECYCLE {
+                    b = b.append_item(M_FLASHBACK, "Flashback (Restore)", "FLASHBACK TABLE ... TO BEFORE DROP").append_item(M_PURGE, "Purge…", "");
+                }
+                if *kind == dialect::MVIEW && matches!(db, Some(Kind::Oracle | Kind::Postgres)) {
+                    b = b.append_item(M_MV_REFRESH, "Refresh Data", "Complete refresh of the materialized view");
+                }
+                if *kind == dialect::DBLINK && db == Some(Kind::Oracle) {
+                    b = b.append_item(M_LINK_TEST, "Test", "SELECT * FROM dual over the link");
+                }
                 if *kind == dialect::SEQUENCE && db.is_some_and(|db| dialect::sequence_sql(db, "o", "n").is_some()) {
                     b = b.append_item(M_EDIT_SEQ, "Edit…", "ALTER SEQUENCE with the current settings, in a worksheet");
                 }
@@ -511,7 +528,7 @@ impl Navigator {
                 if db.is_some_and(|db| rsqldev_core::table_actions::rename_object(db, kind, "o", "n", "x", "o").is_ok()) {
                     b = b.append_item(M_RENAME_OBJ, "Rename…", "");
                 }
-                if *kind != dialect::TABLE {
+                if *kind != dialect::TABLE && *kind != dialect::RECYCLE {
                     b = b.append_item(M_DROP, "Drop…", "");
                 }
             }
@@ -520,6 +537,13 @@ impl Navigator {
                     b = b.append_item(M_NEW_TABLE, "New Table…", "").append_separator();
                 } else if crate::app().open_conn(conn).is_some_and(|c| dialect::create_template(c.borrow().kind, kind, owner).is_some()) {
                     b = b.append_item(M_NEW_OBJ, &format!("New {}…", title(kind)), "A CREATE template in a worksheet").append_separator();
+                }
+                let oracle = crate::app().open_conn(conn).is_some_and(|c| c.borrow().kind == Kind::Oracle);
+                if oracle && matches!(*kind, dialect::PACKAGE | dialect::PROCEDURE | dialect::FUNCTION | dialect::TRIGGER | dialect::TYPE | dialect::VIEW | dialect::MVIEW) {
+                    b = b.append_item(M_COMPILE_INVALID, "Compile Invalid", "Recompile the schema's invalid objects (DBMS_UTILITY.COMPILE_SCHEMA)").append_separator();
+                }
+                if *kind == dialect::RECYCLE {
+                    b = b.append_item(M_PURGE_ALL, "Purge Recycle Bin…", "PURGE RECYCLEBIN").append_separator();
                 }
                 b = b.append_item(M_FILTER, "Apply Filter…", "Show only the names matching a pattern");
                 if filter_of(conn, owner, kind).is_some() {
@@ -588,6 +612,28 @@ impl Navigator {
                 crate::table_menu::run(id, c, owner, name, done);
             }
             (M_OPEN, Node::Obj { conn, owner, kind, name }) => app.open_object(&conn, &owner, kind, &name),
+            (M_COMPILE_INVALID | M_PURGE_ALL, Node::Kind { conn, owner, .. }) => {
+                let Some(c) = app.open_conn(&conn) else { return };
+                let (sql, what) = if id == M_PURGE_ALL { ("PURGE RECYCLEBIN".to_string(), "Purge the recycle bin? Dropped tables can no longer be restored.") } else { (rsqldev_core::table_actions::compile_invalid(&owner), "Recompile the invalid objects of the schema?") };
+                if crate::ui::confirm_sql(&self.tree, what, &sql) {
+                    let (nav, item) = (*self, i.clone());
+                    Conn::work_query(&c, &sql, move |r| match r {
+                        Ok(_) => nav.refresh(&item),
+                        Err(e) => crate::ui::error(&nav.tree, &e),
+                    });
+                }
+            }
+            (M_LINK_TEST, Node::Obj { conn, name, .. }) => {
+                let Some(c) = app.open_conn(&conn) else { return };
+                if !name.chars().all(|ch| ch.is_ascii_alphanumeric() || "_$#.@".contains(ch)) {
+                    return crate::ui::info(&self.tree, "This database link name needs to be tested by hand.");
+                }
+                let tree = self.tree;
+                Conn::meta_query(&c, &format!("SELECT * FROM dual@{name}"), move |r| match r {
+                    Ok(_) => crate::ui::info(&tree, &format!("Database link {name}: OK")),
+                    Err(e) => crate::ui::error(&tree, &format!("Database link {name} failed:\n{e}")),
+                });
+            }
             (M_NEW_OBJ, Node::Kind { conn, owner, kind }) => {
                 if let Some(t) = app.open_conn(&conn).and_then(|c| dialect::create_template(c.borrow().kind, kind, &owner)) {
                     sheet_with(&conn, t);
@@ -649,6 +695,8 @@ impl Navigator {
                             }
                             (Kind::Oracle, dialect::DBLINK) if name.chars().all(|ch| ch.is_ascii_alphanumeric() || "_$#.@".contains(ch)) => format!("DROP DATABASE LINK {name}"),
                             (Kind::Oracle, dialect::DBLINK) => return crate::ui::info(&self.tree, "This database link name needs to be dropped by hand."),
+                            (Kind::Oracle, dialect::DIRECTORY) => format!("DROP DIRECTORY {}", dialect::quote(db, &name)),
+                            (Kind::Oracle, dialect::PUBLIC_SYNONYM) => format!("DROP PUBLIC SYNONYM {}", dialect::quote(db, &name)),
                             _ => format!("DROP {kind} {q}"),
                         };
                         if !crate::ui::confirm_sql(&self.tree, &format!("Drop {kind} {q}?"), &stmt) {
@@ -657,6 +705,17 @@ impl Navigator {
                         stmt
                     }
                     M_COMPILE => format!("ALTER {} {q} COMPILE", if kind == dialect::PACKAGE { "PACKAGE" } else { kind }),
+                    M_MV_REFRESH => match rsqldev_core::table_actions::refresh_mview(db, &owner, &name) {
+                        Ok(s) => s,
+                        Err(e) => return crate::ui::info(&self.tree, &e),
+                    },
+                    M_FLASHBACK | M_PURGE => {
+                        let s = rsqldev_core::table_actions::recycle(&name, id == M_FLASHBACK);
+                        if id == M_PURGE && !crate::ui::confirm_sql(&self.tree, "Purge it from the recycle bin? It can no longer be restored.", &s) {
+                            return;
+                        }
+                        s
+                    }
                     M_TRIG_ON | M_TRIG_OFF => match rsqldev_core::table_actions::trigger_state(db, &owner, &name, id == M_TRIG_ON) {
                         Ok(s) => s,
                         Err(e) => return crate::ui::info(&self.tree, &e),

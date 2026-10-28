@@ -18,6 +18,10 @@ pub const TYPE: &str = "TYPE";
 pub const SEQUENCE: &str = "SEQUENCE";
 pub const SYNONYM: &str = "SYNONYM";
 pub const DBLINK: &str = "DATABASE LINK";
+/// Oracle folders that are not one owner's objects.
+pub const DIRECTORY: &str = "DIRECTORY";
+pub const PUBLIC_SYNONYM: &str = "PUBLIC SYNONYM";
+pub const RECYCLE: &str = "RECYCLE BIN";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum View {
@@ -260,7 +264,10 @@ pub fn folders(db: Db) -> &'static [(&'static str, &'static str)] {
             ("Sequences", SEQUENCE),
             ("Materialized Views", MVIEW),
             ("Synonyms", SYNONYM),
+            ("Public Synonyms", PUBLIC_SYNONYM),
             ("Database Links", DBLINK),
+            ("Directories", DIRECTORY),
+            ("Recycle Bin", RECYCLE),
         ],
         Db::Postgres => &[
             ("Tables", TABLE),
@@ -329,6 +336,10 @@ pub fn list_sql(db: Db, kind: &str, owner: &str) -> Option<String> {
     let ms = |t: &str| format!("SELECT name FROM sys.objects WHERE schema_id = SCHEMA_ID('{{o}}') AND type IN ({t}) ORDER BY name");
     let tpl = match (db, kind) {
         (Db::Oracle, DBLINK) => "SELECT db_link FROM all_db_links WHERE owner = '{o}' ORDER BY 1".into(),
+        (Db::Oracle, DIRECTORY) => "SELECT directory_name FROM all_directories ORDER BY 1".into(),
+        (Db::Oracle, PUBLIC_SYNONYM) => "SELECT synonym_name FROM all_synonyms WHERE owner = 'PUBLIC' ORDER BY 1".into(),
+        // The session user's bin (third column = the label: original name and type).
+        (Db::Oracle, RECYCLE) => "SELECT object_name, NULL, original_name || ' (' || type || ', ' || droptime || ')' FROM user_recyclebin WHERE can_undrop = 'YES' ORDER BY droptime DESC".into(),
         (Db::Oracle, TABLE) => "SELECT table_name, status FROM all_tables WHERE owner = '{o}' AND nested = 'NO' AND (iot_type IS NULL OR iot_type = 'IOT') ORDER BY 1".into(),
         (Db::Oracle, k) => format!("SELECT object_name, status FROM all_objects WHERE owner = '{{o}}' AND object_type = '{k}' ORDER BY 1"),
         (Db::Postgres, TABLE) => pg_rel("'r', 'p', 'f'"),
@@ -459,6 +470,9 @@ fn oracle_tabs(kind: &str) -> Vec<Tab> {
         ],
         SYNONYM => vec![tab("Details", d("SELECT * FROM all_synonyms WHERE owner = '{o}' AND synonym_name = '{n}'")), tab("SQL", ora_ddl(SYNONYM))],
         DBLINK => vec![tab("Details", d("SELECT * FROM all_db_links WHERE owner = '{o}' AND db_link = '{n}'")), tab("SQL", ora_ddl(DBLINK))],
+        DIRECTORY => vec![tab("Details", d("SELECT * FROM all_directories WHERE directory_name = '{n}'")), tab("Grants", g("SELECT grantee, privilege, grantable FROM all_tab_privs WHERE table_name = '{n}' AND type = 'DIRECTORY' ORDER BY 1, 2"))],
+        PUBLIC_SYNONYM => vec![tab("Details", d("SELECT * FROM all_synonyms WHERE owner = 'PUBLIC' AND synonym_name = '{n}'"))],
+        RECYCLE => vec![tab("Details", d("SELECT * FROM user_recyclebin WHERE object_name = '{n}'"))],
         _ => vec![tab("Details", d(ORA_OBJECT))],
     }
 }

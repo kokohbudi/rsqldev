@@ -48,6 +48,38 @@ pub fn rename_object(db: Db, kind: &str, owner: &str, name: &str, new: &str, sch
     }
 }
 
+/// Table ▸ Gather Statistics.
+pub fn gather_stats(db: Db, owner: &str, name: &str) -> R<String> {
+    let t = table(db, owner, name);
+    Ok(match db {
+        Db::Oracle => format!("BEGIN DBMS_STATS.GATHER_TABLE_STATS(ownname => '{}', tabname => '{}', cascade => TRUE); END;", lit(owner), lit(name)),
+        Db::Postgres | Db::Sqlite => format!("ANALYZE {t}"),
+        Db::Mysql => format!("ANALYZE TABLE {t}"),
+        Db::Mssql => format!("UPDATE STATISTICS {t}"),
+        _ => return Err(no(db, "statistics gathering")),
+    })
+}
+
+/// Oracle node actions on schema-wide or special objects (the confirmation shows them).
+pub fn compile_invalid(owner: &str) -> String {
+    format!("BEGIN DBMS_UTILITY.COMPILE_SCHEMA(schema => '{}', compile_all => FALSE); END;", lit(owner))
+}
+
+/// Materialized view ▸ Refresh Data (complete).
+pub fn refresh_mview(db: Db, owner: &str, name: &str) -> R<String> {
+    match db {
+        Db::Oracle => Ok(format!("BEGIN DBMS_MVIEW.REFRESH('{}', 'C'); END;", lit(&table(db, owner, name)))),
+        Db::Postgres => Ok(format!("REFRESH MATERIALIZED VIEW {}", table(db, owner, name))),
+        _ => Err(no(db, "materialized view refresh")),
+    }
+}
+
+/// Recycle Bin ▸ Flashback (restore) / Purge, by the BIN$ name.
+pub fn recycle(name: &str, restore: bool) -> String {
+    let q = quote(Db::Oracle, name);
+    if restore { format!("FLASHBACK TABLE {q} TO BEFORE DROP") } else { format!("PURGE TABLE {q}") }
+}
+
 /// Enable / Disable on an Oracle trigger node.
 pub fn trigger_state(db: Db, owner: &str, name: &str, on: bool) -> R<String> {
     match db {
@@ -322,6 +354,16 @@ pub fn drop_trigger(db: Db, owner: &str, name: &str, trigger: &str) -> R<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oracle_node_actions() {
+        assert_eq!(gather_stats(Db::Oracle, "O'X", "T").unwrap(), "BEGIN DBMS_STATS.GATHER_TABLE_STATS(ownname => 'O''X', tabname => 'T', cascade => TRUE); END;");
+        assert_eq!(gather_stats(Db::Mssql, "dbo", "t").unwrap(), "UPDATE STATISTICS [dbo].[t]");
+        assert!(gather_stats(Db::Clickhouse, "d", "t").is_err());
+        assert_eq!(refresh_mview(Db::Oracle, "HR", "MV").unwrap(), "BEGIN DBMS_MVIEW.REFRESH('\"HR\".\"MV\"', 'C'); END;");
+        assert_eq!(recycle("BIN$ab==$0", true), "FLASHBACK TABLE \"BIN$ab==$0\" TO BEFORE DROP");
+        assert_eq!(compile_invalid("HR"), "BEGIN DBMS_UTILITY.COMPILE_SCHEMA(schema => 'HR', compile_all => FALSE); END;");
+    }
 
     #[test]
     fn object_renames() {
