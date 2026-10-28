@@ -162,6 +162,78 @@ pub fn top_sql(db: Db, order: &str, filter: &str) -> Option<Vec<String>> {
     })
 }
 
+/// Tools ▸ Reports: (label, candidate queries tried in order; later ones need fewer
+/// privileges). `{o}` = the current schema, filled with [`fill`].
+pub fn reports(db: Db) -> Vec<(&'static str, Vec<&'static str>)> {
+    match db {
+        Db::Oracle => vec![
+            ("About: version", vec!["SELECT banner_full AS banner FROM v$version", "SELECT banner FROM v$version"]),
+            ("About: NLS parameters", vec!["SELECT parameter, value FROM nls_session_parameters ORDER BY 1"]),
+            ("Instance and database", vec!["SELECT i.instance_name, i.host_name, i.version, i.status, i.startup_time, d.name AS db_name, d.log_mode, d.open_mode, d.database_role FROM v$instance i CROSS JOIN v$database d"]),
+            ("Parameters (non-default)", vec!["SELECT name, value, description FROM v$parameter WHERE isdefault = 'FALSE' ORDER BY name"]),
+            ("Storage: tablespace usage", vec![
+                "SELECT m.tablespace_name, ROUND(m.tablespace_size * t.block_size / 1048576) AS size_mb, ROUND(m.used_space * t.block_size / 1048576) AS used_mb, ROUND(m.used_percent, 1) AS used_pct, t.status, t.contents FROM dba_tablespace_usage_metrics m JOIN dba_tablespaces t ON t.tablespace_name = m.tablespace_name ORDER BY m.used_percent DESC",
+                "SELECT tablespace_name, ROUND(SUM(bytes) / 1048576) AS used_mb FROM user_segments GROUP BY tablespace_name ORDER BY 2 DESC",
+            ]),
+            ("Storage: data files", vec!["SELECT file_name, tablespace_name, ROUND(bytes / 1048576) AS size_mb, autoextensible, ROUND(maxbytes / 1048576) AS max_mb, status FROM dba_data_files ORDER BY tablespace_name, file_name"]),
+            ("Storage: largest segments (schema)", vec!["SELECT segment_name, segment_type, partition_name, tablespace_name, ROUND(bytes / 1048576, 1) AS size_mb FROM all_segments WHERE owner = '{o}' ORDER BY bytes DESC FETCH FIRST 100 ROWS ONLY", "SELECT segment_name, segment_type, partition_name, tablespace_name, ROUND(bytes / 1048576, 1) AS size_mb FROM user_segments ORDER BY bytes DESC FETCH FIRST 100 ROWS ONLY"]),
+            ("Objects: invalid", vec!["SELECT owner, object_type, object_name, last_ddl_time FROM all_objects WHERE status = 'INVALID' ORDER BY owner, object_type, object_name"]),
+            ("Objects: counts by type (schema)", vec!["SELECT object_type, COUNT(*) AS objects, SUM(CASE WHEN status = 'INVALID' THEN 1 ELSE 0 END) AS invalid FROM all_objects WHERE owner = '{o}' GROUP BY object_type ORDER BY 2 DESC"]),
+            ("Tables: without a primary key (schema)", vec!["SELECT t.table_name, t.num_rows, t.last_analyzed FROM all_tables t WHERE t.owner = '{o}' AND NOT EXISTS (SELECT 1 FROM all_constraints c WHERE c.owner = t.owner AND c.table_name = t.table_name AND c.constraint_type = 'P') ORDER BY 1"]),
+            ("Tables: unindexed foreign keys (schema)", vec!["SELECT c.table_name, c.constraint_name, cc.column_name FROM all_constraints c JOIN all_cons_columns cc ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name AND cc.position = 1 WHERE c.owner = '{o}' AND c.constraint_type = 'R' AND NOT EXISTS (SELECT 1 FROM all_ind_columns ic WHERE ic.table_owner = c.owner AND ic.table_name = c.table_name AND ic.column_name = cc.column_name AND ic.column_position = 1) ORDER BY 1, 2"]),
+            ("Tables: stale statistics (schema)", vec!["SELECT table_name, num_rows, last_analyzed, stale_stats FROM all_tab_statistics WHERE owner = '{o}' AND (stale_stats = 'YES' OR last_analyzed IS NULL) AND object_type = 'TABLE' ORDER BY last_analyzed NULLS FIRST"]),
+            ("Security: users", vec!["SELECT username, account_status, lock_date, expiry_date, default_tablespace, profile, created FROM dba_users ORDER BY username", "SELECT username, created FROM all_users ORDER BY username"]),
+            ("Security: my roles and privileges", vec!["SELECT 'ROLE' AS kind, granted_role AS name, admin_option FROM user_role_privs UNION ALL SELECT 'PRIVILEGE', privilege, admin_option FROM user_sys_privs ORDER BY 1, 2"]),
+            ("Security: grants on my objects", vec!["SELECT table_name, grantee, privilege, grantable FROM user_tab_privs_made ORDER BY 1, 2, 3"]),
+            ("Locks: blocking sessions", vec!["SELECT s.sid, s.serial#, s.username, s.blocking_session, s.event, s.seconds_in_wait, s.sql_id FROM v$session s WHERE s.blocking_session IS NOT NULL OR s.sid IN (SELECT blocking_session FROM v$session) ORDER BY s.blocking_session NULLS FIRST"]),
+            ("Memory: SGA", vec!["SELECT name, ROUND(bytes / 1048576, 1) AS size_mb, resizeable FROM v$sgainfo ORDER BY bytes DESC"]),
+            ("Waits: top events", vec!["SELECT event, wait_class, total_waits, ROUND(time_waited_micro / 1e6, 1) AS seconds FROM v$system_event WHERE wait_class <> 'Idle' ORDER BY time_waited_micro DESC FETCH FIRST 30 ROWS ONLY"]),
+            ("Scheduler: recent job runs", vec!["SELECT owner, job_name, log_date, status, error#, run_duration FROM all_scheduler_job_run_details ORDER BY log_date DESC FETCH FIRST 200 ROWS ONLY"]),
+        ],
+        Db::Postgres => vec![
+            ("About: version", vec!["SELECT version()"]),
+            ("Settings (changed)", vec!["SELECT name, setting, unit, source, short_desc FROM pg_settings WHERE source NOT IN ('default', 'override') ORDER BY name"]),
+            ("Storage: database sizes", vec!["SELECT datname, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database ORDER BY pg_database_size(datname) DESC"]),
+            ("Storage: largest tables (schema)", vec!["SELECT c.relname AS table_name, pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size, pg_size_pretty(pg_relation_size(c.oid)) AS table_size, c.reltuples::bigint AS est_rows FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{o}' AND c.relkind IN ('r', 'p', 'm') ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 100"]),
+            ("Tables: without a primary key (schema)", vec!["SELECT c.relname AS table_name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{o}' AND c.relkind IN ('r', 'p') AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'p') ORDER BY 1"]),
+            ("Tables: dead rows and vacuum (schema)", vec!["SELECT relname, n_live_tup, n_dead_tup, last_vacuum, last_autovacuum, last_analyze, last_autoanalyze FROM pg_stat_user_tables WHERE schemaname = '{o}' ORDER BY n_dead_tup DESC"]),
+            ("Indexes: unused (schema)", vec!["SELECT relname AS table_name, indexrelname AS index_name, idx_scan, pg_size_pretty(pg_relation_size(indexrelid)) AS size FROM pg_stat_user_indexes WHERE schemaname = '{o}' AND idx_scan = 0 ORDER BY pg_relation_size(indexrelid) DESC"]),
+            ("Security: roles", vec!["SELECT rolname, rolsuper, rolcreaterole, rolcreatedb, rolcanlogin, rolvaliduntil FROM pg_roles ORDER BY 1"]),
+            ("Locks: blocking", vec!["SELECT pid, usename, pg_blocking_pids(pid) AS blocked_by, wait_event_type, wait_event, state, query FROM pg_stat_activity WHERE cardinality(pg_blocking_pids(pid)) > 0"]),
+        ],
+        Db::Mysql => vec![
+            ("About: version", vec!["SELECT VERSION() AS version, @@version_comment AS edition"]),
+            ("Variables (global)", vec!["SHOW GLOBAL VARIABLES"]),
+            ("Status (global)", vec!["SHOW GLOBAL STATUS"]),
+            ("Storage: largest tables (database)", vec!["SELECT table_name, engine, table_rows, ROUND((data_length + index_length) / 1048576, 1) AS total_mb, ROUND(data_free / 1048576, 1) AS free_mb FROM information_schema.tables WHERE table_schema = '{o}' ORDER BY data_length + index_length DESC LIMIT 100"]),
+            ("Tables: without a primary key (database)", vec!["SELECT t.table_name FROM information_schema.tables t WHERE t.table_schema = '{o}' AND t.table_type = 'BASE TABLE' AND NOT EXISTS (SELECT 1 FROM information_schema.table_constraints c WHERE c.table_schema = t.table_schema AND c.table_name = t.table_name AND c.constraint_type = 'PRIMARY KEY') ORDER BY 1"]),
+            ("Security: users", vec!["SELECT user, host, account_locked, password_expired FROM mysql.user ORDER BY 1, 2"]),
+        ],
+        Db::Mssql => vec![
+            ("About: version", vec!["SELECT @@VERSION AS version"]),
+            ("Configuration (changed)", vec!["SELECT name, value, value_in_use, description FROM sys.configurations WHERE value <> value_in_use OR is_dynamic = 0 ORDER BY name"]),
+            ("Storage: database files", vec!["SELECT name, type_desc, physical_name, size * 8 / 1024 AS size_mb, max_size, growth FROM sys.database_files"]),
+            ("Storage: largest tables (schema)", vec!["SELECT t.name AS table_name, SUM(p.rows) AS rows, SUM(a.total_pages) * 8 / 1024 AS total_mb FROM sys.tables t JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1) JOIN sys.allocation_units a ON a.container_id = p.partition_id WHERE t.schema_id = SCHEMA_ID('{o}') GROUP BY t.name ORDER BY total_mb DESC"]),
+            ("Tables: without a primary key (schema)", vec!["SELECT t.name AS table_name FROM sys.tables t WHERE t.schema_id = SCHEMA_ID('{o}') AND OBJECTPROPERTY(t.object_id, 'TableHasPrimaryKey') = 0 ORDER BY 1"]),
+            ("Security: logins", vec!["SELECT name, type_desc, is_disabled, create_date, default_database_name FROM sys.server_principals WHERE type IN ('S', 'U', 'G') ORDER BY 1"]),
+        ],
+        Db::Sqlite => vec![
+            ("About: version", vec!["SELECT sqlite_version() AS version"]),
+            ("Pragmas", vec!["SELECT * FROM pragma_page_count, pragma_page_size, pragma_freelist_count, pragma_journal_mode"]),
+            ("Integrity check", vec!["PRAGMA integrity_check"]),
+        ],
+        Db::Duckdb => vec![
+            ("About: version", vec!["SELECT version() AS version"]),
+            ("Settings (changed)", vec!["SELECT name, value, description FROM duckdb_settings() WHERE value IS DISTINCT FROM (SELECT NULL) ORDER BY name"]),
+            ("Storage: database size", vec!["PRAGMA database_size"]),
+        ],
+        Db::Clickhouse => vec![
+            ("About: version", vec!["SELECT version() AS version"]),
+            ("Storage: largest tables (database)", vec!["SELECT table, formatReadableSize(sum(bytes_on_disk)) AS size, sum(rows) AS rows FROM system.parts WHERE database = '{o}' AND active GROUP BY table ORDER BY sum(bytes_on_disk) DESC"]),
+        ],
+    }
+}
+
 /// Oracle: full text and plan of a cursor from [`top_sql`] (id = SQL_ID, child number).
 /// Ids must look like a SQL_ID / number, so a grid value cannot inject SQL.
 pub fn top_sql_text(sql_id: &str) -> Option<String> {
@@ -1101,6 +1173,18 @@ mod tests {
         assert_eq!(count_sql(Db::Oracle, "select * from emp;").unwrap(), "SELECT COUNT(*) FROM (select * from emp) rsq_count");
         assert!(count_sql(Db::Mssql, "with a as (select 1 x) select * from a").is_none());
         assert!(count_sql(Db::Oracle, "update t set a = 1").is_none());
+    }
+
+    #[test]
+    fn report_templates_fill() {
+        for db in [Db::Oracle, Db::Postgres, Db::Mysql, Db::Mssql, Db::Sqlite, Db::Duckdb, Db::Clickhouse] {
+            for (label, qs) in reports(db) {
+                assert!(!qs.is_empty(), "{db:?} {label}");
+                for q in qs {
+                    assert!(!fill(db, q, "O'X", "").contains('{'), "{db:?} {label}");
+                }
+            }
+        }
     }
 
     #[test]

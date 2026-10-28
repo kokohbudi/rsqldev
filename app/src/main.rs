@@ -27,6 +27,7 @@ mod snippets;
 mod table_editor;
 mod table_menu;
 mod topsql;
+mod reports;
 mod transfer;
 mod ui;
 mod value;
@@ -118,6 +119,7 @@ const ID_LOG: i32 = ID_HIGHEST + 57;
 const ID_FORMAT_CLIP: i32 = ID_HIGHEST + 58;
 const ID_RENAME_TAB: i32 = ID_HIGHEST + 59;
 const ID_DISCONNECT_ALL: i32 = ID_HIGHEST + 60;
+const ID_REPORTS: i32 = ID_HIGHEST + 62;
 const ID_DESCRIBE: i32 = ID_HIGHEST + 61;
 
 enum Page {
@@ -125,6 +127,7 @@ enum Page {
     Obj(Rc<ObjectView>),
     Sessions(Rc<sessions::Sessions>),
     TopSql(Rc<topsql::TopSql>),
+    Reports(Rc<reports::Reports>),
     DataPump(Rc<datapump_tab::DataPumpTab>),
 }
 
@@ -135,6 +138,7 @@ impl Page {
             Page::Obj(o) => o.panel,
             Page::Sessions(s) => s.panel,
             Page::TopSql(s) => s.panel,
+            Page::Reports(s) => s.panel,
             Page::DataPump(s) => s.panel,
         }
     }
@@ -506,6 +510,7 @@ impl App {
                 Page::Obj(o) => o.key.starts_with(&format!("{name}|")),
                 Page::Sessions(s) => s.conn_name == name,
                 Page::TopSql(s) => s.conn_name == name,
+                Page::Reports(s) => s.conn_name == name,
                 Page::DataPump(s) => s.conn_name == name,
             };
             if mine {
@@ -935,6 +940,12 @@ impl App {
                 } else {
                     ui::info(&app().frame, "Data Pump is available on Oracle connections");
                 }
+            }),
+            ID_REPORTS => self.pick_conn(|c| {
+                let a = app();
+                let title = format!("Reports: {}", c.borrow().cfg.name);
+                let s = reports::Reports::new(&a.nb, c);
+                a.add_page(Page::Reports(s), &title);
             }),
             ID_TOPSQL => self.pick_conn(|c| {
                 let a = app();
@@ -1379,6 +1390,7 @@ fn menus(frame: &Frame) {
         .append_separator()
         .append_item(ID_SESSIONS, "S&essions…", "Sessions and locks of a connection: who blocks whom, kill session")
         .append_item(ID_TOPSQL, "&Top SQL…", "Heaviest statements on the server: elapsed, CPU, reads, executions, cost")
+        .append_item(ID_REPORTS, "&Reports…", "Version, storage, invalid objects, tables without a primary key, users, locks, waits…")
         .append_item(ID_DP_EXPORT, "Data Pump &Export…", "Export schemas, tables or the whole database with Oracle Data Pump (Oracle only)")
         .append_item(ID_DP_IMPORT, "Data Pump &Import…", "Import a dump file, uploading it first if it is on this computer (Oracle only)")
         .append_item(ID_DP_JOBS, "Data Pump &Jobs && Files…", "Running Data Pump jobs and the dump and log files on the server (Oracle only)")

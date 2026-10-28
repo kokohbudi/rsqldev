@@ -100,6 +100,13 @@ fn exercise(c: ConnConfig, pw: &str, owner: &str) {
         let sql = dialect::list_sql(db, kind, owner).unwrap();
         query_all(b, &sql).unwrap_or_else(|e| panic!("{kind}: {sql}\n=> {e:#}"));
     }
+    // Tools ▸ Reports: a candidate of every report runs (file engines need no privileges).
+    for (label, qs) in dialect::reports(db) {
+        let errs: Vec<String> = qs.iter().filter_map(|q| query_all(b, &dialect::fill(db, q, owner, "")).err().map(|e| format!("{e:#}"))).collect();
+        if matches!(db, Kind::Sqlite | Kind::Duckdb) {
+            assert!(errs.len() < qs.len(), "report {label}: {errs:?}");
+        }
+    }
     let tables = query_all(b, &dialect::list_sql(db, dialect::TABLE, owner).unwrap()).unwrap().1;
     let name = tables.iter().filter_map(|r| r[0].clone()).find(|n| n.eq_ignore_ascii_case("rsq_t")).expect("rsq_t listed");
     // Tree child queries (members, arguments, partitions) run on every engine; no rows is fine.
