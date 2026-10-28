@@ -30,6 +30,32 @@ pub fn rename(db: Db, owner: &str, name: &str, new: &str) -> R<String> {
     })
 }
 
+/// Rename… on a view / sequence / synonym / trigger node. `schema` = the session's current
+/// schema (Oracle RENAME works on its own objects only).
+pub fn rename_object(db: Db, kind: &str, owner: &str, name: &str, new: &str, schema: &str) -> R<String> {
+    use crate::dialect::{SEQUENCE, SYNONYM, TRIGGER, VIEW};
+    let (t, n) = (table(db, owner, name), ident(db, new));
+    if n.is_empty() {
+        return Err("A name is needed".into());
+    }
+    match (db, kind) {
+        (Db::Oracle, TRIGGER) => Ok(format!("ALTER TRIGGER {t} RENAME TO {}", quote(db, &n))),
+        (Db::Oracle, VIEW | SEQUENCE | SYNONYM) if owner.eq_ignore_ascii_case(schema) => Ok(format!("RENAME {} TO {}", quote(db, name), quote(db, &n))),
+        (Db::Oracle, VIEW | SEQUENCE | SYNONYM) => Err(format!("Oracle renames only its own objects: connect as {owner}")),
+        (Db::Postgres, VIEW | SEQUENCE) => Ok(format!("ALTER {kind} {t} RENAME TO {}", quote(db, &n))),
+        (Db::Mysql, VIEW) => Ok(format!("RENAME TABLE {t} TO {}", table(db, owner, &n))),
+        _ => Err(no(db, &format!("rename for a {}", kind.to_lowercase()))),
+    }
+}
+
+/// Enable / Disable on an Oracle trigger node.
+pub fn trigger_state(db: Db, owner: &str, name: &str, on: bool) -> R<String> {
+    match db {
+        Db::Oracle => Ok(format!("ALTER TRIGGER {} {}", table(db, owner, name), if on { "ENABLE" } else { "DISABLE" })),
+        _ => Err(no(db, "trigger enable / disable without its table (use the table's Trigger ▸ menu)")),
+    }
+}
+
 /// Copy…: a new table with the same columns, with or without the rows.
 pub fn copy(db: Db, owner: &str, name: &str, new_owner: &str, new_name: &str, data: bool) -> R<Vec<String>> {
     let src = table(db, owner, name);
@@ -296,6 +322,17 @@ pub fn drop_trigger(db: Db, owner: &str, name: &str, trigger: &str) -> R<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_renames() {
+        assert_eq!(rename_object(Db::Oracle, "TRIGGER", "HR", "T1", "t2", "SCOTT").unwrap(), r#"ALTER TRIGGER "HR"."T1" RENAME TO "T2""#);
+        assert_eq!(rename_object(Db::Oracle, "VIEW", "HR", "V", "w", "hr").unwrap(), r#"RENAME "V" TO "W""#);
+        assert!(rename_object(Db::Oracle, "SEQUENCE", "HR", "S", "s2", "SCOTT").is_err());
+        assert_eq!(rename_object(Db::Postgres, "SEQUENCE", "public", "s", "S2", "public").unwrap(), r#"ALTER SEQUENCE "public"."s" RENAME TO "s2""#);
+        assert!(rename_object(Db::Mssql, "VIEW", "dbo", "v", "w", "dbo").is_err());
+        assert!(rename_object(Db::Oracle, "TRIGGER", "HR", "T1", " ", "HR").is_err());
+        assert_eq!(trigger_state(Db::Oracle, "HR", "T1", false).unwrap(), r#"ALTER TRIGGER "HR"."T1" DISABLE"#);
+    }
 
     #[test]
     fn table_actions() {

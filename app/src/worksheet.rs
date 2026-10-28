@@ -871,23 +871,31 @@ impl Worksheet {
         let sel = self.editor.get_selected_text();
         let guess = if sel.trim().is_empty() { ident_at(&self.editor.get_text(), self.editor.get_current_pos() as usize) } else { sel.trim().to_string() };
         let Some(name) = crate::ui::ask(&self.panel, "Procedure or function ([owner.][package.]name):", "Run PL/SQL", &guess).filter(|n| !n.trim().is_empty()) else { return };
-        let c = self.conn();
-        let c2 = c.clone();
-        Conn::meta_query(&c, &dialect::plsql_args_sql(name.trim()), move |r| {
-            let app = crate::app();
-            match r.map(|r| dialect::plsql_block(&r.rows)) {
-                Ok(Some(block)) => {
-                    app.open_worksheet(c2);
-                    if let Some(ws) = app.current_sheet() {
-                        ws.editor.set_text(&block);
-                    }
-                }
-                Ok(None) => crate::ui::info(&app.frame, &format!("No procedure or function {} visible to this user.", name.trim())),
-                Err(e) => crate::ui::error(&app.frame, &e),
-            }
-        });
+        run_plsql_on(self.conn(), &name);
     }
+}
 
+/// Run PL/SQL: a worksheet with an anonymous block calling `name` ([owner.][package.]name),
+/// one variable per argument (Run ▸ Run PL/SQL, and Run… on a tree node).
+pub fn run_plsql_on(c: ConnRef, name: &str) {
+    let name = name.to_string();
+    let c2 = c.clone();
+    Conn::meta_query(&c, &dialect::plsql_args_sql(name.trim()), move |r| {
+        let app = crate::app();
+        match r.map(|r| dialect::plsql_block(&r.rows)) {
+            Ok(Some(block)) => {
+                app.open_worksheet(c2);
+                if let Some(ws) = app.current_sheet() {
+                    ws.editor.set_text(&block);
+                }
+            }
+            Ok(None) => crate::ui::info(&app.frame, &format!("No procedure or function {} visible to this user.", name.trim())),
+            Err(e) => crate::ui::error(&app.frame, &e),
+        }
+    });
+}
+
+impl Worksheet {
     /// Run the query and show the plan with actual rows / time (Oracle ALLSTATS LAST,
     /// EXPLAIN ANALYZE elsewhere) in the Explain Plan pane.
     pub fn autotrace(&self) {

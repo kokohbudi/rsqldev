@@ -47,6 +47,10 @@ const M_RENAME_CONN: i32 = 7122;
 const M_DUP_CONN: i32 = 7123;
 const M_RECONNECT: i32 = 7124;
 const M_EDIT_SOURCE: i32 = 7125;
+const M_RENAME_OBJ: i32 = 7126;
+const M_TRIG_ON: i32 = 7127;
+const M_TRIG_OFF: i32 = 7128;
+const M_RUN: i32 = 7129;
 
 /// Saved name filter of a tree folder (Apply Filter…).
 fn filter_of(conn: &str, owner: &str, kind: &str) -> Option<String> {
@@ -474,8 +478,17 @@ impl Navigator {
                     b = b.append_item(M_REBUILD, "Rebuild", "");
                 }
                 let oracle = db == Some(Kind::Oracle);
+                if oracle && matches!(*kind, dialect::PROCEDURE | dialect::FUNCTION) {
+                    b = b.append_item(M_RUN, "Run…", "A worksheet with a block calling it, one variable per argument");
+                }
                 if oracle && matches!(*kind, dialect::PACKAGE | dialect::PROCEDURE | dialect::FUNCTION | dialect::TRIGGER | dialect::VIEW | dialect::TYPE) {
                     b = b.append_item(M_COMPILE, "Compile", "");
+                }
+                if oracle && *kind == dialect::TRIGGER {
+                    b = b.append_item(M_TRIG_ON, "Enable", "").append_item(M_TRIG_OFF, "Disable", "");
+                }
+                if db.is_some_and(|db| rsqldev_core::table_actions::rename_object(db, kind, "o", "n", "x", "o").is_ok()) {
+                    b = b.append_item(M_RENAME_OBJ, "Rename…", "");
                 }
                 if *kind != dialect::TABLE {
                     b = b.append_item(M_DROP, "Drop…", "");
@@ -552,6 +565,11 @@ impl Navigator {
                 crate::table_menu::run(id, c, owner, name, done);
             }
             (M_OPEN, Node::Obj { conn, owner, kind, name }) => app.open_object(&conn, &owner, kind, &name),
+            (M_RUN, Node::Obj { conn, owner, name, .. }) => {
+                if let Some(c) = app.open_conn(&conn) {
+                    crate::worksheet::run_plsql_on(c, &format!("{owner}.{name}"));
+                }
+            }
             (M_EDIT_SOURCE, Node::Obj { conn, owner, kind, name }) => app.quick_ddl(&conn, &owner, kind, &name, crate::QuickDdl::Worksheet),
             (M_DDL | M_DDL_CLIP | M_DDL_FILE, Node::Obj { conn, owner, kind, name }) => {
                 let to = match id {
@@ -596,6 +614,18 @@ impl Navigator {
                         stmt
                     }
                     M_COMPILE => format!("ALTER {} {q} COMPILE", if kind == dialect::PACKAGE { "PACKAGE" } else { kind }),
+                    M_TRIG_ON | M_TRIG_OFF => match rsqldev_core::table_actions::trigger_state(db, &owner, &name, id == M_TRIG_ON) {
+                        Ok(s) => s,
+                        Err(e) => return crate::ui::info(&self.tree, &e),
+                    },
+                    M_RENAME_OBJ => {
+                        let Some(new) = crate::ui::ask(&self.tree, "New name:", &format!("Rename {}", kind.to_lowercase()), &rsqldev_core::ddl::shown(db, &name)) else { return };
+                        match rsqldev_core::table_actions::rename_object(db, kind, &owner, &name, &new, &c.borrow().schema) {
+                            Ok(s) if crate::ui::confirm_sql(&self.tree, &format!("Rename {kind} {q}?"), &s) => s,
+                            Ok(_) => return,
+                            Err(e) => return crate::ui::info(&self.tree, &e),
+                        }
+                    }
                     M_REBUILD => match rsqldev_core::ddl::rebuild_index(db, &owner, "", &name) {
                         Some(s) if crate::ui::confirm_sql(&self.tree, &format!("Rebuild index {q}?"), &s) => s,
                         _ => return,
