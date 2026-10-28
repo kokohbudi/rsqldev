@@ -129,6 +129,8 @@ const ID_DATA_COMPARE: i32 = ID_HIGHEST + 68;
 const ID_DB_EXPORT: i32 = ID_HIGHEST + 69;
 const ID_DB_COPY: i32 = ID_HIGHEST + 70;
 const ID_ER: i32 = ID_HIGHEST + 71;
+const ID_SEARCH_SOURCE: i32 = ID_HIGHEST + 72;
+const ID_RECENT_OBJS: i32 = ID_HIGHEST + 73;
 const ID_DESCRIBE: i32 = ID_HIGHEST + 61;
 
 enum Page {
@@ -202,6 +204,8 @@ pub struct App {
     log: RefCell<Vec<String>>,
     /// Edit ▸ Extended Paste: the last texts copied in rsqldev, newest first.
     clips: RefCell<Vec<String>>,
+    /// View ▸ Recent Objects: (connection, owner, kind, name), newest first.
+    recent_objs: RefCell<Vec<(String, String, &'static str, String)>>,
     _timer: Timer<Frame>,
     /// Tab count at the last prune of `pages` (pruning only when it changes).
     tabs_seen: std::cell::Cell<usize>,
@@ -646,6 +650,13 @@ impl App {
 
     pub fn open_object(&self, conn: &str, owner: &str, kind: &'static str, name: &str) {
         let Some(c) = self.open_conn(conn) else { return };
+        {
+            let mut r = self.recent_objs.borrow_mut();
+            let e = (conn.to_string(), owner.to_string(), kind, name.to_string());
+            r.retain(|x| *x != e);
+            r.insert(0, e);
+            r.truncate(20);
+        }
         // Select it in the Connections tree too (IntelliJ's select-in-project).
         let schema = c.borrow().schema.clone();
         self.nav.reveal(conn, &schema, owner, kind, name);
@@ -660,6 +671,43 @@ impl App {
     }
 
     /// View ▸ Find DB Object: name search across all schemas, open the pick in the object viewer.
+    /// Tools ▸ Search Source Code: hits as "OWNER.NAME (type) line n: text"; the picked object
+    /// opens in the viewer.
+    fn search_source(&self, c: ConnRef) {
+        let db = c.borrow().kind;
+        let Some(text) = ui::ask(&self.frame, "Text in the source (case-insensitive):", "Search Source Code", "").filter(|t| !t.trim().is_empty()) else { return };
+        let Some(sql) = dialect::source_search_sql(db, &text) else {
+            return ui::info(&self.frame, "No stored code to search on this database.");
+        };
+        let conn = c.borrow().cfg.name.clone();
+        Conn::meta_query(&c, &sql, move |r| {
+            let app = app();
+            let rows = match r {
+                Ok(r) => r.rows,
+                Err(e) => return ui::error(&app.frame, &e),
+            };
+            let hits: Vec<(String, String, &'static str, String)> = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let g = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+                    let kind = dialect::kind_const(g(2).trim_end_matches(" BODY"))?;
+                    let at = if g(3).is_empty() { String::new() } else { format!(" line {}: {}", g(3), g(4)) };
+                    Some((g(0), g(1), kind, at))
+                })
+                .collect();
+            if hits.is_empty() {
+                return ui::info(&app.frame, &format!("\"{text}\" was not found in stored code."));
+            }
+            let labels: Vec<String> = hits.iter().map(|(o, n, k, at)| format!("{o}.{n} ({}){at}", k.to_lowercase())).collect();
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let d = SingleChoiceDialog::builder(&app.frame, &format!("{} hit(s) (max 500):", hits.len()), "Search Source Code", &refs).build();
+            if d.show_modal() == ID_OK && d.get_selection() >= 0 {
+                let (o, n, k, _) = &hits[d.get_selection() as usize];
+                app.open_object(&conn, o, k, n);
+            }
+        });
+    }
+
     fn find_object(&self, c: ConnRef) {
         let Some(pat) = ui::ask(&self.frame, "Object name contains (* = any):", "Find DB Object", "").filter(|p| !p.trim().is_empty()) else { return };
         let conn = c.borrow().cfg.name.clone();
@@ -1304,6 +1352,23 @@ impl App {
             ID_DB_EXPORT => compare::show_export(&self.frame, false),
             ID_DB_COPY => compare::show_export(&self.frame, true),
             ID_ER => compare::show_er(&self.frame),
+            ID_SEARCH_SOURCE => self.pick_conn(|c| app().search_source(c)),
+            ID_RECENT_OBJS => {
+                let list = self.recent_objs.borrow().clone();
+                if list.is_empty() {
+                    return {
+                        ui::info(&self.frame, "No objects opened yet.");
+                        true
+                    };
+                }
+                let labels: Vec<String> = list.iter().map(|(c, o, k, n)| format!("{n}    {} · {o} · {c}", k.to_lowercase())).collect();
+                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                let d = SingleChoiceDialog::builder(&self.frame, "Open:", "Recent Objects", &refs).build();
+                if d.show_modal() == ID_OK && d.get_selection() >= 0 {
+                    let (c, o, k, n) = list[d.get_selection() as usize].clone();
+                    self.connect(&c.clone(), move |_| app().open_object(&c, &o, k, &n));
+                }
+            }
             ID_PREFERENCES => prefs::show(&self.frame),
             ID_ABOUT => ui::info(
                 &self.frame,
@@ -1481,6 +1546,7 @@ fn menus(frame: &Frame) {
     let view = Menu::builder()
         .append_item(ID_TOGGLE_NAV, "&Connections\tCtrl+Shift+L", "Show or hide the Connections navigator")
         .append_item(ID_FIND_OBJECT, "Find DB &Object…\tCtrl+Shift+O", "Find tables, views, packages… by name in every schema")
+        .append_item(ID_RECENT_OBJS, "Recent O&bjects…", "Reopen one of the last objects opened in the viewer")
         .append_item(ID_LOG, "&Log…", "Status messages and errors of this session, with their time")
         .append_separator()
         .append_item(ID_NEXT_TAB, "&Next Tab\tAlt+PgDn", "")
@@ -1520,6 +1586,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_DB_EXPORT, "Database E&xport…", "DDL of a schema's objects, with table data as INSERTs, into one .sql file")
         .append_item(ID_DB_COPY, "Database Cop&y…", "A schema's objects and data scripted into a worksheet on another connection / schema")
         .append_item(ID_ER, "E&R Diagram…", "A schema's tables and foreign keys as an SVG picture")
+        .append_item(ID_SEARCH_SOURCE, "Search Source Code…", "Find text in stored procedures, packages, triggers and views")
         .append_item(ID_DRIVERS, "&Drivers…", "Download or locate native client drivers")
         .append_item(ID_PREFERENCES, "&Preferences…", "")
         .build();
@@ -1801,6 +1868,7 @@ fn start(prefs0: config::Prefs) {
             binds: RefCell::new(std::fs::read_to_string(config::config_root().join("binds.toml")).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default()),
             log: RefCell::default(),
             clips: RefCell::default(),
+            recent_objs: RefCell::default(),
             _timer: timer,
             tabs_seen: std::cell::Cell::new(usize::MAX),
         });

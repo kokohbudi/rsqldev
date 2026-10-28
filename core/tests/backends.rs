@@ -107,6 +107,9 @@ fn exercise(c: ConnConfig, pw: &str, owner: &str) {
         assert!(t.iter().any(|(n, t)| n.eq_ignore_ascii_case("rsq_t") && t.cols.iter().any(|c| c.0.eq_ignore_ascii_case("id") && c.2)), "{t:?}");
         query_all(b, &fq).unwrap_or_else(|e| panic!("er keys: {fq}\n=> {e:#}"));
     }
+    if let Some(q) = dialect::source_search_sql(db, "rsq_") {
+        query_all(b, &q).unwrap_or_else(|e| panic!("source search: {q}\n=> {e:#}"));
+    }
     // Tools ▸ Reports: a candidate of every report runs (file engines need no privileges).
     for (label, qs) in dialect::reports(db) {
         let errs: Vec<String> = qs.iter().filter_map(|q| query_all(b, &dialect::fill(db, q, owner, "")).err().map(|e| format!("{e:#}"))).collect();

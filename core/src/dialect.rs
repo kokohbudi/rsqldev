@@ -487,6 +487,35 @@ pub fn find_sql(db: Db, pattern: &str) -> String {
 }
 
 /// Folder kind constant for a kind name from [`find_sql`].
+/// Tools ▸ Search Source Code: (owner, name, type, line, text) of stored code and views
+/// containing `text` (case-insensitive), at most 500 hits. None = nothing to search.
+pub fn source_search_sql(db: Db, text: &str) -> Option<String> {
+    // LIKE with the typed text taken literally.
+    let t = lit(&text.trim().to_uppercase()).replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let t = if matches!(db, Db::Mysql) { t.replace('\\', "\\\\") } else { t };
+    let like = |col: &str| format!("UPPER({col}) LIKE '%{t}%' ESCAPE '\\'");
+    let like_my = |col: &str| format!("UPPER({col}) LIKE '%{t}%' ESCAPE '\\\\'");
+    Some(match db {
+        Db::Oracle => format!("SELECT owner, name, type, line, TRIM(text) FROM all_source WHERE {} AND owner NOT IN ('SYS', 'SYSTEM', 'XDB', 'MDSYS', 'CTXSYS', 'ORDSYS', 'WMSYS', 'LBACSYS', 'OLAPSYS', 'DVSYS', 'GSMADMIN_INTERNAL', 'APEX_PUBLIC_USER') ORDER BY owner, name, type, line FETCH FIRST 500 ROWS ONLY", like("text")),
+        Db::Postgres => format!(
+            "SELECT n.nspname, p.proname, CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, NULL, NULL FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE {} AND n.nspname NOT IN ('pg_catalog', 'information_schema') UNION ALL SELECT schemaname, viewname, 'VIEW', NULL, NULL FROM pg_views WHERE {} AND schemaname NOT IN ('pg_catalog', 'information_schema') LIMIT 500",
+            like("p.prosrc"),
+            like("definition")
+        ),
+        Db::Mysql => format!(
+            "SELECT routine_schema, routine_name, routine_type, NULL, NULL FROM information_schema.routines WHERE {} UNION ALL SELECT table_schema, table_name, 'VIEW', NULL, NULL FROM information_schema.views WHERE {} LIMIT 500",
+            like_my("routine_definition"),
+            like_my("view_definition")
+        ),
+        Db::Mssql => format!(
+            "SELECT TOP (500) OBJECT_SCHEMA_NAME(m.object_id), OBJECT_NAME(m.object_id), CASE o.type WHEN 'P' THEN 'PROCEDURE' WHEN 'V' THEN 'VIEW' WHEN 'TR' THEN 'TRIGGER' ELSE 'FUNCTION' END, NULL, NULL FROM sys.sql_modules m JOIN sys.objects o ON o.object_id = m.object_id WHERE {}",
+            like("m.definition")
+        ),
+        Db::Sqlite => format!("SELECT 'main', name, UPPER(type), NULL, NULL FROM sqlite_master WHERE type IN ('view', 'trigger') AND {} LIMIT 500", like("sql")),
+        _ => return None,
+    })
+}
+
 pub fn kind_const(kind: &str) -> Option<&'static str> {
     [TABLE, VIEW, MVIEW, INDEX, PACKAGE, PROCEDURE, FUNCTION, TRIGGER, TYPE, SEQUENCE, SYNONYM, DBLINK].into_iter().find(|k| k.eq_ignore_ascii_case(kind.trim()))
 }
@@ -1180,6 +1209,13 @@ mod tests {
         assert_eq!(count_sql(Db::Oracle, "select * from emp;").unwrap(), "SELECT COUNT(*) FROM (select * from emp) rsq_count");
         assert!(count_sql(Db::Mssql, "with a as (select 1 x) select * from a").is_none());
         assert!(count_sql(Db::Oracle, "update t set a = 1").is_none());
+    }
+
+    #[test]
+    fn source_search_is_literal() {
+        let s = source_search_sql(Db::Oracle, "50%_o'k").unwrap();
+        assert!(s.contains("LIKE '%50\\%\\_O''K%' ESCAPE '\\'"), "{s}");
+        assert!(source_search_sql(Db::Clickhouse, "x").is_none());
     }
 
     #[test]
