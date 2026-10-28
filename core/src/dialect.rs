@@ -686,6 +686,71 @@ pub fn extra_children_sql(db: Db, kind: &str) -> Option<&'static str> {
     })
 }
 
+/// Folder ▸ New …: a CREATE template for a worksheet (placeholders in lower case). `{s}` in
+/// the patterns is the quoted owner.
+pub fn create_template(db: Db, kind: &str, owner: &str) -> Option<String> {
+    let t = match (db, kind) {
+        (Db::Oracle, VIEW) => "CREATE OR REPLACE VIEW {s}.new_view AS\nSELECT *\n  FROM dual;\n",
+        (Db::Oracle, MVIEW) => "CREATE MATERIALIZED VIEW {s}.new_mview\n  REFRESH COMPLETE ON DEMAND\nAS\nSELECT *\n  FROM dual;\n",
+        (Db::Oracle, INDEX) => "CREATE INDEX {s}.new_index ON {s}.table_name (column_name);\n",
+        (Db::Oracle, SEQUENCE) => "CREATE SEQUENCE {s}.new_sequence\n  START WITH 1\n  INCREMENT BY 1\n  NOCACHE\n  NOCYCLE;\n",
+        (Db::Oracle, SYNONYM) => "CREATE OR REPLACE SYNONYM {s}.new_synonym FOR owner.object_name;\n",
+        (Db::Oracle, PROCEDURE) => "CREATE OR REPLACE PROCEDURE {s}.new_procedure (\n  p_id IN NUMBER\n) AS\nBEGIN\n  NULL;\nEND;\n/\n",
+        (Db::Oracle, FUNCTION) => "CREATE OR REPLACE FUNCTION {s}.new_function (\n  p_id IN NUMBER\n) RETURN NUMBER AS\nBEGIN\n  RETURN p_id;\nEND;\n/\n",
+        (Db::Oracle, PACKAGE) => "CREATE OR REPLACE PACKAGE {s}.new_package AS\n  PROCEDURE run;\nEND;\n/\n\nCREATE OR REPLACE PACKAGE BODY {s}.new_package AS\n  PROCEDURE run IS\n  BEGIN\n    NULL;\n  END;\nEND;\n/\n",
+        (Db::Oracle, TRIGGER) => "CREATE OR REPLACE TRIGGER {s}.new_trigger\n  BEFORE INSERT OR UPDATE ON {s}.table_name\n  FOR EACH ROW\nBEGIN\n  NULL;\nEND;\n/\n",
+        (Db::Oracle, TYPE) => "CREATE OR REPLACE TYPE {s}.new_type AS OBJECT (\n  id   NUMBER,\n  name VARCHAR2(100)\n);\n/\n",
+        (Db::Oracle, DBLINK) => "CREATE DATABASE LINK new_link\n  CONNECT TO remote_user IDENTIFIED BY \"password\"\n  USING 'tns_alias';\n",
+        (Db::Postgres | Db::Duckdb, VIEW) => "CREATE OR REPLACE VIEW {s}.new_view AS\nSELECT 1 AS id;\n",
+        (Db::Postgres, MVIEW) => "CREATE MATERIALIZED VIEW {s}.new_mview AS\nSELECT 1 AS id;\n",
+        (Db::Postgres | Db::Duckdb | Db::Sqlite, INDEX) => "CREATE INDEX new_index ON {s}.table_name (column_name);\n",
+        (Db::Postgres | Db::Duckdb, SEQUENCE) => "CREATE SEQUENCE {s}.new_sequence START 1 INCREMENT 1;\n",
+        (Db::Postgres, FUNCTION) => "CREATE OR REPLACE FUNCTION {s}.new_function(p_id integer)\nRETURNS integer\nLANGUAGE plpgsql AS $$\nBEGIN\n  RETURN p_id;\nEND;\n$$;\n",
+        (Db::Postgres, PROCEDURE) => "CREATE OR REPLACE PROCEDURE {s}.new_procedure(p_id integer)\nLANGUAGE plpgsql AS $$\nBEGIN\n  NULL;\nEND;\n$$;\n",
+        (Db::Postgres, TRIGGER) => "CREATE OR REPLACE FUNCTION {s}.new_trigger_fn()\nRETURNS trigger\nLANGUAGE plpgsql AS $$\nBEGIN\n  RETURN NEW;\nEND;\n$$;\n\nCREATE TRIGGER new_trigger\n  BEFORE INSERT OR UPDATE ON {s}.table_name\n  FOR EACH ROW EXECUTE FUNCTION {s}.new_trigger_fn();\n",
+        (Db::Mysql, VIEW) => "CREATE OR REPLACE VIEW {s}.new_view AS\nSELECT 1 AS id;\n",
+        (Db::Mysql, INDEX) => "CREATE INDEX new_index ON {s}.table_name (column_name);\n",
+        (Db::Mysql, PROCEDURE) => "DELIMITER //\nCREATE PROCEDURE {s}.new_procedure(IN p_id INT)\nBEGIN\n  SELECT p_id;\nEND //\nDELIMITER ;\n",
+        (Db::Mysql, FUNCTION) => "DELIMITER //\nCREATE FUNCTION {s}.new_function(p_id INT) RETURNS INT\nDETERMINISTIC\nBEGIN\n  RETURN p_id;\nEND //\nDELIMITER ;\n",
+        (Db::Mysql, TRIGGER) => "DELIMITER //\nCREATE TRIGGER {s}.new_trigger\n  BEFORE INSERT ON {s}.table_name\n  FOR EACH ROW\nBEGIN\n  SET NEW.column_name = NEW.column_name;\nEND //\nDELIMITER ;\n",
+        (Db::Mssql, VIEW) => "CREATE OR ALTER VIEW {s}.new_view AS\nSELECT 1 AS id;\nGO\n",
+        (Db::Mssql, INDEX) => "CREATE INDEX new_index ON {s}.table_name (column_name);\nGO\n",
+        (Db::Mssql, PROCEDURE) => "CREATE OR ALTER PROCEDURE {s}.new_procedure\n  @p_id INT\nAS\nBEGIN\n  SET NOCOUNT ON;\n  SELECT @p_id;\nEND;\nGO\n",
+        (Db::Mssql, FUNCTION) => "CREATE OR ALTER FUNCTION {s}.new_function (@p_id INT)\nRETURNS INT\nAS\nBEGIN\n  RETURN @p_id;\nEND;\nGO\n",
+        (Db::Mssql, TRIGGER) => "CREATE OR ALTER TRIGGER {s}.new_trigger\nON {s}.table_name\nAFTER INSERT, UPDATE\nAS\nBEGIN\n  SET NOCOUNT ON;\nEND;\nGO\n",
+        (Db::Mssql, SYNONYM) => "CREATE SYNONYM {s}.new_synonym FOR schema_name.object_name;\nGO\n",
+        (Db::Mssql, SEQUENCE) => "CREATE SEQUENCE {s}.new_sequence START WITH 1 INCREMENT BY 1;\nGO\n",
+        (Db::Sqlite, VIEW) => "CREATE VIEW {s}.new_view AS\nSELECT 1 AS id;\n",
+        (Db::Sqlite, TRIGGER) => "CREATE TRIGGER {s}.new_trigger\n  AFTER INSERT ON table_name\nBEGIN\n  SELECT 1;\nEND;\n",
+        (Db::Clickhouse, VIEW) => "CREATE VIEW {s}.new_view AS\nSELECT 1 AS id;\n",
+        _ => return None,
+    };
+    Some(t.replace("{s}", &quote(db, owner)))
+}
+
+/// Sequence ▸ Edit…: current settings (Oracle / PostgreSQL), for [`alter_sequence`].
+pub fn sequence_sql(db: Db, owner: &str, name: &str) -> Option<String> {
+    let tpl = match db {
+        Db::Oracle => "SELECT increment_by, min_value, max_value, cache_size, cycle_flag FROM all_sequences WHERE sequence_owner = '{o}' AND sequence_name = '{n}'",
+        Db::Postgres => "SELECT increment_by, min_value, max_value, cache_size, CASE WHEN cycle THEN 'Y' ELSE 'N' END FROM pg_sequences WHERE schemaname = '{o}' AND sequencename = '{n}'",
+        _ => return None,
+    };
+    Some(fill(db, tpl, owner, name))
+}
+
+/// ALTER SEQUENCE with the current settings from [`sequence_sql`] (increment, min, max,
+/// cache, cycle Y/N), one clause per line to edit.
+pub fn alter_sequence(db: Db, owner: &str, name: &str, row: &[Option<String>]) -> String {
+    let v = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+    let cache = v(3).parse::<u64>().unwrap_or(0);
+    let cycle = v(4) == "Y";
+    let (cache, cycle) = match db {
+        Db::Oracle => (if cache > 1 { format!("CACHE {cache}") } else { "NOCACHE".into() }, if cycle { "CYCLE" } else { "NOCYCLE" }),
+        _ => (format!("CACHE {}", cache.max(1)), if cycle { "CYCLE" } else { "NO CYCLE" }),
+    };
+    format!("ALTER SEQUENCE {}\n  INCREMENT BY {}\n  MINVALUE {}\n  MAXVALUE {}\n  {cache}\n  {cycle};\n", qualified(db, owner, name), v(0), v(1), v(2))
+}
+
 /// Data tab query. `hidden` = leading row-locator column (ROWID, ctid, rowid) kept out of view
 /// and used as the edit key.
 pub struct DataQuery {
@@ -1012,6 +1077,18 @@ mod tests {
         assert_eq!(count_sql(Db::Oracle, "select * from emp;").unwrap(), "SELECT COUNT(*) FROM (select * from emp) rsq_count");
         assert!(count_sql(Db::Mssql, "with a as (select 1 x) select * from a").is_none());
         assert!(count_sql(Db::Oracle, "update t set a = 1").is_none());
+    }
+
+    #[test]
+    fn create_templates_and_sequences() {
+        let t = create_template(Db::Oracle, PROCEDURE, "HR").unwrap();
+        assert!(t.starts_with("CREATE OR REPLACE PROCEDURE \"HR\".new_procedure") && t.ends_with("END;\n/\n"));
+        assert!(create_template(Db::Mssql, VIEW, "dbo").unwrap().starts_with("CREATE OR ALTER VIEW [dbo].new_view"));
+        assert!(create_template(Db::Clickhouse, SEQUENCE, "d").is_none());
+        let row = |v: &[&str]| v.iter().map(|s| Some(s.to_string())).collect::<Vec<_>>();
+        assert_eq!(alter_sequence(Db::Oracle, "HR", "S", &row(&["1", "1", "9999", "20", "N"])), "ALTER SEQUENCE \"HR\".\"S\"\n  INCREMENT BY 1\n  MINVALUE 1\n  MAXVALUE 9999\n  CACHE 20\n  NOCYCLE;\n");
+        assert!(alter_sequence(Db::Postgres, "public", "s", &row(&["2", "1", "100", "1", "Y"])).ends_with("CACHE 1\n  CYCLE;\n"));
+        assert!(sequence_sql(Db::Mysql, "a", "b").is_none());
     }
 
     #[test]

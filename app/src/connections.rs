@@ -51,6 +51,24 @@ const M_RENAME_OBJ: i32 = 7126;
 const M_TRIG_ON: i32 = 7127;
 const M_TRIG_OFF: i32 = 7128;
 const M_RUN: i32 = 7129;
+const M_NEW_OBJ: i32 = 7130;
+const M_EDIT_SEQ: i32 = 7131;
+
+/// "MATERIALIZED VIEW" → "Materialized View".
+fn title(kind: &str) -> String {
+    kind.split(' ').map(|w| w[..1].to_string() + &w[1..].to_lowercase()).collect::<Vec<_>>().join(" ")
+}
+
+/// A worksheet on `conn` holding `text` (templates, generated statements).
+fn sheet_with(conn: &str, text: String) {
+    crate::app().connect(conn, move |c| {
+        let app = crate::app();
+        app.open_worksheet(c);
+        if let Some(ws) = app.current_sheet() {
+            ws.editor.set_text(&text);
+        }
+    });
+}
 
 /// Saved name filter of a tree folder (Apply Filter…).
 fn filter_of(conn: &str, owner: &str, kind: &str) -> Option<String> {
@@ -464,6 +482,10 @@ impl Navigator {
                     .append_item(M_DDL_CLIP, "Quick DDL ▸ Clipboard", "")
                     .append_item(M_DDL_FILE, "Quick DDL ▸ Save to File…", "")
                     .append_separator();
+                let db = crate::app().open_conn(conn).map(|c| c.borrow().kind);
+                if *kind == dialect::SEQUENCE && db.is_some_and(|db| dialect::sequence_sql(db, "o", "n").is_some()) {
+                    b = b.append_item(M_EDIT_SEQ, "Edit…", "ALTER SEQUENCE with the current settings, in a worksheet");
+                }
                 if matches!(*kind, dialect::PACKAGE | dialect::PROCEDURE | dialect::FUNCTION | dialect::TRIGGER | dialect::TYPE | dialect::VIEW) {
                     b = b.append_item(M_EDIT_SOURCE, "Edit…", "The source as CREATE OR REPLACE in a worksheet: Run Script (F5) compiles it, errors are marked");
                 }
@@ -472,7 +494,6 @@ impl Navigator {
                         .append_item(M_EDIT_TABLE, "Edit…", "Columns, keys, constraints, indexes and storage, with the DDL shown first")
                         .append_item(M_NEW_INDEX, "New Index…", "");
                 }
-                let db = crate::app().open_conn(conn).map(|c| c.borrow().kind);
                 // Rebuild needs only the index name on these engines.
                 if *kind == dialect::INDEX && matches!(db, Some(Kind::Oracle | Kind::Postgres | Kind::Sqlite)) {
                     b = b.append_item(M_REBUILD, "Rebuild", "");
@@ -497,6 +518,8 @@ impl Navigator {
             Node::Kind { conn, owner, kind } => {
                 if *kind == dialect::TABLE {
                     b = b.append_item(M_NEW_TABLE, "New Table…", "").append_separator();
+                } else if crate::app().open_conn(conn).is_some_and(|c| dialect::create_template(c.borrow().kind, kind, owner).is_some()) {
+                    b = b.append_item(M_NEW_OBJ, &format!("New {}…", title(kind)), "A CREATE template in a worksheet").append_separator();
                 }
                 b = b.append_item(M_FILTER, "Apply Filter…", "Show only the names matching a pattern");
                 if filter_of(conn, owner, kind).is_some() {
@@ -565,6 +588,21 @@ impl Navigator {
                 crate::table_menu::run(id, c, owner, name, done);
             }
             (M_OPEN, Node::Obj { conn, owner, kind, name }) => app.open_object(&conn, &owner, kind, &name),
+            (M_NEW_OBJ, Node::Kind { conn, owner, kind }) => {
+                if let Some(t) = app.open_conn(&conn).and_then(|c| dialect::create_template(c.borrow().kind, kind, &owner)) {
+                    sheet_with(&conn, t);
+                }
+            }
+            (M_EDIT_SEQ, Node::Obj { conn, owner, name, .. }) => {
+                let Some(c) = app.open_conn(&conn) else { return };
+                let db = c.borrow().kind;
+                let Some(sql) = dialect::sequence_sql(db, &owner, &name) else { return };
+                Conn::meta_query(&c, &sql, move |r| match r.map(|r| r.rows.into_iter().next()) {
+                    Ok(Some(row)) => sheet_with(&conn, dialect::alter_sequence(db, &owner, &name, &row)),
+                    Ok(None) => crate::ui::info(&crate::app().frame, &format!("Sequence {name} not found.")),
+                    Err(e) => crate::ui::error(&crate::app().frame, &e),
+                });
+            }
             (M_RUN, Node::Obj { conn, owner, name, .. }) => {
                 if let Some(c) = app.open_conn(&conn) {
                     crate::worksheet::run_plsql_on(c, &format!("{owner}.{name}"));
