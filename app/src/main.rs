@@ -141,6 +141,13 @@ struct History {
     entries: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+pub enum QuickDdl {
+    Worksheet,
+    Clipboard,
+    File,
+}
+
 pub struct App {
     frame: Frame,
     nb: AuiNotebook,
@@ -293,6 +300,15 @@ impl App {
             self.disconnect(o);
             if o != cfg.name {
                 config::delete_password(o);
+                // Data Pump file records follow the renamed connection.
+                if let Ok(mut f) = rsqldev_core::datapump::load_files() {
+                    if f.iter().any(|r| r.conn == o) {
+                        rsqldev_core::datapump::rename_conn(&mut f, o, &cfg.name);
+                        if let Err(e) = rsqldev_core::datapump::save_files(&f) {
+                            ui::error(&self.frame, &format!("Data Pump file records still name \"{o}\": {e}"));
+                        }
+                    }
+                }
             }
         }
         if cfg.save_password && !pw.is_empty() {
@@ -329,6 +345,36 @@ impl App {
             r.1.filters = c.filters;
             self.end_work(Some(&c.name), move || app().store(r));
         }
+    }
+
+    /// Connection ▸ Rename…: same settings and saved password under a new name.
+    pub fn rename_connection(&self, name: &str) {
+        let Some(cfg) = self.conns.borrow().iter().find(|c| c.name == name).cloned() else { return };
+        let Some(new) = ui::ask(&self.frame, "New connection name:", "Rename Connection", name).map(|s| s.trim().to_string()) else { return };
+        if new.is_empty() || new == name {
+            return;
+        }
+        if self.conns.borrow().iter().any(|c| c.name == new) {
+            return ui::error(&self.frame, &format!("A connection named \"{new}\" already exists."));
+        }
+        let pw = config::get_password(name).unwrap_or_default();
+        let (old, cfg) = (name.to_string(), ConnConfig { name: new, ..cfg });
+        self.end_work(Some(name), move || app().store((Some(old), cfg, pw, false)));
+    }
+
+    /// Connection ▸ Duplicate: a copy named "<name> (2)" with the saved password.
+    pub fn duplicate_connection(&self, name: &str) {
+        let Some(mut cfg) = self.conns.borrow().iter().find(|c| c.name == name).cloned() else { return };
+        let mut n = 2;
+        cfg.name = loop {
+            let candidate = format!("{name} ({n})");
+            if !self.conns.borrow().iter().any(|c| c.name == candidate) {
+                break candidate;
+            }
+            n += 1;
+        };
+        let pw = config::get_password(name).unwrap_or_default();
+        self.store((None, cfg, pw, false));
     }
 
     pub fn delete_connection(&self, name: &str) {
@@ -566,18 +612,20 @@ impl App {
         });
     }
 
-    pub fn ddl_to_worksheet(&self, conn: &str, owner: &str, kind: &'static str, name: &str) {
+    /// Quick DDL ▸ Worksheet / Clipboard / Save to File: the object's DDL (Oracle: DBMS_METADATA
+    /// with `;` and `/` terminators, runnable as a script).
+    pub fn quick_ddl(&self, conn: &str, owner: &str, kind: &'static str, name: &str, to: QuickDdl) {
         let Some(c) = self.open_conn(conn) else { return };
         let db = c.borrow().kind;
-        let Some((sql, col)) = dialect::tabs(db, kind).into_iter().find_map(|t| match t.view {
-            dialect::View::Ddl(s, col) => Some((s, col)),
-            dialect::View::Code(s) => Some((s, usize::MAX)),
-            _ => None,
-        }) else {
-            return;
+        let Some((sql, col)) = dialect::ddl_sql(db, kind, owner, name) else {
+            return ui::info(&self.frame, &format!("No DDL available for {kind} on this database."));
         };
-        let sql = dialect::fill(db, &sql, owner, name);
-        let c2 = c.clone();
+        let oracle = db == Kind::Oracle;
+        // One lane runs these in order: the terminator setting applies to GET_DDL only.
+        if oracle {
+            Conn::meta_query(&c, rsqldev_core::compare::ORA_TERMINATORS_ON, |_| {});
+        }
+        let (c2, file) = (c.clone(), format!("{name}.sql"));
         Conn::meta_query(&c, &sql, move |r| {
             let app = app();
             let text = match r {
@@ -585,12 +633,37 @@ impl App {
                 Ok(r) => r.rows.into_iter().next().and_then(|row| row.into_iter().nth(col).flatten()).unwrap_or_default(),
                 Err(e) => return ui::error(&app.frame, &e),
             };
-            app.open_worksheet(c2);
-            if let Some(ws) = app.current_sheet() {
-                ws.editor.set_text(text.trim_start());
-                ws.editor.set_save_point();
+            let text = format!("{}\n", text.trim());
+            match to {
+                QuickDdl::Worksheet => {
+                    app.open_worksheet(c2);
+                    if let Some(ws) = app.current_sheet() {
+                        ws.editor.set_text(&text);
+                        ws.editor.set_save_point();
+                    }
+                }
+                QuickDdl::Clipboard => {
+                    Clipboard::get().set_text(&text);
+                    app.status(0, "DDL copied to the clipboard");
+                }
+                QuickDdl::File => {
+                    let d = FileDialog::builder(&app.frame)
+                        .with_message("Save DDL")
+                        .with_default_file(&file)
+                        .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+                        .with_wildcard("SQL files (*.sql)|*.sql|All files (*)|*")
+                        .build();
+                    if let Some(p) = (d.show_modal() == ID_OK).then(|| d.get_path()).flatten() {
+                        if let Err(e) = std::fs::write(&p, &text) {
+                            ui::error(&app.frame, &format!("Saving {p} failed: {e}"));
+                        }
+                    }
+                }
             }
         });
+        if oracle {
+            Conn::meta_query(&c, rsqldev_core::compare::ORA_TERMINATORS_OFF, |_| {});
+        }
     }
 
     fn sheets(&self) -> Vec<SheetRef> {

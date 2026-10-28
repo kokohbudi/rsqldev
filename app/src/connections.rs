@@ -41,6 +41,11 @@ const M_NEW_INDEX: i32 = 7116;
 const M_REBUILD: i32 = 7117;
 const M_FILTER: i32 = 7118;
 const M_CLEAR_FILTER: i32 = 7119;
+const M_DDL_CLIP: i32 = 7120;
+const M_DDL_FILE: i32 = 7121;
+const M_RENAME_CONN: i32 = 7122;
+const M_DUP_CONN: i32 = 7123;
+const M_RECONNECT: i32 = 7124;
 
 /// Saved name filter of a tree folder (Apply Filter…).
 fn filter_of(conn: &str, owner: &str, kind: &str) -> Option<String> {
@@ -409,16 +414,24 @@ impl Navigator {
         match &node {
             Node::Conn(name) => {
                 let up = crate::app().open_conn(name).is_some();
-                b = if up { b.append_item(M_DISCONNECT, "Disconnect", "") } else { b.append_item(M_CONNECT, "Connect", "") };
+                b = if up { b.append_item(M_DISCONNECT, "Disconnect", "").append_item(M_RECONNECT, "Reconnect", "") } else { b.append_item(M_CONNECT, "Connect", "") };
                 b = b
                     .append_item(M_WORKSHEET, "Open SQL Worksheet", "")
                     .append_separator()
                     .append_item(M_PROPS, "Properties…", "")
+                    .append_item(M_RENAME_CONN, "Rename…", "")
+                    .append_item(M_DUP_CONN, "Duplicate", "Same settings and saved password under a new name")
                     .append_item(M_DELETE, "Delete Connection", "")
                     .append_item(M_REFRESH, "Refresh", "");
             }
             Node::Obj { kind, conn, .. } => {
-                b = b.append_item(M_OPEN, "Open", "").append_item(M_REFRESH, "Refresh", "").append_item(M_DDL, "Quick DDL ▸ Worksheet", "").append_separator();
+                b = b
+                    .append_item(M_OPEN, "Open", "")
+                    .append_item(M_REFRESH, "Refresh", "")
+                    .append_item(M_DDL, "Quick DDL ▸ Worksheet", "")
+                    .append_item(M_DDL_CLIP, "Quick DDL ▸ Clipboard", "")
+                    .append_item(M_DDL_FILE, "Quick DDL ▸ Save to File…", "")
+                    .append_separator();
                 if *kind == dialect::TABLE {
                     b = b
                         .append_item(M_EDIT_TABLE, "Edit…", "Columns, keys, constraints, indexes and storage, with the DDL shown first")
@@ -479,6 +492,16 @@ impl Navigator {
                     nav.tree.append_item_with_data(&i, "Loading…", Node::Loading, None, None);
                 });
             }
+            (M_RENAME_CONN, Node::Conn(name)) => app.rename_connection(&name),
+            (M_DUP_CONN, Node::Conn(name)) => app.duplicate_connection(&name),
+            (M_RECONNECT, Node::Conn(name)) => {
+                let (nav, i) = (*self, i.clone());
+                app.end_work(Some(&name.clone()), move || {
+                    crate::app().disconnect(&name);
+                    // Expanding the Loading placeholder connects again.
+                    nav.refresh(&i);
+                });
+            }
             (M_WORKSHEET, Node::Conn(name)) => app.connect(&name, move |c| crate::app().open_worksheet(c)),
             (M_PROPS, Node::Conn(name)) => app.edit_connection(&name),
             (M_DELETE, Node::Conn(name)) => {
@@ -498,7 +521,14 @@ impl Navigator {
                 crate::table_menu::run(id, c, owner, name, done);
             }
             (M_OPEN, Node::Obj { conn, owner, kind, name }) => app.open_object(&conn, &owner, kind, &name),
-            (M_DDL, Node::Obj { conn, owner, kind, name }) => app.ddl_to_worksheet(&conn, &owner, kind, &name),
+            (M_DDL | M_DDL_CLIP | M_DDL_FILE, Node::Obj { conn, owner, kind, name }) => {
+                let to = match id {
+                    M_DDL_CLIP => crate::QuickDdl::Clipboard,
+                    M_DDL_FILE => crate::QuickDdl::File,
+                    _ => crate::QuickDdl::Worksheet,
+                };
+                app.quick_ddl(&conn, &owner, kind, &name, to);
+            }
             (M_NEW_TABLE, Node::Kind { conn, owner, .. }) => {
                 let Some(c) = app.open_conn(&conn) else { return };
                 let (nav, item) = (*self, i.clone());
@@ -515,11 +545,24 @@ impl Navigator {
                 let db = c.borrow().kind;
                 let q = dialect::qualified(db, &owner, &name);
                 let sql = match id {
-                    M_DROP if crate::ui::confirm(&self.tree, &format!("Drop {kind} {q}?")) => match (db, kind) {
-                        (Kind::Postgres, dialect::FUNCTION | dialect::PROCEDURE) => format!("DROP {kind} {}.{name}", dialect::quote(db, &owner)),
-                        (Kind::Postgres, dialect::TRIGGER) => return crate::ui::info(&self.tree, "Drop the trigger from its table's Triggers tab (needs ON table)."),
-                        _ => format!("DROP {kind} {q}"),
-                    },
+                    M_DROP => {
+                        let stmt = match (db, kind) {
+                            (Kind::Postgres, dialect::FUNCTION | dialect::PROCEDURE) => format!("DROP {kind} {}.{name}", dialect::quote(db, &owner)),
+                            (Kind::Postgres, dialect::TRIGGER) => return crate::ui::info(&self.tree, "Drop the trigger from its table's Triggers tab (needs ON table)."),
+                            // Oracle names a database link bare (dots belong to the name) and
+                            // only its owner can drop it.
+                            (Kind::Oracle, dialect::DBLINK) if !owner.eq_ignore_ascii_case(&c.borrow().schema) => {
+                                return crate::ui::info(&self.tree, &format!("Only its owner can drop a database link: connect as {owner}."));
+                            }
+                            (Kind::Oracle, dialect::DBLINK) if name.chars().all(|ch| ch.is_ascii_alphanumeric() || "_$#.@".contains(ch)) => format!("DROP DATABASE LINK {name}"),
+                            (Kind::Oracle, dialect::DBLINK) => return crate::ui::info(&self.tree, "This database link name needs to be dropped by hand."),
+                            _ => format!("DROP {kind} {q}"),
+                        };
+                        if !crate::ui::confirm_sql(&self.tree, &format!("Drop {kind} {q}?"), &stmt) {
+                            return;
+                        }
+                        stmt
+                    }
                     M_COMPILE => format!("ALTER {} {q} COMPILE", if kind == dialect::PACKAGE { "PACKAGE" } else { kind }),
                     M_REBUILD => match rsqldev_core::ddl::rebuild_index(db, &owner, "", &name) {
                         Some(s) if crate::ui::confirm_sql(&self.tree, &format!("Rebuild index {q}?"), &s) => s,
