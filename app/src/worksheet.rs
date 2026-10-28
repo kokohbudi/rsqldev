@@ -745,6 +745,17 @@ impl Worksheet {
                         Err(e) => self.out(&format!("SP2-0310: unable to open file \"{}\": {e}", p.display())),
                     }
                 }
+                Action::Exit(tx) => return self.stop_script("EXIT", tx, items, Box::new(next)),
+                Action::Autocommit(on) => {
+                    self.conn().borrow_mut().prefs.autocommit = on;
+                    let me = self.weak();
+                    return Conn::tx(&self.conn(), Cmd::Autocommit(on), move |r| {
+                        if let Some(me) = me.upgrade() {
+                            me.out(&r.map(str::to_string).unwrap_or_else(|e| e));
+                        }
+                        next(items)
+                    });
+                }
                 Action::Unsupported(t) => self.out(&format!("Command skipped (not supported): {t}")),
             }
             return next(items);
@@ -765,14 +776,20 @@ impl Worksheet {
         *self.last.borrow_mut() = Some(sql.clone());
         let me = self.weak();
         let line = self.line_of(start);
+        let set = self.defines.borrow().set.clone();
+        if set.echo {
+            self.out(&format!("\n{}", sql.trim_start_matches('\u{1}')));
+        }
+        let t0 = Instant::now();
         Conn::work_query(&self.conn(), &sql.clone(), move |r| {
             let Some(me) = me.upgrade() else { return };
+            let failed = r.is_err();
             match r {
                 Ok(r) => {
-                    if r.cols.is_empty() {
+                    if !r.cols.is_empty() {
+                        me.out(&script::format_table(&r.cols, &r.rows, &set));
+                    } else if set.feedback {
                         me.out(&format!("\n{}\n", script::feedback(&sql, r.affected)));
-                    } else {
-                        me.out(&script::format_table(&r.cols, &r.rows));
                     }
                     me.dbms_lines(&r.output);
                 }
@@ -781,7 +798,32 @@ impl Worksheet {
                     me.mark_errors(line, &e);
                 }
             }
-            next(items);
+            if set.timing {
+                let ms = t0.elapsed().as_millis();
+                me.out(&format!("Elapsed: {:02}:{:02}:{:02}.{:03}", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000));
+            }
+            match set.on_error {
+                Some(tx) if failed => me.stop_script("WHENEVER SQLERROR EXIT", tx, items, next),
+                _ => next(items),
+            }
+        });
+    }
+
+    /// EXIT / WHENEVER SQLERROR EXIT: the rest of the script is skipped; commit or roll back
+    /// first when the command says so.
+    fn stop_script(&self, why: &str, tx: Option<bool>, items: Vec<Item>, next: Box<dyn FnOnce(Vec<Item>)>) {
+        self.running.set(false);
+        let msg = format!("\nScript stopped ({why}).");
+        let Some(commit) = tx else {
+            self.out(&msg);
+            return next(items);
+        };
+        let me = self.weak();
+        Conn::tx(&self.conn(), if commit { Cmd::Commit } else { Cmd::Rollback }, move |r| {
+            if let Some(me) = me.upgrade() {
+                me.out(&format!("{msg} {}", r.map(str::to_string).unwrap_or_else(|e| e)));
+            }
+            next(items)
         });
     }
 
