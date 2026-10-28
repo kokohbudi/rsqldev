@@ -733,3 +733,71 @@ mod tests {
         assert!(super::KEYWORDS.windows(2).all(|w| w[0] < w[1]));
     }
 }
+
+/// File ▸ Print: plain monospace text, a header line (title, page n of m) per page, long lines
+/// wrapped to the page width.
+struct TextPrint {
+    title: String,
+    text: String,
+    lines: Vec<String>,
+    per_page: usize,
+    font: Option<Font>,
+}
+
+impl TextPrint {
+    fn margins(dc: &GenericDC) -> (i32, i32, i32, i32) {
+        let (w, h) = dc.get_size();
+        (w / 16, h / 16, w - w / 8, h - h / 8)
+    }
+}
+
+impl Printout for TextPrint {
+    fn on_prepare_printing(&mut self, dc: &GenericDC) {
+        self.font = Font::new_with_details(9, FontFamily::Teletype as i32, 0, 400, false, "");
+        if let Some(f) = &self.font {
+            dc.set_font(f);
+        }
+        let (_, _, w, h) = Self::margins(dc);
+        let (cw, ch) = dc.get_text_extent("M");
+        let cols = (w / cw.max(1)).max(20) as usize;
+        self.per_page = ((h / ch.max(1)) as usize).saturating_sub(2).max(1);
+        // Wrap by characters (monospace): tabs as four spaces.
+        self.lines = self
+            .text
+            .replace('\t', "    ")
+            .lines()
+            .flat_map(|l| {
+                let chars: Vec<char> = l.chars().collect();
+                if chars.is_empty() { vec![String::new()] } else { chars.chunks(cols).map(|c| c.iter().collect()).collect() }
+            })
+            .collect();
+    }
+
+    fn get_page_info(&mut self) -> (i32, i32, i32, i32) {
+        let pages = self.lines.len().div_ceil(self.per_page).max(1) as i32;
+        (1, pages, 1, pages)
+    }
+
+    fn has_page(&mut self, page: i32) -> bool {
+        page >= 1 && (page as usize - 1) * self.per_page < self.lines.len().max(1)
+    }
+
+    fn on_print_page(&mut self, dc: &GenericDC, page: i32) -> bool {
+        if let Some(f) = &self.font {
+            dc.set_font(f);
+        }
+        let (x, y, _, _) = Self::margins(dc);
+        let ch = dc.get_text_extent("M").1;
+        let pages = self.lines.len().div_ceil(self.per_page).max(1);
+        dc.draw_text(&format!("{}    page {page} of {pages}", self.title), x, y);
+        for (i, l) in self.lines.iter().skip((page as usize - 1) * self.per_page).take(self.per_page).enumerate() {
+            dc.draw_text(l, x, y + ch * (i as i32 + 2));
+        }
+        true
+    }
+}
+
+pub fn print_text(parent: &Frame, title: &str, text: &str) {
+    let job = TextPrint { title: title.to_string(), text: text.to_string(), lines: vec![], per_page: 1, font: None };
+    Printer::new(None).print(Some(parent), title, job, true);
+}

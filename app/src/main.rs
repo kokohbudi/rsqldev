@@ -131,6 +131,7 @@ const ID_DB_COPY: i32 = ID_HIGHEST + 70;
 const ID_ER: i32 = ID_HIGHEST + 71;
 const ID_SEARCH_SOURCE: i32 = ID_HIGHEST + 72;
 const ID_RECENT_OBJS: i32 = ID_HIGHEST + 73;
+const ID_PRINT: i32 = ID_HIGHEST + 74;
 const ID_DESCRIBE: i32 = ID_HIGHEST + 61;
 
 enum Page {
@@ -1352,6 +1353,14 @@ impl App {
             ID_DB_EXPORT => compare::show_export(&self.frame, false),
             ID_DB_COPY => compare::show_export(&self.frame, true),
             ID_ER => compare::show_er(&self.frame),
+            ID_PRINT => {
+                if let Some(s) = sheet {
+                    let sel = s.editor.get_selected_text();
+                    let text = if sel.trim().is_empty() { s.editor.get_text() } else { sel };
+                    let title = s.path.borrow().as_ref().and_then(|p| p.file_name()).map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| s.conn().borrow().cfg.name.clone());
+                    editor::print_text(&self.frame, &title, &text);
+                }
+            }
             ID_SEARCH_SOURCE => self.pick_conn(|c| app().search_source(c)),
             ID_RECENT_OBJS => {
                 let list = self.recent_objs.borrow().clone();
@@ -1505,6 +1514,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_RENAME_TAB, "Rena&me Tab…", "Rename the current tab")
         .append_item(ID_DISCONNECT_ALL, "Disconnect All", "Close every connection (asks about uncommitted changes)")
         .append_item(ID_RECOVER, "&Recover Unsaved Worksheet…\tCtrl+Shift+T", "Reopen a worksheet closed without saving")
+        .append_item(ID_PRINT, "&Print…\tCtrl+P", "Print the worksheet (or its selection)")
         .append_separator()
         .append_item(ID_EXIT, "E&xit\tCtrl+Q", "")
         .build();
