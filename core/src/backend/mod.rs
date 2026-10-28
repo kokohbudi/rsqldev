@@ -35,6 +35,53 @@ pub fn client_dir(driver_id: &str, prefs: &Prefs) -> Option<PathBuf> {
     crate::download::installed_dir(registry::find(driver_id)?)
 }
 
+/// tnsnames.ora aliases (sorted, upper case) for the TNS connection type, from `tns_admin`
+/// (the connection's option), the Tnsnames Directory preference, $TNS_ADMIN, $ORACLE_HOME/network/admin and the Oracle client
+/// folder's network/admin.
+pub fn tns_aliases(tns_admin: Option<&str>, prefs: &Prefs) -> Vec<String> {
+    let mut dirs: Vec<PathBuf> = [tns_admin, Some(prefs.tns_dir.as_str())].into_iter().flatten().filter(|s| !s.trim().is_empty()).map(PathBuf::from).collect();
+    dirs.extend(std::env::var_os("TNS_ADMIN").map(PathBuf::from));
+    dirs.extend(std::env::var_os("ORACLE_HOME").map(|h| PathBuf::from(h).join("network").join("admin")));
+    dirs.extend(client_dir("oracle", prefs).map(|c| c.join("network").join("admin")));
+    let mut out: Vec<String> = dirs.iter().filter_map(|d| std::fs::read_to_string(d.join("tnsnames.ora")).ok()).flat_map(|s| parse_tnsnames(&s)).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Alias names in tnsnames.ora text: `NAME[, NAME2] =` outside parentheses. The rest of an
+/// `=` line at depth 0 (an IFILE path) is skipped.
+pub fn parse_tnsnames(text: &str) -> Vec<String> {
+    let (mut out, mut depth, mut head) = (vec![], 0i32, String::new());
+    for line in text.lines() {
+        let mut after_eq = false;
+        for ch in line.split('#').next().unwrap_or("").chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                '=' if depth == 0 && !after_eq => {
+                    out.extend(head.split(',').map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty() && s != "IFILE" && !s.contains(char::is_whitespace)));
+                    head.clear();
+                    after_eq = true;
+                }
+                c if depth == 0 && !after_eq => head.push(c),
+                _ => {}
+            }
+        }
+        if after_eq { head.clear() } else { head.push(' ') }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tns_tests {
+    #[test]
+    fn tnsnames_aliases() {
+        let t = "# comment\nORCL =\n  (DESCRIPTION =\n    (ADDRESS = (PROTOCOL = TCP)(HOST = h)(PORT = 1521))\n    (CONNECT_DATA = (SERVICE_NAME = orcl)))\n\nIFILE = /etc/other.ora\nprod, prod.world=(DESCRIPTION=(ADDRESS=(HOST=p)))\nlast =\n (DESCRIPTION=)";
+        assert_eq!(super::parse_tnsnames(t), ["ORCL", "PROD", "PROD.WORLD", "LAST"]);
+    }
+}
+
 pub fn connect(cfg: &ConnConfig, password: &str, prefs: &Prefs) -> Result<Box<dyn Backend>> {
     let drv = registry::find(&cfg.driver).ok_or_else(|| anyhow!("unknown driver '{}'", cfg.driver))?;
     // SSH tunnel: connect to a forwarded local port instead of the database host.

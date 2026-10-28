@@ -154,6 +154,8 @@ pub struct TableDef {
     pub pk_name: String,
     /// Primary key column order from the Primary Key page (empty = PK flags in column order).
     pub pk_order: Vec<String>,
+    /// Oracle: the primary key is DISABLEd (Primary Key page ▸ Enabled unticked).
+    pub pk_disabled: bool,
     pub comment: String,
     /// Create only: `Some(true)` session (ON COMMIT PRESERVE ROWS), `Some(false)` transaction.
     pub temporary: Option<bool>,
@@ -437,7 +439,8 @@ fn pk_clause(db: Db, t: &TableDef, cols: &[String]) -> String {
     match db {
         Db::Oracle | Db::Mssql => {
             let n = if t.pk_name.trim().is_empty() { format!("PK_{}", ident(db, &t.name)).chars().take(128).collect() } else { ident(db, &t.pk_name) };
-            format!("CONSTRAINT {} PRIMARY KEY ({list})", quote(db, &n))
+            let off = if db == Db::Oracle && t.pk_disabled { " DISABLE" } else { "" };
+            format!("CONSTRAINT {} PRIMARY KEY ({list}){off}", quote(db, &n))
         }
         Db::Postgres | Db::Duckdb if !t.pk_name.trim().is_empty() => format!("CONSTRAINT {} PRIMARY KEY ({list})", q(db, &t.pk_name)),
         _ => format!("PRIMARY KEY ({list})"),
@@ -621,6 +624,11 @@ pub fn alter_table(db: Db, old: &TableDef, new: &TableDef) -> Result<Vec<String>
     let typed = new.pk_name.trim();
     if !pk_changed && !old.pk_name.is_empty() && !typed.is_empty() && typed != old.pk_name && typed != shown(db, &old.pk_name) && ident(db, typed) != old.pk_name {
         body.push(rename_constraint(db, &t, &old.owner, &old.pk_name, &new.pk_name)?);
+    }
+    // Enabled ticked / unticked on a kept Oracle primary key (a new one carries DISABLE itself).
+    if db == Db::Oracle && !pk_changed && !old_pk.is_empty() && new.pk_disabled != old.pk_disabled {
+        let n = if typed.is_empty() { old.pk_name.clone() } else { ident(db, typed) };
+        body.push(alter(&format!("{} CONSTRAINT {}", if new.pk_disabled { "DISABLE" } else { "ENABLE" }, quote(db, &n))));
     }
 
     for o in &old.columns {
@@ -914,6 +922,7 @@ pub fn from_rows(db: Db, owner: &str, name: &str, cols: &[Row], cons: &[Row], id
         let (cname, kind, info) = (get(r, 0), get(r, 1), get(r, 2));
         if kind == "PRIMARY KEY" {
             t.pk_name = cname;
+            t.pk_disabled = get(r, 3) == "DISABLED";
             if db == Db::Duckdb {
                 // "PRIMARY KEY(id, b)"
                 let inner = info.split_once('(').map_or("", |x| x.1).trim_end_matches(')');
@@ -1100,6 +1109,18 @@ mod tests {
         assert!(create_table(Db::Duckdb, &ms).unwrap_err().contains("DuckDB has no"));
         ms.columns[0].identity.as_mut().unwrap().start = "1; drop".into();
         assert!(create_table(Db::Oracle, &ms).unwrap_err().contains("whole number"));
+    }
+
+    #[test]
+    fn primary_key_enabled_flag() {
+        let r = |v: &[&str]| v.iter().map(|x| (!x.is_empty()).then(|| x.to_string())).collect::<Vec<_>>();
+        let old = from_rows(Db::Oracle, "HR", "T", &[r(&["ID", "NUMBER", "No", "", "1", "Y", ""])], &[r(&["PK_T", "PRIMARY KEY", "ID", "ENABLED"])], &[]);
+        assert!(!old.pk_disabled);
+        let mut new = old.clone();
+        new.pk_disabled = true;
+        assert_eq!(alter_table(Db::Oracle, &old, &new).unwrap(), ["ALTER TABLE \"HR\".\"T\" DISABLE CONSTRAINT \"PK_T\""]);
+        assert!(create_table(Db::Oracle, &new).unwrap()[0].contains("CONSTRAINT \"PK_T\" PRIMARY KEY (\"ID\") DISABLE"));
+        assert!(!create_table(Db::Postgres, &new).unwrap()[0].contains("DISABLE"));
     }
 
     #[test]

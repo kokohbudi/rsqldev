@@ -67,6 +67,13 @@ impl FindBar {
                 }
             });
         }
+        // Incremental search: the match follows the text as it is typed.
+        let w = Rc::downgrade(&bar);
+        bar.find.on_text_changed(move |_| {
+            if let Some(w) = w.upgrade() {
+                w.incremental()
+            }
+        });
         let enter: [(TextCtrl, fn(&FindBar)); 2] = [(bar.find, |b| b.next(false)), (bar.repl, FindBar::replace_one)];
         for (t, f) in enter {
             let w = Rc::downgrade(&bar);
@@ -127,6 +134,24 @@ impl FindBar {
     }
 
     /// Select the next (or previous) match, wrapping around the document.
+    /// Search from the current match start (wrapping), so typing extends the match in place.
+    fn incremental(&self) {
+        let text = self.find.get_value();
+        if text.is_empty() || !self.panel.is_shown() {
+            return self.msg.set_label("");
+        }
+        let (e, f, len) = (self.editor, self.flags(), self.editor.get_length());
+        let from = e.get_selection_start();
+        match e.find_text(from, len, &text, f).or_else(|| e.find_text(0, from, &text, f)) {
+            Some(p) => {
+                e.set_selection(p, p + text.len() as i32);
+                e.ensure_caret_visible();
+                self.msg.set_label("");
+            }
+            None => self.msg.set_label("Not found"),
+        }
+    }
+
     pub fn next(&self, back: bool) {
         let text = self.find.get_value();
         if text.is_empty() {

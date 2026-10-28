@@ -39,6 +39,109 @@ const M_NEW_TABLE: i32 = 7114;
 const M_EDIT_TABLE: i32 = 7115;
 const M_NEW_INDEX: i32 = 7116;
 const M_REBUILD: i32 = 7117;
+const M_FILTER: i32 = 7118;
+const M_CLEAR_FILTER: i32 = 7119;
+const M_DDL_CLIP: i32 = 7120;
+const M_DDL_FILE: i32 = 7121;
+const M_RENAME_CONN: i32 = 7122;
+const M_DUP_CONN: i32 = 7123;
+const M_RECONNECT: i32 = 7124;
+const M_EDIT_SOURCE: i32 = 7125;
+const M_RENAME_OBJ: i32 = 7126;
+const M_TRIG_ON: i32 = 7127;
+const M_TRIG_OFF: i32 = 7128;
+const M_RUN: i32 = 7129;
+const M_NEW_OBJ: i32 = 7130;
+const M_EDIT_SEQ: i32 = 7131;
+const M_COMPILE_INVALID: i32 = 7132;
+const M_MV_REFRESH: i32 = 7133;
+const M_LINK_TEST: i32 = 7134;
+const M_FLASHBACK: i32 = 7135;
+const M_PURGE: i32 = 7136;
+const M_PURGE_ALL: i32 = 7137;
+const M_JOB_RUN: i32 = 7138;
+const M_JOB_STOP: i32 = 7139;
+const M_JOB_ON: i32 = 7140;
+const M_JOB_OFF: i32 = 7141;
+const M_NEW_USER: i32 = 7142;
+const M_EDIT_USER: i32 = 7143;
+const M_GRANT: i32 = 7144;
+const M_REVOKE: i32 = 7145;
+const M_DROP_USER: i32 = 7146;
+
+/// New / Edit User, Grant, Revoke, Drop User (Oracle). Passwords stay out of the shown
+/// statements and error messages; `done` refreshes the tree.
+fn user_action(id: i32, c: ConnRef, user: String, done: std::rc::Rc<dyn Fn()>) {
+    use crate::table_menu::{F, form};
+    use rsqldev_core::table_actions as ta;
+    let p = crate::app().frame;
+    let (stmts, pw) = match id {
+        M_NEW_USER => {
+            let Some(v) = form(&p, "New User", vec![F::Text("User name:", String::new()), F::Password("Password:"), F::Password("Confirm password:"), F::Text("Default tablespace:", "USERS".into()), F::Text("Temporary tablespace:", "TEMP".into()), F::Check("Unlimited quota on the default tablespace", true), F::Text("Grant (comma separated):", "CREATE SESSION".into())]) else { return };
+            if v[1] != v[2] {
+                return crate::ui::error(&p, "The passwords differ.");
+            }
+            let u = ta::UserSpec { name: v[0].clone(), password: v[1].clone(), default_ts: v[3].clone(), temp_ts: v[4].clone(), quota_unlimited: v[5] == "1", grants: v[6].split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(), ..Default::default() };
+            (ta::create_user(&u), u.password)
+        }
+        M_EDIT_USER => {
+            let Some(v) = form(&p, &format!("Edit User {user}"), vec![F::Password("New password (empty = unchanged):"), F::Password("Confirm password:"), F::Text("Default tablespace (empty = unchanged):", String::new()), F::Text("Temporary tablespace (empty = unchanged):", String::new()), F::Check("Unlimited quota on the default tablespace", false), F::Choice("Account:", vec!["unchanged".into(), "Lock".into(), "Unlock".into()]), F::Check("Expire the password (change at next login)", false)]) else { return };
+            if v[0] != v[1] {
+                return crate::ui::error(&p, "The passwords differ.");
+            }
+            let lock = match v[5].as_str() {
+                "Lock" => Some(true),
+                "Unlock" => Some(false),
+                _ => None,
+            };
+            let u = ta::UserSpec { name: user.clone(), password: v[0].clone(), default_ts: v[2].clone(), temp_ts: v[3].clone(), quota_unlimited: v[4] == "1", lock, expire: v[6] == "1", ..Default::default() };
+            (ta::alter_user(&u), u.password)
+        }
+        M_GRANT | M_REVOKE => {
+            let revoke = id == M_REVOKE;
+            let mut f = vec![F::Text("Privileges / roles (comma separated):", String::new())];
+            if !revoke {
+                f.push(F::Check("With admin option", false));
+            }
+            let Some(v) = form(&p, &format!("{} {user}", if revoke { "Revoke from" } else { "Grant to" }), f) else { return };
+            (ta::grant(&v[0], &user, v.get(1).is_some_and(|a| a == "1"), revoke).map(|s| vec![s]), String::new())
+        }
+        _ => {
+            let Some(v) = form(&p, &format!("Drop User {user}"), vec![F::Check("Cascade (also drop the user's objects)", false)]) else { return };
+            (Ok(vec![ta::drop_user(&user, v[0] == "1")]), String::new())
+        }
+    };
+    let stmts = match stmts {
+        Ok(s) => s,
+        Err(e) => return crate::ui::error(&p, &e),
+    };
+    let shown = ta::masked(&stmts, &pw);
+    let text = shown.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
+    if crate::ui::confirm_sql(&p, &format!("Run on {}?", c.borrow().cfg.name), &text) {
+        crate::table_editor::run_shown(c, stmts, shown, 0, done);
+    }
+}
+
+/// "MATERIALIZED VIEW" → "Materialized View".
+fn title(kind: &str) -> String {
+    kind.split(' ').map(|w| w[..1].to_string() + &w[1..].to_lowercase()).collect::<Vec<_>>().join(" ")
+}
+
+/// A worksheet on `conn` holding `text` (templates, generated statements).
+fn sheet_with(conn: &str, text: String) {
+    crate::app().connect(conn, move |c| {
+        let app = crate::app();
+        app.open_worksheet(c);
+        if let Some(ws) = app.current_sheet() {
+            ws.editor.set_text(&text);
+        }
+    });
+}
+
+/// Saved name filter of a tree folder (Apply Filter…).
+fn filter_of(conn: &str, owner: &str, kind: &str) -> Option<String> {
+    crate::app().conns.borrow().iter().find(|c| c.name == conn)?.filters.get(&config::filter_key(owner, kind)).cloned()
+}
 
 impl Navigator {
     pub fn new(parent: &dyn WxWidget) -> Navigator {
@@ -46,9 +149,11 @@ impl Navigator {
         let bar = BoxSizer::builder(Orientation::Horizontal).build();
         let add = crate::icons::tool(&panel, "new", "New Connection…");
         let refresh = crate::icons::tool(&panel, "refresh", "Refresh");
+        let filter = crate::icons::tool(&panel, "filter", "Apply Filter… (on Tables, Views, …)");
         let collapse = crate::icons::tool(&panel, "collapse", "Collapse All");
         bar.add(&add, 0, SizerFlag::All, 3);
         bar.add(&refresh, 0, SizerFlag::All, 3);
+        bar.add(&filter, 0, SizerFlag::All, 3);
         bar.add(&collapse, 0, SizerFlag::All, 3);
         let tree = TreeCtrl::builder(&panel).with_style(TreeCtrlStyle::Default | TreeCtrlStyle::HideRoot).build();
         tree.set_image_list(crate::icons::tree_images());
@@ -59,6 +164,10 @@ impl Navigator {
         let nav = Navigator { panel, tree };
         add.on_click(move |_| crate::app().new_connection());
         collapse.on_click(move |_| tree.collapse_all());
+        filter.on_click(move |_| match tree.get_selection().map(|i| (nav.node(&i), i)) {
+            Some((Node::Kind { conn, owner, kind }, i)) => nav.set_filter(&i, &conn, &owner, kind, true),
+            _ => crate::ui::info(&tree, "Select a folder (Tables, Views, …) under a connection to filter it."),
+        });
         refresh.on_click(move |_| {
             if let Some(i) = tree.get_selection() {
                 nav.refresh(&i);
@@ -157,6 +266,17 @@ impl Navigator {
         });
     }
 
+    /// Expand and select connection `name`'s node (connections can sit one folder deep).
+    pub fn expand_conn(&self, name: &str) {
+        let Some(root) = self.tree.get_root_item() else { return };
+        let is = |n: &Node| matches!(n, Node::Conn(c) if c == name);
+        let found = self.child_where(&root, &is).or_else(|| self.children(&root).into_iter().filter(|c| matches!(self.node(c), Node::Folder)).find_map(|f| self.child_where(&f, &is)));
+        if let Some(i) = found {
+            self.tree.expand(&i);
+            crate::copy::quietly(|| self.tree.select_item(&i));
+        }
+    }
+
     fn children(&self, i: &TreeItemId) -> Vec<TreeItemId> {
         let mut out = vec![];
         if let Some((mut c, _)) = self.tree.get_first_child(i) {
@@ -231,7 +351,12 @@ impl Navigator {
             } else {
                 folders.entry(&c.folder).or_insert_with(|| self.add(&root, &c.folder, Node::Folder, false).unwrap()).clone()
             };
-            self.add(&parent, &c.name, Node::Conn(c.name.clone()), true);
+            if let Some(i) = self.add(&parent, &c.name, Node::Conn(c.name.clone()), true) {
+                if let Some(rgb) = config::conn_colour(&c.color) {
+                    self.tree.set_item_text_colour(&i, crate::theme::c(rgb));
+                    self.tree.set_item_bold(&i, true);
+                }
+            }
         }
     }
 
@@ -275,13 +400,21 @@ impl Navigator {
                 let c = crate::app().open_conn(&conn);
                 let db = c.map(|c| c.borrow().kind).unwrap_or(Kind::Sqlite);
                 let sql = dialect::list_sql(db, kind, &owner);
+                let pat = filter_of(&conn, &owner, kind);
                 self.load(i, &conn.clone(), sql, move |nav, item, db, rows| {
-                    let expandable = dialect::children_sql(db, kind).is_some();
+                    let expandable = dialect::children_sql(db, kind).is_some() || dialect::extra_children_sql(db, kind).is_some();
                     let red = crate::theme::c(crate::theme::p().invalid);
                     for r in rows {
                         let Some(name) = r.first().cloned().flatten() else { continue };
+                        // ponytail: filtered client side (the full list is fetched, only matches go
+                        // into the tree); push the pattern into list_sql if huge schemas need it.
+                        if pat.as_deref().is_some_and(|p| !config::name_matches(p, &name)) {
+                            continue;
+                        }
                         let n = Node::Obj { conn: conn.clone(), owner: owner.clone(), kind, name: name.clone() };
-                        if let Some(ni) = nav.add(item, &name, n, expandable) {
+                        // A third column, when listed, is the label (Recycle Bin: original name).
+                        let label = r.get(2).cloned().flatten().unwrap_or_else(|| name.clone());
+                        if let Some(ni) = nav.add(item, &label, n, expandable) {
                             if r.get(1).and_then(|s| s.as_deref()) == Some("INVALID") {
                                 nav.tree.set_item_text_colour(&ni, red);
                             }
@@ -292,14 +425,30 @@ impl Navigator {
             Node::Obj { conn, owner, kind, name } => {
                 let c = crate::app().open_conn(&conn);
                 let db = c.map(|c| c.borrow().kind).unwrap_or(Kind::Sqlite);
-                let sql = dialect::children_sql(db, kind).map(|s| dialect::fill(db, &s, &owner, &name));
-                self.load(i, &conn, sql, move |nav, item, _, rows| {
+                let extra = dialect::extra_children_sql(db, kind).map(|s| dialect::fill(db, s, &owner, &name));
+                let leaves = |nav: &Navigator, item: &TreeItemId, rows: Vec<Vec<rsqldev_core::Cell>>| {
                     for r in rows {
-                        let col = r.first().cloned().flatten().unwrap_or_default();
-                        let ty = r.get(1).cloned().flatten().unwrap_or_default();
-                        nav.add(item, &format!("{col} ({})", ty.to_uppercase()), Node::Leaf, false);
+                        let name = r.first().cloned().flatten().unwrap_or_default();
+                        let detail = r.get(1).cloned().flatten().unwrap_or_default();
+                        let text = if detail.trim().is_empty() { name } else { format!("{name} ({})", detail.trim().to_uppercase()) };
+                        nav.add(item, &text, Node::Leaf, false);
                     }
-                });
+                };
+                // Columns first (if any), then members / arguments / partitions.
+                match dialect::children_sql(db, kind).map(|s| dialect::fill(db, &s, &owner, &name)) {
+                    Some(cols) => self.load(i, &conn.clone(), Some(cols), move |nav, item, _, rows| {
+                        leaves(nav, item, rows);
+                        if let (Some(extra), Some(c)) = (extra, crate::app().open_conn(&conn)) {
+                            let (nav, item) = (*nav, item.clone());
+                            Conn::meta_query(&c, &extra, move |r| {
+                                if let Ok(r) = r {
+                                    crate::copy::quietly(|| leaves(&nav, &item, r.rows));
+                                }
+                            });
+                        }
+                    }),
+                    None => self.load(i, &conn, extra, move |nav, item, _, rows| leaves(nav, item, rows)),
+                }
             }
             _ => {}
         }
@@ -307,7 +456,8 @@ impl Navigator {
 
     fn add_folders(&self, parent: &TreeItemId, conn: &str, owner: &str, kind: Kind) {
         for (label, k) in dialect::folders(kind) {
-            self.add(parent, label, Node::Kind { conn: conn.into(), owner: owner.into(), kind: k }, true);
+            let text = if filter_of(conn, owner, k).is_some() { format!("{label} (Filtered)") } else { label.to_string() };
+            self.add(parent, &text, Node::Kind { conn: conn.into(), owner: owner.into(), kind: k }, true);
         }
     }
 
@@ -343,6 +493,38 @@ impl Navigator {
         }
     }
 
+    /// Apply Filter… (`ask`) or Clear Filter on a folder: saved with the connection, the folder
+    /// reloads with only the matching names and is labelled "(Filtered)".
+    fn set_filter(&self, i: &TreeItemId, conn: &str, owner: &str, kind: &'static str, ask: bool) {
+        let pat = if ask {
+            let cur = filter_of(conn, owner, kind).unwrap_or_default();
+            match crate::ui::ask(&self.tree, "Name filter (% or * = any characters, _ = one character, plain text = contains):", "Apply Filter", &cur) {
+                Some(p) => p.trim().to_string(),
+                None => return,
+            }
+        } else {
+            String::new()
+        };
+        let app = crate::app();
+        {
+            let mut cs = app.conns.borrow_mut();
+            let Some(c) = cs.iter_mut().find(|c| c.name == conn) else { return };
+            let key = config::filter_key(owner, kind);
+            if pat.is_empty() {
+                c.filters.remove(&key);
+            } else {
+                c.filters.insert(key, pat.clone());
+            }
+        }
+        // Saved directly: App::save_conns would rebuild (and collapse) the whole tree.
+        if let Err(e) = config::save_connections(&app.conns.borrow()) {
+            crate::ui::error(&self.tree, &format!("Saving the filter failed: {e}"));
+        }
+        let base = self.tree.get_item_text(i).unwrap_or_default().trim_end_matches(" (Filtered)").to_string();
+        self.tree.set_item_text(i, &if pat.is_empty() { base } else { format!("{base} (Filtered)") });
+        self.refresh(i);
+    }
+
     fn activated(&self, i: &TreeItemId) {
         match self.node(i) {
             Node::Conn(name) => crate::app().connect(&name, move |c| crate::app().open_worksheet(c)),
@@ -357,36 +539,106 @@ impl Navigator {
         match &node {
             Node::Conn(name) => {
                 let up = crate::app().open_conn(name).is_some();
-                b = if up { b.append_item(M_DISCONNECT, "Disconnect", "") } else { b.append_item(M_CONNECT, "Connect", "") };
+                b = if up { b.append_item(M_DISCONNECT, "Disconnect", "").append_item(M_RECONNECT, "Reconnect", "") } else { b.append_item(M_CONNECT, "Connect", "") };
                 b = b
                     .append_item(M_WORKSHEET, "Open SQL Worksheet", "")
                     .append_separator()
                     .append_item(M_PROPS, "Properties…", "")
+                    .append_item(M_RENAME_CONN, "Rename…", "")
+                    .append_item(M_DUP_CONN, "Duplicate", "Same settings and saved password under a new name")
                     .append_item(M_DELETE, "Delete Connection", "")
                     .append_item(M_REFRESH, "Refresh", "");
             }
             Node::Obj { kind, conn, .. } => {
-                b = b.append_item(M_OPEN, "Open", "").append_item(M_REFRESH, "Refresh", "").append_item(M_DDL, "Quick DDL ▸ Worksheet", "").append_separator();
+                b = b.append_item(M_OPEN, "Open", "").append_item(M_REFRESH, "Refresh", "");
+                // Directories, public synonyms and the recycle bin have no owner DDL here.
+                let special = matches!(*kind, dialect::DIRECTORY | dialect::PUBLIC_SYNONYM | dialect::RECYCLE | dialect::JOB);
+                if !special {
+                    b = b.append_item(M_DDL, "Quick DDL ▸ Worksheet", "").append_item(M_DDL_CLIP, "Quick DDL ▸ Clipboard", "").append_item(M_DDL_FILE, "Quick DDL ▸ Save to File…", "");
+                }
+                b = b.append_separator();
+                let db = crate::app().open_conn(conn).map(|c| c.borrow().kind);
+                if *kind == dialect::JOB {
+                    b = b
+                        .append_item(M_JOB_RUN, "Run", "Run the job now, in the background")
+                        .append_item(M_JOB_STOP, "Stop", "")
+                        .append_item(M_JOB_ON, "Enable", "")
+                        .append_item(M_JOB_OFF, "Disable", "");
+                }
+                if *kind == dialect::RECYCLE {
+                    b = b.append_item(M_FLASHBACK, "Flashback (Restore)", "FLASHBACK TABLE ... TO BEFORE DROP").append_item(M_PURGE, "Purge…", "");
+                }
+                if *kind == dialect::MVIEW && matches!(db, Some(Kind::Oracle | Kind::Postgres)) {
+                    b = b.append_item(M_MV_REFRESH, "Refresh Data", "Complete refresh of the materialized view");
+                }
+                if *kind == dialect::DBLINK && db == Some(Kind::Oracle) {
+                    b = b.append_item(M_LINK_TEST, "Test", "SELECT * FROM dual over the link");
+                }
+                if *kind == dialect::SEQUENCE && db.is_some_and(|db| dialect::sequence_sql(db, "o", "n").is_some()) {
+                    b = b.append_item(M_EDIT_SEQ, "Edit…", "ALTER SEQUENCE with the current settings, in a worksheet");
+                }
+                if matches!(*kind, dialect::PACKAGE | dialect::PROCEDURE | dialect::FUNCTION | dialect::TRIGGER | dialect::TYPE | dialect::VIEW) {
+                    b = b.append_item(M_EDIT_SOURCE, "Edit…", "The source as CREATE OR REPLACE in a worksheet: Run Script (F5) compiles it, errors are marked");
+                }
                 if *kind == dialect::TABLE {
                     b = b
                         .append_item(M_EDIT_TABLE, "Edit…", "Columns, keys, constraints, indexes and storage, with the DDL shown first")
                         .append_item(M_NEW_INDEX, "New Index…", "");
                 }
-                let db = crate::app().open_conn(conn).map(|c| c.borrow().kind);
                 // Rebuild needs only the index name on these engines.
                 if *kind == dialect::INDEX && matches!(db, Some(Kind::Oracle | Kind::Postgres | Kind::Sqlite)) {
                     b = b.append_item(M_REBUILD, "Rebuild", "");
                 }
                 let oracle = db == Some(Kind::Oracle);
+                if oracle && matches!(*kind, dialect::PROCEDURE | dialect::FUNCTION) {
+                    b = b.append_item(M_RUN, "Run…", "A worksheet with a block calling it, one variable per argument");
+                }
                 if oracle && matches!(*kind, dialect::PACKAGE | dialect::PROCEDURE | dialect::FUNCTION | dialect::TRIGGER | dialect::VIEW | dialect::TYPE) {
                     b = b.append_item(M_COMPILE, "Compile", "");
                 }
-                if *kind != dialect::TABLE {
+                if oracle && *kind == dialect::TRIGGER {
+                    b = b.append_item(M_TRIG_ON, "Enable", "").append_item(M_TRIG_OFF, "Disable", "");
+                }
+                if db.is_some_and(|db| rsqldev_core::table_actions::rename_object(db, kind, "o", "n", "x", "o").is_ok()) {
+                    b = b.append_item(M_RENAME_OBJ, "Rename…", "");
+                }
+                if *kind != dialect::TABLE && *kind != dialect::RECYCLE {
                     b = b.append_item(M_DROP, "Drop…", "");
                 }
             }
-            Node::Kind { kind, .. } if *kind == dialect::TABLE => b = b.append_item(M_NEW_TABLE, "New Table…", "").append_separator().append_item(M_REFRESH, "Refresh", ""),
-            Node::Kind { .. } | Node::Schemas { .. } | Node::Schema { .. } => b = b.append_item(M_REFRESH, "Refresh", ""),
+            Node::Kind { conn, owner, kind } => {
+                if *kind == dialect::TABLE {
+                    b = b.append_item(M_NEW_TABLE, "New Table…", "").append_separator();
+                } else if crate::app().open_conn(conn).is_some_and(|c| dialect::create_template(c.borrow().kind, kind, owner).is_some()) {
+                    b = b.append_item(M_NEW_OBJ, &format!("New {}…", title(kind)), "A CREATE template in a worksheet").append_separator();
+                }
+                let oracle = crate::app().open_conn(conn).is_some_and(|c| c.borrow().kind == Kind::Oracle);
+                if oracle && matches!(*kind, dialect::PACKAGE | dialect::PROCEDURE | dialect::FUNCTION | dialect::TRIGGER | dialect::TYPE | dialect::VIEW | dialect::MVIEW) {
+                    b = b.append_item(M_COMPILE_INVALID, "Compile Invalid", "Recompile the schema's invalid objects (DBMS_UTILITY.COMPILE_SCHEMA)").append_separator();
+                }
+                if *kind == dialect::RECYCLE {
+                    b = b.append_item(M_PURGE_ALL, "Purge Recycle Bin…", "PURGE RECYCLEBIN").append_separator();
+                }
+                b = b.append_item(M_FILTER, "Apply Filter…", "Show only the names matching a pattern");
+                if filter_of(conn, owner, kind).is_some() {
+                    b = b.append_item(M_CLEAR_FILTER, "Clear Filter", "");
+                }
+                b = b.append_separator().append_item(M_REFRESH, "Refresh", "");
+            }
+            Node::Schemas { conn } | Node::Schema { conn, .. } => {
+                if crate::app().open_conn(conn).is_some_and(|c| c.borrow().kind == Kind::Oracle) {
+                    b = match &node {
+                        Node::Schemas { .. } => b.append_item(M_NEW_USER, "New User…", ""),
+                        _ => b
+                            .append_item(M_EDIT_USER, "Edit User…", "Password, tablespaces, quota, lock / unlock, expire")
+                            .append_item(M_GRANT, "Grant…", "System privileges or roles")
+                            .append_item(M_REVOKE, "Revoke…", "")
+                            .append_item(M_DROP_USER, "Drop User…", ""),
+                    };
+                    b = b.append_separator();
+                }
+                b = b.append_item(M_REFRESH, "Refresh", "");
+            }
             _ => return,
         }
         let mut m = b.build();
@@ -404,15 +656,30 @@ impl Navigator {
 
     fn menu(&self, id: i32, i: &TreeItemId, node: Node) {
         let app = crate::app();
+        let node_copy = node.clone();
         match (id, node) {
             (M_REFRESH, _) => self.refresh(i),
+            (M_FILTER | M_CLEAR_FILTER, Node::Kind { conn, owner, kind }) => self.set_filter(i, &conn, &owner, kind, id == M_FILTER),
             (M_CONNECT, Node::Conn(_)) => self.tree.expand(i),
             (M_DISCONNECT, Node::Conn(name)) => {
-                app.disconnect(&name);
-                self.set_conn_image(i, &name, false);
-                self.tree.collapse(i);
-                self.tree.delete_children(i);
-                self.tree.append_item_with_data(i, "Loading…", Node::Loading, None, None);
+                let (nav, i) = (*self, i.clone());
+                app.end_work(Some(&name.clone()), move || {
+                    crate::app().disconnect(&name);
+                    nav.set_conn_image(&i, &name, false);
+                    nav.tree.collapse(&i);
+                    nav.tree.delete_children(&i);
+                    nav.tree.append_item_with_data(&i, "Loading…", Node::Loading, None, None);
+                });
+            }
+            (M_RENAME_CONN, Node::Conn(name)) => app.rename_connection(&name),
+            (M_DUP_CONN, Node::Conn(name)) => app.duplicate_connection(&name),
+            (M_RECONNECT, Node::Conn(name)) => {
+                let (nav, i) = (*self, i.clone());
+                app.end_work(Some(&name.clone()), move || {
+                    crate::app().disconnect(&name);
+                    // Expanding the Loading placeholder connects again.
+                    nav.refresh(&i);
+                });
             }
             (M_WORKSHEET, Node::Conn(name)) => app.connect(&name, move |c| crate::app().open_worksheet(c)),
             (M_PROPS, Node::Conn(name)) => app.edit_connection(&name),
@@ -433,7 +700,65 @@ impl Navigator {
                 crate::table_menu::run(id, c, owner, name, done);
             }
             (M_OPEN, Node::Obj { conn, owner, kind, name }) => app.open_object(&conn, &owner, kind, &name),
-            (M_DDL, Node::Obj { conn, owner, kind, name }) => app.ddl_to_worksheet(&conn, &owner, kind, &name),
+            (M_NEW_USER | M_EDIT_USER | M_GRANT | M_REVOKE | M_DROP_USER, Node::Schemas { conn } | Node::Schema { conn, .. }) => {
+                let Some(c) = app.open_conn(&conn) else { return };
+                let user = if let Node::Schema { owner, .. } = &node_copy { owner.clone() } else { String::new() };
+                let (nav, item) = (*self, i.clone());
+                // Refresh the user list (the Other Users folder) afterwards.
+                let target = if id == M_NEW_USER { item } else { nav.tree.get_item_parent(&item).unwrap_or(item) };
+                user_action(id, c, user, std::rc::Rc::new(move || nav.refresh(&target)));
+            }
+            (M_COMPILE_INVALID | M_PURGE_ALL, Node::Kind { conn, owner, .. }) => {
+                let Some(c) = app.open_conn(&conn) else { return };
+                let (sql, what) = if id == M_PURGE_ALL { ("PURGE RECYCLEBIN".to_string(), "Purge the recycle bin? Dropped tables can no longer be restored.") } else { (rsqldev_core::table_actions::compile_invalid(&owner), "Recompile the invalid objects of the schema?") };
+                if crate::ui::confirm_sql(&self.tree, what, &sql) {
+                    let (nav, item) = (*self, i.clone());
+                    Conn::work_query(&c, &sql, move |r| match r {
+                        Ok(_) => nav.refresh(&item),
+                        Err(e) => crate::ui::error(&nav.tree, &e),
+                    });
+                }
+            }
+            (M_LINK_TEST, Node::Obj { conn, name, .. }) => {
+                let Some(c) = app.open_conn(&conn) else { return };
+                if !name.chars().all(|ch| ch.is_ascii_alphanumeric() || "_$#.@".contains(ch)) {
+                    return crate::ui::info(&self.tree, "This database link name needs to be tested by hand.");
+                }
+                let tree = self.tree;
+                Conn::meta_query(&c, &format!("SELECT * FROM dual@{name}"), move |r| match r {
+                    Ok(_) => crate::ui::info(&tree, &format!("Database link {name}: OK")),
+                    Err(e) => crate::ui::error(&tree, &format!("Database link {name} failed:\n{e}")),
+                });
+            }
+            (M_NEW_OBJ, Node::Kind { conn, owner, kind }) => {
+                if let Some(t) = app.open_conn(&conn).and_then(|c| dialect::create_template(c.borrow().kind, kind, &owner)) {
+                    sheet_with(&conn, t);
+                }
+            }
+            (M_EDIT_SEQ, Node::Obj { conn, owner, name, .. }) => {
+                let Some(c) = app.open_conn(&conn) else { return };
+                let db = c.borrow().kind;
+                let Some(sql) = dialect::sequence_sql(db, &owner, &name) else { return };
+                Conn::meta_query(&c, &sql, move |r| match r.map(|r| r.rows.into_iter().next()) {
+                    Ok(Some(row)) => sheet_with(&conn, dialect::alter_sequence(db, &owner, &name, &row)),
+                    Ok(None) => crate::ui::info(&crate::app().frame, &format!("Sequence {name} not found.")),
+                    Err(e) => crate::ui::error(&crate::app().frame, &e),
+                });
+            }
+            (M_RUN, Node::Obj { conn, owner, name, .. }) => {
+                if let Some(c) = app.open_conn(&conn) {
+                    crate::worksheet::run_plsql_on(c, &format!("{owner}.{name}"));
+                }
+            }
+            (M_EDIT_SOURCE, Node::Obj { conn, owner, kind, name }) => app.quick_ddl(&conn, &owner, kind, &name, crate::QuickDdl::Worksheet),
+            (M_DDL | M_DDL_CLIP | M_DDL_FILE, Node::Obj { conn, owner, kind, name }) => {
+                let to = match id {
+                    M_DDL_CLIP => crate::QuickDdl::Clipboard,
+                    M_DDL_FILE => crate::QuickDdl::File,
+                    _ => crate::QuickDdl::Worksheet,
+                };
+                app.quick_ddl(&conn, &owner, kind, &name, to);
+            }
             (M_NEW_TABLE, Node::Kind { conn, owner, .. }) => {
                 let Some(c) = app.open_conn(&conn) else { return };
                 let (nav, item) = (*self, i.clone());
@@ -450,12 +775,69 @@ impl Navigator {
                 let db = c.borrow().kind;
                 let q = dialect::qualified(db, &owner, &name);
                 let sql = match id {
-                    M_DROP if crate::ui::confirm(&self.tree, &format!("Drop {kind} {q}?")) => match (db, kind) {
-                        (Kind::Postgres, dialect::FUNCTION | dialect::PROCEDURE) => format!("DROP {kind} {}.{name}", dialect::quote(db, &owner)),
-                        (Kind::Postgres, dialect::TRIGGER) => return crate::ui::info(&self.tree, "Drop the trigger from its table's Triggers tab (needs ON table)."),
-                        _ => format!("DROP {kind} {q}"),
-                    },
+                    M_DROP => {
+                        let stmt = match (db, kind) {
+                            (Kind::Postgres, dialect::FUNCTION | dialect::PROCEDURE) => format!("DROP {kind} {}.{name}", dialect::quote(db, &owner)),
+                            (Kind::Postgres, dialect::TRIGGER) => return crate::ui::info(&self.tree, "Drop the trigger from its table's Triggers tab (needs ON table)."),
+                            // Index nodes are `table.index` here.
+                            (Kind::Mysql | Kind::Mssql, dialect::INDEX) => match name.split_once('.') {
+                                Some((t, i)) => format!("DROP INDEX {} ON {}", dialect::quote(db, i), dialect::qualified(db, &owner, t)),
+                                None => return,
+                            },
+                            // Oracle names a database link bare (dots belong to the name) and
+                            // only its owner can drop it.
+                            (Kind::Oracle, dialect::DBLINK) if !owner.eq_ignore_ascii_case(&c.borrow().schema) => {
+                                return crate::ui::info(&self.tree, &format!("Only its owner can drop a database link: connect as {owner}."));
+                            }
+                            (Kind::Oracle, dialect::DBLINK) if name.chars().all(|ch| ch.is_ascii_alphanumeric() || "_$#.@".contains(ch)) => format!("DROP DATABASE LINK {name}"),
+                            (Kind::Oracle, dialect::DBLINK) => return crate::ui::info(&self.tree, "This database link name needs to be dropped by hand."),
+                            (Kind::Oracle, dialect::DIRECTORY) => format!("DROP DIRECTORY {}", dialect::quote(db, &name)),
+                            (Kind::Oracle, dialect::JOB) => rsqldev_core::table_actions::job_action(&owner, &name, "DROP"),
+                            (Kind::Oracle, dialect::PUBLIC_SYNONYM) => format!("DROP PUBLIC SYNONYM {}", dialect::quote(db, &name)),
+                            _ => format!("DROP {kind} {q}"),
+                        };
+                        if !crate::ui::confirm_sql(&self.tree, &format!("Drop {kind} {q}?"), &stmt) {
+                            return;
+                        }
+                        stmt
+                    }
                     M_COMPILE => format!("ALTER {} {q} COMPILE", if kind == dialect::PACKAGE { "PACKAGE" } else { kind }),
+                    M_MV_REFRESH => match rsqldev_core::table_actions::refresh_mview(db, &owner, &name) {
+                        Ok(s) => s,
+                        Err(e) => return crate::ui::info(&self.tree, &e),
+                    },
+                    M_JOB_RUN | M_JOB_STOP | M_JOB_ON | M_JOB_OFF => {
+                        let action = match id {
+                            M_JOB_RUN => "RUN",
+                            M_JOB_STOP => "STOP",
+                            M_JOB_ON => "ENABLE",
+                            _ => "DISABLE",
+                        };
+                        let s = rsqldev_core::table_actions::job_action(&owner, &name, action);
+                        if id == M_JOB_STOP && !crate::ui::confirm_sql(&self.tree, &format!("Stop job {q}?"), &s) {
+                            return;
+                        }
+                        s
+                    }
+                    M_FLASHBACK | M_PURGE => {
+                        let s = rsqldev_core::table_actions::recycle(&name, id == M_FLASHBACK);
+                        if id == M_PURGE && !crate::ui::confirm_sql(&self.tree, "Purge it from the recycle bin? It can no longer be restored.", &s) {
+                            return;
+                        }
+                        s
+                    }
+                    M_TRIG_ON | M_TRIG_OFF => match rsqldev_core::table_actions::trigger_state(db, &owner, &name, id == M_TRIG_ON) {
+                        Ok(s) => s,
+                        Err(e) => return crate::ui::info(&self.tree, &e),
+                    },
+                    M_RENAME_OBJ => {
+                        let Some(new) = crate::ui::ask(&self.tree, "New name:", &format!("Rename {}", kind.to_lowercase()), &rsqldev_core::ddl::shown(db, &name)) else { return };
+                        match rsqldev_core::table_actions::rename_object(db, kind, &owner, &name, &new, &c.borrow().schema) {
+                            Ok(s) if crate::ui::confirm_sql(&self.tree, &format!("Rename {kind} {q}?"), &s) => s,
+                            Ok(_) => return,
+                            Err(e) => return crate::ui::info(&self.tree, &e),
+                        }
+                    }
                     M_REBUILD => match rsqldev_core::ddl::rebuild_index(db, &owner, "", &name) {
                         Some(s) if crate::ui::confirm_sql(&self.tree, &format!("Rebuild index {q}?"), &s) => s,
                         _ => return,
@@ -533,9 +915,15 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let db = text();
     let file = text();
     let browse = Button::builder(&dlg).with_label("Browse…").build();
-    let tns = text();
+    // TNS: aliases from tnsnames.ora to pick, or a typed alias / full descriptor.
+    let tns_admin = existing.and_then(|c| c.options.get("tns_admin").cloned());
+    let tns = ComboBox::builder(&dlg).with_choices(rsqldev_core::backend::tns_aliases(tns_admin.as_deref(), &crate::app().prefs())).build();
     let opts = text();
-    opts.set_tooltip("Driver options, e.g. ssh=user@bastion[:22]; ssh_key=~/.ssh/id_ed25519 (SSH tunnel); sslmode=verify-full; trust_cert=true (SQL Server self-signed); ssl=true; verify=false (MySQL); https=true; allow_http=true (ClickHouse); tns_admin=/path");
+    let startup = text();
+    let colour = Choice::builder(&dlg).with_choices(std::iter::once("None".to_string()).chain(config::CONN_COLOURS.iter().map(|c| c.0.to_string())).collect()).build();
+    colour.set_tooltip("Marks this connection's worksheets and tree node (e.g. red for production)");
+    startup.set_tooltip("Run on every new session, ; separated, e.g. ALTER SESSION SET CURRENT_SCHEMA = HR");
+    opts.set_tooltip("Driver options, e.g. ssh=user@bastion[:22]; ssh_key=~/.ssh/id_ed25519 (SSH tunnel); sslmode=verify-full; trust_cert=true (SQL Server self-signed); ssl=true; verify=false (MySQL); https=true; allow_http=true (ClickHouse); tns_admin=/path; auth=external (Oracle OS / Kerberos / wallet login, no password)");
     let status = StaticText::builder(&dlg).with_label("Status :").build();
 
     let top = FlexGridSizer::builder(0, 2).with_vgap(6).with_hgap(8).build();
@@ -543,6 +931,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let r_name = put(&top, &dlg, "Name", name);
     let _ = put(&top, &dlg, "Database Type", dbtype);
     let _ = put(&top, &dlg, "Folder", folder);
+    let _ = put(&top, &dlg, "Color", colour);
     let ub = StaticBoxSizerBuilder::new_with_label(Orientation::Vertical, &dlg, "User Info").build();
     let ug = FlexGridSizer::builder(0, 2).with_vgap(6).with_hgap(8).build();
     ug.add_growable_col(1, 1);
@@ -562,6 +951,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
         put(&dg, &dlg, "", browse),
         put(&dg, &dlg, "TNS alias / Descriptor", tns),
         put(&dg, &dlg, "Options", opts),
+        put(&dg, &dlg, "Startup SQL", startup),
     ];
     dbx.add_sizer(&dg, 1, SizerFlag::Expand | SizerFlag::All, 6);
     let _ = r_name;
@@ -589,6 +979,8 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
         file.set_value(&c.database);
         tns.set_value(&c.tns);
         opts.set_value(&c.options.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; "));
+        startup.set_value(&c.startup_sql);
+        colour.set_selection(config::CONN_COLOURS.iter().position(|x| x.0 == c.color).map_or(0, |i| i + 1) as u32);
     };
     let rows_user = std::rc::Rc::new(rows_user);
     let rows_det = std::rc::Rc::new(rows_det);
@@ -604,7 +996,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
                 l.show(show);
                 c.show(show);
             }
-            let det = [ora, !file_db && basic, !file_db && basic, ora && ct == 0, ora && ct == 0, !ora && !file_db, file_db, file_db, ora && ct > 0, !file_db];
+            let det = [ora, !file_db && basic, !file_db && basic, ora && ct == 0, ora && ct == 0, !ora && !file_db, file_db, file_db, ora && ct > 0, !file_db, true];
             for ((l, c), show) in rd.iter().zip(det) {
                 l.show(show);
                 c.show(show);
@@ -665,6 +1057,8 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
             sid: d.backend == Kind::Oracle && r_sid.get_value(),
             tns: tns.get_value().trim().to_string(),
             options: opts.get_value().split(';').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect(),
+            startup_sql: startup.get_value().trim().to_string(),
+            color: colour.get_string_selection().filter(|c| c != "None").unwrap_or_default(),
             ..Default::default()
         };
         c.database = match d.backend {

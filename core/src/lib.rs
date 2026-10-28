@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod compare;
+pub mod er;
 pub mod complete;
 pub mod config;
 pub mod datapump;
@@ -175,9 +176,41 @@ pub fn is_query(sql: &str) -> bool {
     )
 }
 
+/// What a statement does to the open transaction when autocommit is off: Some(true) it may
+/// leave uncommitted work, Some(false) it ends the transaction, None no change.
+/// `ddl_commits`: DDL commits implicitly (Oracle, MySQL).
+// ponytail: keyword heuristic; a procedure that commits inside still counts as pending work
+// (asks once too often, never too rarely).
+pub fn tx_effect(sql: &str, ddl_commits: bool) -> Option<bool> {
+    let up = sql.to_uppercase();
+    let words = || up.split(|c: char| !(c.is_alphanumeric() || c == '_'));
+    match first_keyword(sql).as_str() {
+        "COMMIT" | "END" => Some(false),
+        "ROLLBACK" if !words().any(|w| w == "TO") => Some(false),
+        "ROLLBACK" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "UPSERT" | "REPLACE" | "BEGIN" | "DECLARE" | "CALL" | "EXEC" | "EXECUTE" | "LOCK" | "SAVEPOINT" => Some(true),
+        "SELECT" | "WITH" if words().any(|w| matches!(w, "INSERT" | "UPDATE" | "DELETE" | "MERGE")) => Some(true),
+        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "GRANT" | "REVOKE" | "RENAME" | "COMMENT" | "ANALYZE" | "AUDIT" | "PURGE" | "FLASHBACK" if ddl_commits => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transaction_effect() {
+        assert_eq!(tx_effect("insert into t values (1)", true), Some(true));
+        assert_eq!(tx_effect("select * from t for update", true), Some(true));
+        assert_eq!(tx_effect("with d as (delete from t returning *) select * from d", false), Some(true));
+        assert_eq!(tx_effect("select * from t", true), None);
+        assert_eq!(tx_effect("commit", true), Some(false));
+        assert_eq!(tx_effect("rollback", false), Some(false));
+        assert_eq!(tx_effect("rollback to savepoint a", true), Some(true));
+        assert_eq!(tx_effect("begin p; end;", true), Some(true));
+        assert_eq!(tx_effect("create table x (a int)", true), Some(false));
+        assert_eq!(tx_effect("create table x (a int)", false), None);
+    }
 
     #[test]
     fn keyword() {

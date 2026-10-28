@@ -180,8 +180,8 @@ pub fn show(parent: &Frame) {
     dlg.destroy();
 }
 
-/// Minimal "open in file manager".
-mod open {
+/// Minimal "open in file manager" / default app.
+pub(crate) mod open {
     pub fn that(p: &std::path::Path) -> std::io::Result<()> {
         #[cfg(target_os = "macos")]
         let cmd = "open";

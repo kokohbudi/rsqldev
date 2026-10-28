@@ -192,7 +192,7 @@ fn line_block(stc: &StyledTextCtrl) -> (i32, i32) {
     (stc.position_from_line(l0), end)
 }
 
-fn replace(stc: &StyledTextCtrl, a: i32, b: i32, text: &str) {
+pub fn replace(stc: &StyledTextCtrl, a: i32, b: i32, text: &str) {
     stc.set_target_start(a);
     stc.set_target_end(b);
     stc.replace_target(text);
@@ -206,6 +206,35 @@ pub fn duplicate_lines(stc: StyledTextCtrl) {
     let block = if block.ends_with('\n') { block.to_string() } else { format!("{block}\n") };
     replace(&stc, a, b, &format!("{block}{}", &text[a as usize..b as usize]));
     stc.set_selection(a + block.len() as i32, a + 2 * block.len() as i32 - 1);
+}
+
+/// Edit ▸ Toggle Line Comment: `-- ` on every touched line, or off when all have one.
+pub fn toggle_comment(stc: StyledTextCtrl) {
+    let (a, b) = line_block(&stc);
+    let text = stc.get_text();
+    let Some(block) = text.get(a as usize..b as usize) else { return };
+    let out = rsqldev_core::format::toggle_line_comments(block);
+    replace(&stc, a, b, &out);
+    stc.set_selection(a, a + out.trim_end_matches(['\r', '\n']).len() as i32);
+}
+
+/// Edit ▸ Toggle Block Comment: wrap the selection in `/* */`, or unwrap it.
+pub fn toggle_block_comment(stc: StyledTextCtrl) {
+    let (a, b) = (stc.get_selection_start(), stc.get_selection_end());
+    let text = stc.get_text();
+    let Some(sel) = text.get(a as usize..b as usize).filter(|s| !s.is_empty()) else { return };
+    let out = rsqldev_core::format::toggle_block_comment(sel);
+    replace(&stc, a, b, &out);
+    stc.set_selection(a, a + out.len() as i32);
+}
+
+/// Navigate ▸ Go to Line…
+pub fn goto_line(stc: StyledTextCtrl, parent: &dyn WxWidget) {
+    let (cur, n) = (stc.line_from_position(stc.get_current_pos()) + 1, stc.get_line_count());
+    let Some(s) = crate::ui::ask(parent, &format!("Line number (1 - {n}):"), "Go to Line", &cur.to_string()) else { return };
+    let Ok(line) = s.trim().parse::<i32>() else { return };
+    stc.goto_line((line - 1).clamp(0, n - 1));
+    stc.set_focus();
 }
 
 /// Edit ▸ Move Lines Up / Down: swap the touched lines with the line above / below.
@@ -703,4 +732,72 @@ mod tests {
     fn keywords_sorted() {
         assert!(super::KEYWORDS.windows(2).all(|w| w[0] < w[1]));
     }
+}
+
+/// File ▸ Print: plain monospace text, a header line (title, page n of m) per page, long lines
+/// wrapped to the page width.
+struct TextPrint {
+    title: String,
+    text: String,
+    lines: Vec<String>,
+    per_page: usize,
+    font: Option<Font>,
+}
+
+impl TextPrint {
+    fn margins(dc: &GenericDC) -> (i32, i32, i32, i32) {
+        let (w, h) = dc.get_size();
+        (w / 16, h / 16, w - w / 8, h - h / 8)
+    }
+}
+
+impl Printout for TextPrint {
+    fn on_prepare_printing(&mut self, dc: &GenericDC) {
+        self.font = Font::new_with_details(9, FontFamily::Teletype as i32, 0, 400, false, "");
+        if let Some(f) = &self.font {
+            dc.set_font(f);
+        }
+        let (_, _, w, h) = Self::margins(dc);
+        let (cw, ch) = dc.get_text_extent("M");
+        let cols = (w / cw.max(1)).max(20) as usize;
+        self.per_page = ((h / ch.max(1)) as usize).saturating_sub(2).max(1);
+        // Wrap by characters (monospace): tabs as four spaces.
+        self.lines = self
+            .text
+            .replace('\t', "    ")
+            .lines()
+            .flat_map(|l| {
+                let chars: Vec<char> = l.chars().collect();
+                if chars.is_empty() { vec![String::new()] } else { chars.chunks(cols).map(|c| c.iter().collect()).collect() }
+            })
+            .collect();
+    }
+
+    fn get_page_info(&mut self) -> (i32, i32, i32, i32) {
+        let pages = self.lines.len().div_ceil(self.per_page).max(1) as i32;
+        (1, pages, 1, pages)
+    }
+
+    fn has_page(&mut self, page: i32) -> bool {
+        page >= 1 && (page as usize - 1) * self.per_page < self.lines.len().max(1)
+    }
+
+    fn on_print_page(&mut self, dc: &GenericDC, page: i32) -> bool {
+        if let Some(f) = &self.font {
+            dc.set_font(f);
+        }
+        let (x, y, _, _) = Self::margins(dc);
+        let ch = dc.get_text_extent("M").1;
+        let pages = self.lines.len().div_ceil(self.per_page).max(1);
+        dc.draw_text(&format!("{}    page {page} of {pages}", self.title), x, y);
+        for (i, l) in self.lines.iter().skip((page as usize - 1) * self.per_page).take(self.per_page).enumerate() {
+            dc.draw_text(l, x, y + ch * (i as i32 + 2));
+        }
+        true
+    }
+}
+
+pub fn print_text(parent: &Frame, title: &str, text: &str) {
+    let job = TextPrint { title: title.to_string(), text: text.to_string(), lines: vec![], per_page: 1, font: None };
+    Printer::new(None).print(Some(parent), title, job, true);
 }

@@ -18,6 +18,11 @@ pub const TYPE: &str = "TYPE";
 pub const SEQUENCE: &str = "SEQUENCE";
 pub const SYNONYM: &str = "SYNONYM";
 pub const DBLINK: &str = "DATABASE LINK";
+/// Oracle folders that are not one owner's objects.
+pub const DIRECTORY: &str = "DIRECTORY";
+pub const PUBLIC_SYNONYM: &str = "PUBLIC SYNONYM";
+pub const RECYCLE: &str = "RECYCLE BIN";
+pub const JOB: &str = "JOB";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum View {
@@ -157,6 +162,78 @@ pub fn top_sql(db: Db, order: &str, filter: &str) -> Option<Vec<String>> {
     })
 }
 
+/// Tools ▸ Reports: (label, candidate queries tried in order; later ones need fewer
+/// privileges). `{o}` = the current schema, filled with [`fill`].
+pub fn reports(db: Db) -> Vec<(&'static str, Vec<&'static str>)> {
+    match db {
+        Db::Oracle => vec![
+            ("About: version", vec!["SELECT banner_full AS banner FROM v$version", "SELECT banner FROM v$version"]),
+            ("About: NLS parameters", vec!["SELECT parameter, value FROM nls_session_parameters ORDER BY 1"]),
+            ("Instance and database", vec!["SELECT i.instance_name, i.host_name, i.version, i.status, i.startup_time, d.name AS db_name, d.log_mode, d.open_mode, d.database_role FROM v$instance i CROSS JOIN v$database d"]),
+            ("Parameters (non-default)", vec!["SELECT name, value, description FROM v$parameter WHERE isdefault = 'FALSE' ORDER BY name"]),
+            ("Storage: tablespace usage", vec![
+                "SELECT m.tablespace_name, ROUND(m.tablespace_size * t.block_size / 1048576) AS size_mb, ROUND(m.used_space * t.block_size / 1048576) AS used_mb, ROUND(m.used_percent, 1) AS used_pct, t.status, t.contents FROM dba_tablespace_usage_metrics m JOIN dba_tablespaces t ON t.tablespace_name = m.tablespace_name ORDER BY m.used_percent DESC",
+                "SELECT tablespace_name, ROUND(SUM(bytes) / 1048576) AS used_mb FROM user_segments GROUP BY tablespace_name ORDER BY 2 DESC",
+            ]),
+            ("Storage: data files", vec!["SELECT file_name, tablespace_name, ROUND(bytes / 1048576) AS size_mb, autoextensible, ROUND(maxbytes / 1048576) AS max_mb, status FROM dba_data_files ORDER BY tablespace_name, file_name"]),
+            ("Storage: largest segments (schema)", vec!["SELECT segment_name, segment_type, partition_name, tablespace_name, ROUND(bytes / 1048576, 1) AS size_mb FROM all_segments WHERE owner = '{o}' ORDER BY bytes DESC FETCH FIRST 100 ROWS ONLY", "SELECT segment_name, segment_type, partition_name, tablespace_name, ROUND(bytes / 1048576, 1) AS size_mb FROM user_segments ORDER BY bytes DESC FETCH FIRST 100 ROWS ONLY"]),
+            ("Objects: invalid", vec!["SELECT owner, object_type, object_name, last_ddl_time FROM all_objects WHERE status = 'INVALID' ORDER BY owner, object_type, object_name"]),
+            ("Objects: counts by type (schema)", vec!["SELECT object_type, COUNT(*) AS objects, SUM(CASE WHEN status = 'INVALID' THEN 1 ELSE 0 END) AS invalid FROM all_objects WHERE owner = '{o}' GROUP BY object_type ORDER BY 2 DESC"]),
+            ("Tables: without a primary key (schema)", vec!["SELECT t.table_name, t.num_rows, t.last_analyzed FROM all_tables t WHERE t.owner = '{o}' AND NOT EXISTS (SELECT 1 FROM all_constraints c WHERE c.owner = t.owner AND c.table_name = t.table_name AND c.constraint_type = 'P') ORDER BY 1"]),
+            ("Tables: unindexed foreign keys (schema)", vec!["SELECT c.table_name, c.constraint_name, cc.column_name FROM all_constraints c JOIN all_cons_columns cc ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name AND cc.position = 1 WHERE c.owner = '{o}' AND c.constraint_type = 'R' AND NOT EXISTS (SELECT 1 FROM all_ind_columns ic WHERE ic.table_owner = c.owner AND ic.table_name = c.table_name AND ic.column_name = cc.column_name AND ic.column_position = 1) ORDER BY 1, 2"]),
+            ("Tables: stale statistics (schema)", vec!["SELECT table_name, num_rows, last_analyzed, stale_stats FROM all_tab_statistics WHERE owner = '{o}' AND (stale_stats = 'YES' OR last_analyzed IS NULL) AND object_type = 'TABLE' ORDER BY last_analyzed NULLS FIRST"]),
+            ("Security: users", vec!["SELECT username, account_status, lock_date, expiry_date, default_tablespace, profile, created FROM dba_users ORDER BY username", "SELECT username, created FROM all_users ORDER BY username"]),
+            ("Security: my roles and privileges", vec!["SELECT 'ROLE' AS kind, granted_role AS name, admin_option FROM user_role_privs UNION ALL SELECT 'PRIVILEGE', privilege, admin_option FROM user_sys_privs ORDER BY 1, 2"]),
+            ("Security: grants on my objects", vec!["SELECT table_name, grantee, privilege, grantable FROM user_tab_privs_made ORDER BY 1, 2, 3"]),
+            ("Locks: blocking sessions", vec!["SELECT s.sid, s.serial#, s.username, s.blocking_session, s.event, s.seconds_in_wait, s.sql_id FROM v$session s WHERE s.blocking_session IS NOT NULL OR s.sid IN (SELECT blocking_session FROM v$session) ORDER BY s.blocking_session NULLS FIRST"]),
+            ("Memory: SGA", vec!["SELECT name, ROUND(bytes / 1048576, 1) AS size_mb, resizeable FROM v$sgainfo ORDER BY bytes DESC"]),
+            ("Waits: top events", vec!["SELECT event, wait_class, total_waits, ROUND(time_waited_micro / 1e6, 1) AS seconds FROM v$system_event WHERE wait_class <> 'Idle' ORDER BY time_waited_micro DESC FETCH FIRST 30 ROWS ONLY"]),
+            ("Scheduler: recent job runs", vec!["SELECT owner, job_name, log_date, status, error#, run_duration FROM all_scheduler_job_run_details ORDER BY log_date DESC FETCH FIRST 200 ROWS ONLY"]),
+        ],
+        Db::Postgres => vec![
+            ("About: version", vec!["SELECT version()"]),
+            ("Settings (changed)", vec!["SELECT name, setting, unit, source, short_desc FROM pg_settings WHERE source NOT IN ('default', 'override') ORDER BY name"]),
+            ("Storage: database sizes", vec!["SELECT datname, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database ORDER BY pg_database_size(datname) DESC"]),
+            ("Storage: largest tables (schema)", vec!["SELECT c.relname AS table_name, pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size, pg_size_pretty(pg_relation_size(c.oid)) AS table_size, c.reltuples::bigint AS est_rows FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{o}' AND c.relkind IN ('r', 'p', 'm') ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 100"]),
+            ("Tables: without a primary key (schema)", vec!["SELECT c.relname AS table_name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{o}' AND c.relkind IN ('r', 'p') AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'p') ORDER BY 1"]),
+            ("Tables: dead rows and vacuum (schema)", vec!["SELECT relname, n_live_tup, n_dead_tup, last_vacuum, last_autovacuum, last_analyze, last_autoanalyze FROM pg_stat_user_tables WHERE schemaname = '{o}' ORDER BY n_dead_tup DESC"]),
+            ("Indexes: unused (schema)", vec!["SELECT relname AS table_name, indexrelname AS index_name, idx_scan, pg_size_pretty(pg_relation_size(indexrelid)) AS size FROM pg_stat_user_indexes WHERE schemaname = '{o}' AND idx_scan = 0 ORDER BY pg_relation_size(indexrelid) DESC"]),
+            ("Security: roles", vec!["SELECT rolname, rolsuper, rolcreaterole, rolcreatedb, rolcanlogin, rolvaliduntil FROM pg_roles ORDER BY 1"]),
+            ("Locks: blocking", vec!["SELECT pid, usename, pg_blocking_pids(pid) AS blocked_by, wait_event_type, wait_event, state, query FROM pg_stat_activity WHERE cardinality(pg_blocking_pids(pid)) > 0"]),
+        ],
+        Db::Mysql => vec![
+            ("About: version", vec!["SELECT VERSION() AS version, @@version_comment AS edition"]),
+            ("Variables (global)", vec!["SHOW GLOBAL VARIABLES"]),
+            ("Status (global)", vec!["SHOW GLOBAL STATUS"]),
+            ("Storage: largest tables (database)", vec!["SELECT table_name, engine, table_rows, ROUND((data_length + index_length) / 1048576, 1) AS total_mb, ROUND(data_free / 1048576, 1) AS free_mb FROM information_schema.tables WHERE table_schema = '{o}' ORDER BY data_length + index_length DESC LIMIT 100"]),
+            ("Tables: without a primary key (database)", vec!["SELECT t.table_name FROM information_schema.tables t WHERE t.table_schema = '{o}' AND t.table_type = 'BASE TABLE' AND NOT EXISTS (SELECT 1 FROM information_schema.table_constraints c WHERE c.table_schema = t.table_schema AND c.table_name = t.table_name AND c.constraint_type = 'PRIMARY KEY') ORDER BY 1"]),
+            ("Security: users", vec!["SELECT user, host, account_locked, password_expired FROM mysql.user ORDER BY 1, 2"]),
+        ],
+        Db::Mssql => vec![
+            ("About: version", vec!["SELECT @@VERSION AS version"]),
+            ("Configuration (changed)", vec!["SELECT name, value, value_in_use, description FROM sys.configurations WHERE value <> value_in_use OR is_dynamic = 0 ORDER BY name"]),
+            ("Storage: database files", vec!["SELECT name, type_desc, physical_name, size * 8 / 1024 AS size_mb, max_size, growth FROM sys.database_files"]),
+            ("Storage: largest tables (schema)", vec!["SELECT t.name AS table_name, SUM(p.rows) AS rows, SUM(a.total_pages) * 8 / 1024 AS total_mb FROM sys.tables t JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1) JOIN sys.allocation_units a ON a.container_id = p.partition_id WHERE t.schema_id = SCHEMA_ID('{o}') GROUP BY t.name ORDER BY total_mb DESC"]),
+            ("Tables: without a primary key (schema)", vec!["SELECT t.name AS table_name FROM sys.tables t WHERE t.schema_id = SCHEMA_ID('{o}') AND OBJECTPROPERTY(t.object_id, 'TableHasPrimaryKey') = 0 ORDER BY 1"]),
+            ("Security: logins", vec!["SELECT name, type_desc, is_disabled, create_date, default_database_name FROM sys.server_principals WHERE type IN ('S', 'U', 'G') ORDER BY 1"]),
+        ],
+        Db::Sqlite => vec![
+            ("About: version", vec!["SELECT sqlite_version() AS version"]),
+            ("Pragmas", vec!["SELECT * FROM pragma_page_count, pragma_page_size, pragma_freelist_count, pragma_journal_mode"]),
+            ("Integrity check", vec!["PRAGMA integrity_check"]),
+        ],
+        Db::Duckdb => vec![
+            ("About: version", vec!["SELECT version() AS version"]),
+            ("Settings (changed)", vec!["SELECT name, value, description FROM duckdb_settings() WHERE value IS DISTINCT FROM (SELECT NULL) ORDER BY name"]),
+            ("Storage: database size", vec!["PRAGMA database_size"]),
+        ],
+        Db::Clickhouse => vec![
+            ("About: version", vec!["SELECT version() AS version"]),
+            ("Storage: largest tables (database)", vec!["SELECT table, formatReadableSize(sum(bytes_on_disk)) AS size, sum(rows) AS rows FROM system.parts WHERE database = '{o}' AND active GROUP BY table ORDER BY sum(bytes_on_disk) DESC"]),
+        ],
+    }
+}
+
 /// Oracle: full text and plan of a cursor from [`top_sql`] (id = SQL_ID, child number).
 /// Ids must look like a SQL_ID / number, so a grid value cannot inject SQL.
 pub fn top_sql_text(sql_id: &str) -> Option<String> {
@@ -260,7 +337,11 @@ pub fn folders(db: Db) -> &'static [(&'static str, &'static str)] {
             ("Sequences", SEQUENCE),
             ("Materialized Views", MVIEW),
             ("Synonyms", SYNONYM),
+            ("Public Synonyms", PUBLIC_SYNONYM),
             ("Database Links", DBLINK),
+            ("Directories", DIRECTORY),
+            ("Scheduler Jobs", JOB),
+            ("Recycle Bin", RECYCLE),
         ],
         Db::Postgres => &[
             ("Tables", TABLE),
@@ -272,10 +353,12 @@ pub fn folders(db: Db) -> &'static [(&'static str, &'static str)] {
             ("Triggers", TRIGGER),
             ("Sequences", SEQUENCE),
         ],
-        Db::Mysql => &[("Tables", TABLE), ("Views", VIEW), ("Procedures", PROCEDURE), ("Functions", FUNCTION), ("Triggers", TRIGGER)],
+        // MySQL / SQL Server index names are unique per table: nodes are `table.index`.
+        Db::Mysql => &[("Tables", TABLE), ("Views", VIEW), ("Indexes", INDEX), ("Procedures", PROCEDURE), ("Functions", FUNCTION), ("Triggers", TRIGGER)],
         Db::Mssql => &[
             ("Tables", TABLE),
             ("Views", VIEW),
+            ("Indexes", INDEX),
             ("Procedures", PROCEDURE),
             ("Functions", FUNCTION),
             ("Triggers", TRIGGER),
@@ -327,6 +410,12 @@ pub fn list_sql(db: Db, kind: &str, owner: &str) -> Option<String> {
     let ms = |t: &str| format!("SELECT name FROM sys.objects WHERE schema_id = SCHEMA_ID('{{o}}') AND type IN ({t}) ORDER BY name");
     let tpl = match (db, kind) {
         (Db::Oracle, DBLINK) => "SELECT db_link FROM all_db_links WHERE owner = '{o}' ORDER BY 1".into(),
+        (Db::Oracle, DIRECTORY) => "SELECT directory_name FROM all_directories ORDER BY 1".into(),
+        // Second column INVALID paints the node red: broken / failed jobs.
+        (Db::Oracle, JOB) => "SELECT job_name, CASE WHEN state IN ('BROKEN', 'FAILED') THEN 'INVALID' END FROM all_scheduler_jobs WHERE owner = '{o}' ORDER BY 1".into(),
+        (Db::Oracle, PUBLIC_SYNONYM) => "SELECT synonym_name FROM all_synonyms WHERE owner = 'PUBLIC' ORDER BY 1".into(),
+        // The session user's bin (third column = the label: original name and type).
+        (Db::Oracle, RECYCLE) => "SELECT object_name, NULL, original_name || ' (' || type || ', ' || droptime || ')' FROM user_recyclebin WHERE can_undrop = 'YES' ORDER BY droptime DESC".into(),
         (Db::Oracle, TABLE) => "SELECT table_name, status FROM all_tables WHERE owner = '{o}' AND nested = 'NO' AND (iot_type IS NULL OR iot_type = 'IOT') ORDER BY 1".into(),
         (Db::Oracle, k) => format!("SELECT object_name, status FROM all_objects WHERE owner = '{{o}}' AND object_type = '{k}' ORDER BY 1"),
         (Db::Postgres, TABLE) => pg_rel("'r', 'p', 'f'"),
@@ -341,6 +430,8 @@ pub fn list_sql(db: Db, kind: &str, owner: &str) -> Option<String> {
         (Db::Mysql, VIEW) => "SELECT table_name FROM information_schema.views WHERE table_schema = '{o}' ORDER BY 1".into(),
         (Db::Mysql, k @ (PROCEDURE | FUNCTION)) => format!("SELECT routine_name FROM information_schema.routines WHERE routine_schema = '{{o}}' AND routine_type = '{k}' ORDER BY 1"),
         (Db::Mysql, TRIGGER) => "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = '{o}' ORDER BY 1".into(),
+        (Db::Mysql, INDEX) => "SELECT DISTINCT CONCAT(table_name, '.', index_name) FROM information_schema.statistics WHERE table_schema = '{o}' ORDER BY 1".into(),
+        (Db::Mssql, INDEX) => "SELECT t.name + '.' + i.name FROM sys.indexes i JOIN sys.tables t ON t.object_id = i.object_id WHERE t.schema_id = SCHEMA_ID('{o}') AND i.name IS NOT NULL ORDER BY 1".into(),
         (Db::Mssql, TABLE) => ms("'U'"),
         (Db::Mssql, VIEW) => ms("'V'"),
         (Db::Mssql, PROCEDURE) => ms("'P'"),
@@ -396,6 +487,35 @@ pub fn find_sql(db: Db, pattern: &str) -> String {
 }
 
 /// Folder kind constant for a kind name from [`find_sql`].
+/// Tools ▸ Search Source Code: (owner, name, type, line, text) of stored code and views
+/// containing `text` (case-insensitive), at most 500 hits. None = nothing to search.
+pub fn source_search_sql(db: Db, text: &str) -> Option<String> {
+    // LIKE with the typed text taken literally.
+    let t = lit(&text.trim().to_uppercase()).replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let t = if matches!(db, Db::Mysql) { t.replace('\\', "\\\\") } else { t };
+    let like = |col: &str| format!("UPPER({col}) LIKE '%{t}%' ESCAPE '\\'");
+    let like_my = |col: &str| format!("UPPER({col}) LIKE '%{t}%' ESCAPE '\\\\'");
+    Some(match db {
+        Db::Oracle => format!("SELECT owner, name, type, line, TRIM(text) FROM all_source WHERE {} AND owner NOT IN ('SYS', 'SYSTEM', 'XDB', 'MDSYS', 'CTXSYS', 'ORDSYS', 'WMSYS', 'LBACSYS', 'OLAPSYS', 'DVSYS', 'GSMADMIN_INTERNAL', 'APEX_PUBLIC_USER') ORDER BY owner, name, type, line FETCH FIRST 500 ROWS ONLY", like("text")),
+        Db::Postgres => format!(
+            "SELECT n.nspname, p.proname, CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, NULL, NULL FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE {} AND n.nspname NOT IN ('pg_catalog', 'information_schema') UNION ALL SELECT schemaname, viewname, 'VIEW', NULL, NULL FROM pg_views WHERE {} AND schemaname NOT IN ('pg_catalog', 'information_schema') LIMIT 500",
+            like("p.prosrc"),
+            like("definition")
+        ),
+        Db::Mysql => format!(
+            "SELECT routine_schema, routine_name, routine_type, NULL, NULL FROM information_schema.routines WHERE {} UNION ALL SELECT table_schema, table_name, 'VIEW', NULL, NULL FROM information_schema.views WHERE {} LIMIT 500",
+            like_my("routine_definition"),
+            like_my("view_definition")
+        ),
+        Db::Mssql => format!(
+            "SELECT TOP (500) OBJECT_SCHEMA_NAME(m.object_id), OBJECT_NAME(m.object_id), CASE o.type WHEN 'P' THEN 'PROCEDURE' WHEN 'V' THEN 'VIEW' WHEN 'TR' THEN 'TRIGGER' ELSE 'FUNCTION' END, NULL, NULL FROM sys.sql_modules m JOIN sys.objects o ON o.object_id = m.object_id WHERE {}",
+            like("m.definition")
+        ),
+        Db::Sqlite => format!("SELECT 'main', name, UPPER(type), NULL, NULL FROM sqlite_master WHERE type IN ('view', 'trigger') AND {} LIMIT 500", like("sql")),
+        _ => return None,
+    })
+}
+
 pub fn kind_const(kind: &str) -> Option<&'static str> {
     [TABLE, VIEW, MVIEW, INDEX, PACKAGE, PROCEDURE, FUNCTION, TRIGGER, TYPE, SEQUENCE, SYNONYM, DBLINK].into_iter().find(|k| k.eq_ignore_ascii_case(kind.trim()))
 }
@@ -455,6 +575,14 @@ fn oracle_tabs(kind: &str) -> Vec<Tab> {
         ],
         SYNONYM => vec![tab("Details", d("SELECT * FROM all_synonyms WHERE owner = '{o}' AND synonym_name = '{n}'")), tab("SQL", ora_ddl(SYNONYM))],
         DBLINK => vec![tab("Details", d("SELECT * FROM all_db_links WHERE owner = '{o}' AND db_link = '{n}'")), tab("SQL", ora_ddl(DBLINK))],
+        DIRECTORY => vec![tab("Details", d("SELECT * FROM all_directories WHERE directory_name = '{n}'")), tab("Grants", g("SELECT grantee, privilege, grantable FROM all_tab_privs WHERE table_name = '{n}' AND type = 'DIRECTORY' ORDER BY 1, 2"))],
+        PUBLIC_SYNONYM => vec![tab("Details", d("SELECT * FROM all_synonyms WHERE owner = 'PUBLIC' AND synonym_name = '{n}'"))],
+        RECYCLE => vec![tab("Details", d("SELECT * FROM user_recyclebin WHERE object_name = '{n}'"))],
+        JOB => vec![
+            tab("Details", d("SELECT * FROM all_scheduler_jobs WHERE owner = '{o}' AND job_name = '{n}'")),
+            tab("Run Log", g("SELECT log_date, status, error#, run_duration, cpu_used, additional_info FROM all_scheduler_job_run_details WHERE owner = '{o}' AND job_name = '{n}' ORDER BY log_date DESC")),
+            tab("Arguments", g("SELECT argument_position, argument_name, argument_type, value FROM all_scheduler_job_args WHERE owner = '{o}' AND job_name = '{n}' ORDER BY 1")),
+        ],
         _ => vec![tab("Details", d(ORA_OBJECT))],
     }
 }
@@ -543,6 +671,10 @@ fn mysql_tabs(kind: &str) -> Vec<Tab> {
             tab("Code", View::Ddl("SHOW CREATE TRIGGER {q}".into(), 2)),
             tab("Details", d("SELECT * FROM information_schema.triggers WHERE trigger_schema = '{o}' AND trigger_name = '{n}'")),
         ],
+        INDEX => vec![tab(
+            "Columns",
+            g("SELECT seq_in_index, column_name, CASE non_unique WHEN 0 THEN 'UNIQUE' ELSE 'NONUNIQUE' END AS uniqueness, collation, index_type, sub_part, cardinality FROM information_schema.statistics WHERE table_schema = '{o}' AND CONCAT(table_name, '.', index_name) = '{n}' ORDER BY seq_in_index"),
+        )],
         _ => vec![],
     }
 }
@@ -574,6 +706,10 @@ fn mssql_tabs(kind: &str) -> Vec<Tab> {
         PROCEDURE | FUNCTION | TRIGGER => vec![tab("Code", code()), tab("Details", d("SELECT * FROM sys.objects WHERE object_id = OBJECT_ID('{lq}')"))],
         SYNONYM => vec![tab("Details", d("SELECT * FROM sys.synonyms WHERE object_id = OBJECT_ID('{lq}')"))],
         SEQUENCE => vec![tab("Details", d("SELECT * FROM sys.sequences WHERE object_id = OBJECT_ID('{lq}')"))],
+        INDEX => vec![tab(
+            "Columns",
+            g("SELECT ic.key_ordinal, c.name AS column_name, CASE ic.is_descending_key WHEN 1 THEN 'DESC' ELSE 'ASC' END AS sort, ic.is_included_column, i.type_desc, i.is_unique, i.is_primary_key FROM sys.indexes i JOIN sys.tables t ON t.object_id = i.object_id JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE t.schema_id = SCHEMA_ID('{o}') AND t.name + '.' + i.name = '{n}' ORDER BY ic.is_included_column, ic.key_ordinal".into()),
+        )],
         _ => vec![],
     }
 }
@@ -659,6 +795,87 @@ pub fn children_sql(db: Db, kind: &str) -> Option<String> {
     }
 }
 
+/// More child nodes in the tree, after the columns: (name, detail) rows for package members,
+/// routine arguments and table partitions. Templates unfilled (use [`fill`]).
+pub fn extra_children_sql(db: Db, kind: &str) -> Option<&'static str> {
+    Some(match (db, kind) {
+        (Db::Oracle, PACKAGE) => "SELECT procedure_name, NULL FROM all_procedures WHERE owner = '{o}' AND object_name = '{n}' AND procedure_name IS NOT NULL GROUP BY procedure_name ORDER BY MIN(subprogram_id)",
+        (Db::Oracle, PROCEDURE | FUNCTION) => "SELECT NVL(argument_name, 'RETURN'), LTRIM(NVL2(argument_name, in_out, '') || ' ' || data_type) FROM all_arguments WHERE owner = '{o}' AND object_name = '{n}' AND package_name IS NULL AND data_level = 0 AND (argument_name IS NOT NULL OR position = 0) ORDER BY overload, position",
+        (Db::Oracle, TABLE) => "SELECT partition_name, 'PARTITION' FROM all_tab_partitions WHERE table_owner = '{o}' AND table_name = '{n}' ORDER BY partition_position",
+        (Db::Postgres, TABLE) => "SELECT c.relname, 'PARTITION' FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid JOIN pg_class p ON p.oid = i.inhparent WHERE p.relkind = 'p' AND i.inhparent = '{lq}'::regclass ORDER BY 1",
+        (Db::Mysql, TABLE) => "SELECT partition_name, CONCAT('PARTITION ', partition_method) FROM information_schema.partitions WHERE table_schema = '{o}' AND table_name = '{n}' AND partition_name IS NOT NULL ORDER BY partition_ordinal_position",
+        (Db::Mysql, PROCEDURE | FUNCTION) => "SELECT COALESCE(parameter_name, 'RETURN'), CONCAT_WS(' ', parameter_mode, dtd_identifier) FROM information_schema.parameters WHERE specific_schema = '{o}' AND specific_name = '{n}' ORDER BY ordinal_position",
+        (Db::Mssql, PROCEDURE | FUNCTION) => "SELECT CASE WHEN p.name = '' THEN 'RETURN' ELSE p.name END, CASE WHEN p.is_output = 1 AND p.parameter_id > 0 THEN 'OUT ' ELSE '' END + TYPE_NAME(p.user_type_id) FROM sys.parameters p WHERE p.object_id = OBJECT_ID('{lq}') ORDER BY p.parameter_id",
+        _ => return None,
+    })
+}
+
+/// Folder ▸ New …: a CREATE template for a worksheet (placeholders in lower case). `{s}` in
+/// the patterns is the quoted owner.
+pub fn create_template(db: Db, kind: &str, owner: &str) -> Option<String> {
+    let t = match (db, kind) {
+        (Db::Oracle, VIEW) => "CREATE OR REPLACE VIEW {s}.new_view AS\nSELECT *\n  FROM dual;\n",
+        (Db::Oracle, MVIEW) => "CREATE MATERIALIZED VIEW {s}.new_mview\n  REFRESH COMPLETE ON DEMAND\nAS\nSELECT *\n  FROM dual;\n",
+        (Db::Oracle, INDEX) => "CREATE INDEX {s}.new_index ON {s}.table_name (column_name);\n",
+        (Db::Oracle, SEQUENCE) => "CREATE SEQUENCE {s}.new_sequence\n  START WITH 1\n  INCREMENT BY 1\n  NOCACHE\n  NOCYCLE;\n",
+        (Db::Oracle, SYNONYM) => "CREATE OR REPLACE SYNONYM {s}.new_synonym FOR owner.object_name;\n",
+        (Db::Oracle, PROCEDURE) => "CREATE OR REPLACE PROCEDURE {s}.new_procedure (\n  p_id IN NUMBER\n) AS\nBEGIN\n  NULL;\nEND;\n/\n",
+        (Db::Oracle, FUNCTION) => "CREATE OR REPLACE FUNCTION {s}.new_function (\n  p_id IN NUMBER\n) RETURN NUMBER AS\nBEGIN\n  RETURN p_id;\nEND;\n/\n",
+        (Db::Oracle, PACKAGE) => "CREATE OR REPLACE PACKAGE {s}.new_package AS\n  PROCEDURE run;\nEND;\n/\n\nCREATE OR REPLACE PACKAGE BODY {s}.new_package AS\n  PROCEDURE run IS\n  BEGIN\n    NULL;\n  END;\nEND;\n/\n",
+        (Db::Oracle, TRIGGER) => "CREATE OR REPLACE TRIGGER {s}.new_trigger\n  BEFORE INSERT OR UPDATE ON {s}.table_name\n  FOR EACH ROW\nBEGIN\n  NULL;\nEND;\n/\n",
+        (Db::Oracle, TYPE) => "CREATE OR REPLACE TYPE {s}.new_type AS OBJECT (\n  id   NUMBER,\n  name VARCHAR2(100)\n);\n/\n",
+        (Db::Oracle, JOB) => "BEGIN\n  DBMS_SCHEDULER.CREATE_JOB(\n    job_name        => '{s}.NEW_JOB',\n    job_type        => 'PLSQL_BLOCK',\n    job_action      => 'BEGIN NULL; END;',\n    start_date      => SYSTIMESTAMP,\n    repeat_interval => 'FREQ=DAILY; BYHOUR=2',\n    enabled         => TRUE,\n    comments        => '');\nEND;\n/\n",
+        (Db::Oracle, DBLINK) => "CREATE DATABASE LINK new_link\n  CONNECT TO remote_user IDENTIFIED BY \"password\"\n  USING 'tns_alias';\n",
+        (Db::Postgres | Db::Duckdb, VIEW) => "CREATE OR REPLACE VIEW {s}.new_view AS\nSELECT 1 AS id;\n",
+        (Db::Postgres, MVIEW) => "CREATE MATERIALIZED VIEW {s}.new_mview AS\nSELECT 1 AS id;\n",
+        (Db::Postgres | Db::Duckdb | Db::Sqlite, INDEX) => "CREATE INDEX new_index ON {s}.table_name (column_name);\n",
+        (Db::Postgres | Db::Duckdb, SEQUENCE) => "CREATE SEQUENCE {s}.new_sequence START 1 INCREMENT 1;\n",
+        (Db::Postgres, FUNCTION) => "CREATE OR REPLACE FUNCTION {s}.new_function(p_id integer)\nRETURNS integer\nLANGUAGE plpgsql AS $$\nBEGIN\n  RETURN p_id;\nEND;\n$$;\n",
+        (Db::Postgres, PROCEDURE) => "CREATE OR REPLACE PROCEDURE {s}.new_procedure(p_id integer)\nLANGUAGE plpgsql AS $$\nBEGIN\n  NULL;\nEND;\n$$;\n",
+        (Db::Postgres, TRIGGER) => "CREATE OR REPLACE FUNCTION {s}.new_trigger_fn()\nRETURNS trigger\nLANGUAGE plpgsql AS $$\nBEGIN\n  RETURN NEW;\nEND;\n$$;\n\nCREATE TRIGGER new_trigger\n  BEFORE INSERT OR UPDATE ON {s}.table_name\n  FOR EACH ROW EXECUTE FUNCTION {s}.new_trigger_fn();\n",
+        (Db::Mysql, VIEW) => "CREATE OR REPLACE VIEW {s}.new_view AS\nSELECT 1 AS id;\n",
+        (Db::Mysql, INDEX) => "CREATE INDEX new_index ON {s}.table_name (column_name);\n",
+        (Db::Mysql, PROCEDURE) => "DELIMITER //\nCREATE PROCEDURE {s}.new_procedure(IN p_id INT)\nBEGIN\n  SELECT p_id;\nEND //\nDELIMITER ;\n",
+        (Db::Mysql, FUNCTION) => "DELIMITER //\nCREATE FUNCTION {s}.new_function(p_id INT) RETURNS INT\nDETERMINISTIC\nBEGIN\n  RETURN p_id;\nEND //\nDELIMITER ;\n",
+        (Db::Mysql, TRIGGER) => "DELIMITER //\nCREATE TRIGGER {s}.new_trigger\n  BEFORE INSERT ON {s}.table_name\n  FOR EACH ROW\nBEGIN\n  SET NEW.column_name = NEW.column_name;\nEND //\nDELIMITER ;\n",
+        (Db::Mssql, VIEW) => "CREATE OR ALTER VIEW {s}.new_view AS\nSELECT 1 AS id;\nGO\n",
+        (Db::Mssql, INDEX) => "CREATE INDEX new_index ON {s}.table_name (column_name);\nGO\n",
+        (Db::Mssql, PROCEDURE) => "CREATE OR ALTER PROCEDURE {s}.new_procedure\n  @p_id INT\nAS\nBEGIN\n  SET NOCOUNT ON;\n  SELECT @p_id;\nEND;\nGO\n",
+        (Db::Mssql, FUNCTION) => "CREATE OR ALTER FUNCTION {s}.new_function (@p_id INT)\nRETURNS INT\nAS\nBEGIN\n  RETURN @p_id;\nEND;\nGO\n",
+        (Db::Mssql, TRIGGER) => "CREATE OR ALTER TRIGGER {s}.new_trigger\nON {s}.table_name\nAFTER INSERT, UPDATE\nAS\nBEGIN\n  SET NOCOUNT ON;\nEND;\nGO\n",
+        (Db::Mssql, SYNONYM) => "CREATE SYNONYM {s}.new_synonym FOR schema_name.object_name;\nGO\n",
+        (Db::Mssql, SEQUENCE) => "CREATE SEQUENCE {s}.new_sequence START WITH 1 INCREMENT BY 1;\nGO\n",
+        (Db::Sqlite, VIEW) => "CREATE VIEW {s}.new_view AS\nSELECT 1 AS id;\n",
+        (Db::Sqlite, TRIGGER) => "CREATE TRIGGER {s}.new_trigger\n  AFTER INSERT ON table_name\nBEGIN\n  SELECT 1;\nEND;\n",
+        (Db::Clickhouse, VIEW) => "CREATE VIEW {s}.new_view AS\nSELECT 1 AS id;\n",
+        _ => return None,
+    };
+    Some(t.replace("{s}", &quote(db, owner)))
+}
+
+/// Sequence ▸ Edit…: current settings (Oracle / PostgreSQL), for [`alter_sequence`].
+pub fn sequence_sql(db: Db, owner: &str, name: &str) -> Option<String> {
+    let tpl = match db {
+        Db::Oracle => "SELECT increment_by, min_value, max_value, cache_size, cycle_flag FROM all_sequences WHERE sequence_owner = '{o}' AND sequence_name = '{n}'",
+        Db::Postgres => "SELECT increment_by, min_value, max_value, cache_size, CASE WHEN cycle THEN 'Y' ELSE 'N' END FROM pg_sequences WHERE schemaname = '{o}' AND sequencename = '{n}'",
+        _ => return None,
+    };
+    Some(fill(db, tpl, owner, name))
+}
+
+/// ALTER SEQUENCE with the current settings from [`sequence_sql`] (increment, min, max,
+/// cache, cycle Y/N), one clause per line to edit.
+pub fn alter_sequence(db: Db, owner: &str, name: &str, row: &[Option<String>]) -> String {
+    let v = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+    let cache = v(3).parse::<u64>().unwrap_or(0);
+    let cycle = v(4) == "Y";
+    let (cache, cycle) = match db {
+        Db::Oracle => (if cache > 1 { format!("CACHE {cache}") } else { "NOCACHE".into() }, if cycle { "CYCLE" } else { "NOCYCLE" }),
+        _ => (format!("CACHE {}", cache.max(1)), if cycle { "CYCLE" } else { "NO CYCLE" }),
+    };
+    format!("ALTER SEQUENCE {}\n  INCREMENT BY {}\n  MINVALUE {}\n  MAXVALUE {}\n  {cache}\n  {cycle};\n", qualified(db, owner, name), v(0), v(1), v(2))
+}
+
 /// Data tab query. `hidden` = leading row-locator column (ROWID, ctid, rowid) kept out of view
 /// and used as the edit key.
 pub struct DataQuery {
@@ -718,6 +935,13 @@ pub fn explain(db: Db, sql: &str) -> Explain {
         Db::Sqlite => one("EXPLAIN QUERY PLAN"),
         _ => one("EXPLAIN"),
     }
+}
+
+/// Explain Plan (DBMS_XPLAN), Oracle: the formatted plan with predicates and notes.
+pub fn explain_xplan(sql: &str) -> Explain {
+    let mut e = explain(Db::Oracle, sql);
+    e.stmts[2] = "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY('PLAN_TABLE', 'rsqldev', 'ALL'))".into();
+    e
 }
 
 /// Autotrace: run the query and show its plan with actual rows and timings. Queries only (the
@@ -988,11 +1212,45 @@ mod tests {
     }
 
     #[test]
+    fn source_search_is_literal() {
+        let s = source_search_sql(Db::Oracle, "50%_o'k").unwrap();
+        assert!(s.contains("LIKE '%50\\%\\_O''K%' ESCAPE '\\'"), "{s}");
+        assert!(source_search_sql(Db::Clickhouse, "x").is_none());
+    }
+
+    #[test]
+    fn report_templates_fill() {
+        for db in [Db::Oracle, Db::Postgres, Db::Mysql, Db::Mssql, Db::Sqlite, Db::Duckdb, Db::Clickhouse] {
+            for (label, qs) in reports(db) {
+                assert!(!qs.is_empty(), "{db:?} {label}");
+                for q in qs {
+                    assert!(!fill(db, q, "O'X", "").contains('{'), "{db:?} {label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_templates_and_sequences() {
+        let t = create_template(Db::Oracle, PROCEDURE, "HR").unwrap();
+        assert!(t.starts_with("CREATE OR REPLACE PROCEDURE \"HR\".new_procedure") && t.ends_with("END;\n/\n"));
+        assert!(create_template(Db::Mssql, VIEW, "dbo").unwrap().starts_with("CREATE OR ALTER VIEW [dbo].new_view"));
+        assert!(create_template(Db::Clickhouse, SEQUENCE, "d").is_none());
+        let row = |v: &[&str]| v.iter().map(|s| Some(s.to_string())).collect::<Vec<_>>();
+        assert_eq!(alter_sequence(Db::Oracle, "HR", "S", &row(&["1", "1", "9999", "20", "N"])), "ALTER SEQUENCE \"HR\".\"S\"\n  INCREMENT BY 1\n  MINVALUE 1\n  MAXVALUE 9999\n  CACHE 20\n  NOCYCLE;\n");
+        assert!(alter_sequence(Db::Postgres, "public", "s", &row(&["2", "1", "100", "1", "Y"])).ends_with("CACHE 1\n  CYCLE;\n"));
+        assert!(sequence_sql(Db::Mysql, "a", "b").is_none());
+    }
+
+    #[test]
     fn templates_fill_and_every_folder_lists() {
         for db in [Db::Oracle, Db::Postgres, Db::Mysql, Db::Mssql, Db::Sqlite, Db::Duckdb, Db::Clickhouse] {
             for (_, kind) in folders(db) {
                 let s = list_sql(db, kind, "O'X").unwrap_or_else(|| panic!("{db:?} {kind}"));
                 assert!(!s.contains('{'), "{db:?} {kind}: {s}");
+                if let Some(x) = extra_children_sql(db, kind) {
+                    assert!(!fill(db, x, "O'X", "T").contains('{'), "{db:?} {kind} children");
+                }
                 for t in tabs(db, kind) {
                     if let View::Grid(s) | View::Details(s) | View::Code(s) | View::Ddl(s, _) = t.view {
                         let f = fill(db, &s, "O'X", "T");

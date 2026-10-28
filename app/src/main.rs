@@ -27,6 +27,7 @@ mod snippets;
 mod table_editor;
 mod table_menu;
 mod topsql;
+mod reports;
 mod transfer;
 mod ui;
 mod value;
@@ -109,12 +110,36 @@ const ID_DP_IMPORT: i32 = ID_HIGHEST + 48;
 const ID_DP_JOBS: i32 = ID_HIGHEST + 49;
 const ID_INSERT_ROW: i32 = ID_HIGHEST + 50;
 const ID_EDIT_VALUE: i32 = ID_HIGHEST + 51;
+const ID_COMMENT: i32 = ID_HIGHEST + 52;
+const ID_GOTO_LINE: i32 = ID_HIGHEST + 53;
+const ID_CLOSE_ALL: i32 = ID_HIGHEST + 54;
+const ID_NEXT_TAB: i32 = ID_HIGHEST + 55;
+const ID_PREV_TAB: i32 = ID_HIGHEST + 56;
+const ID_LOG: i32 = ID_HIGHEST + 57;
+const ID_FORMAT_CLIP: i32 = ID_HIGHEST + 58;
+const ID_RENAME_TAB: i32 = ID_HIGHEST + 59;
+const ID_DISCONNECT_ALL: i32 = ID_HIGHEST + 60;
+const ID_REPORTS: i32 = ID_HIGHEST + 62;
+const ID_XPLAN: i32 = ID_HIGHEST + 63;
+const ID_EXT_PASTE: i32 = ID_HIGHEST + 64;
+const ID_EXPORT_CONNS: i32 = ID_HIGHEST + 65;
+const ID_IMPORT_FILE: i32 = ID_HIGHEST + 66;
+const ID_RECENT: i32 = ID_HIGHEST + 67;
+const ID_DATA_COMPARE: i32 = ID_HIGHEST + 68;
+const ID_DB_EXPORT: i32 = ID_HIGHEST + 69;
+const ID_DB_COPY: i32 = ID_HIGHEST + 70;
+const ID_ER: i32 = ID_HIGHEST + 71;
+const ID_SEARCH_SOURCE: i32 = ID_HIGHEST + 72;
+const ID_RECENT_OBJS: i32 = ID_HIGHEST + 73;
+const ID_PRINT: i32 = ID_HIGHEST + 74;
+const ID_DESCRIBE: i32 = ID_HIGHEST + 61;
 
 enum Page {
     Sheet(SheetRef),
     Obj(Rc<ObjectView>),
     Sessions(Rc<sessions::Sessions>),
     TopSql(Rc<topsql::TopSql>),
+    Reports(Rc<reports::Reports>),
     DataPump(Rc<datapump_tab::DataPumpTab>),
 }
 
@@ -125,6 +150,7 @@ impl Page {
             Page::Obj(o) => o.panel,
             Page::Sessions(s) => s.panel,
             Page::TopSql(s) => s.panel,
+            Page::Reports(s) => s.panel,
             Page::DataPump(s) => s.panel,
         }
     }
@@ -132,8 +158,31 @@ impl Page {
 
 #[derive(Serialize, Deserialize, Default)]
 struct History {
-    #[serde(default)]
+    /// Older history files: statement text only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     entries: Vec<String>,
+    #[serde(default)]
+    items: Vec<HistItem>,
+}
+
+/// One SQL History entry.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct HistItem {
+    pub sql: String,
+    #[serde(default)]
+    pub conn: String,
+    /// Executed, Unix seconds (0 = before history kept it).
+    #[serde(default)]
+    pub at: i64,
+    #[serde(default)]
+    pub script: bool,
+}
+
+#[derive(Clone, Copy)]
+pub enum QuickDdl {
+    Worksheet,
+    Clipboard,
+    File,
 }
 
 pub struct App {
@@ -148,7 +197,16 @@ pub struct App {
     conns: RefCell<Vec<ConnConfig>>,
     open: RefCell<HashMap<String, ConnRef>>,
     pages: RefCell<Vec<Page>>,
-    history: RefCell<Vec<String>>,
+    history: RefCell<Vec<HistItem>>,
+    /// Last value typed per bind name (upper case), offered again in every worksheet; kept in
+    /// binds.toml when Preferences ▸ Save bind values is on.
+    pub binds: RefCell<std::collections::BTreeMap<String, String>>,
+    /// View ▸ Log: status messages and errors of this run, with their time.
+    log: RefCell<Vec<String>>,
+    /// Edit ▸ Extended Paste: the last texts copied in rsqldev, newest first.
+    clips: RefCell<Vec<String>>,
+    /// View ▸ Recent Objects: (connection, owner, kind, name), newest first.
+    recent_objs: RefCell<Vec<(String, String, &'static str, String)>>,
     _timer: Timer<Frame>,
     /// Tab count at the last prune of `pages` (pruning only when it changes).
     tabs_seen: std::cell::Cell<usize>,
@@ -162,6 +220,11 @@ pub fn app() -> Rc<App> {
     APP.with(|a| a.borrow().clone().expect("app initialised"))
 }
 
+/// The app once it exists (errors can be shown before that).
+pub fn try_app() -> Option<Rc<App>> {
+    APP.with(|a| a.borrow().clone())
+}
+
 impl App {
     pub fn prefs(&self) -> Prefs {
         self.prefs.borrow().clone()
@@ -171,29 +234,36 @@ impl App {
         if let Err(e) = config::save_prefs(&p) {
             ui::error(&self.frame, &format!("Saving preferences failed: {e}"));
         }
+        grid::set_null_text(&p.null_display);
         *self.prefs.borrow_mut() = p;
     }
 
-    pub fn add_history(&self, sql: &str) {
+    pub fn add_history(&self, sql: &str, conn: &str, script: bool) {
         let sql = sql.trim().to_string();
         let mut h = self.history.borrow_mut();
-        h.retain(|s| *s != sql);
-        h.push(sql);
-        let n = h.len();
-        if n > 500 {
-            h.drain(..n - 500);
+        h.retain(|s| s.sql != sql);
+        h.push(HistItem { sql, conn: conn.to_string(), at: chrono::Local::now().timestamp(), script });
+        let (n, max) = (h.len(), self.prefs.borrow().history_limit.max(1));
+        if n > max {
+            h.drain(..n - max);
         }
         drop(h);
         // Saved at once: a crash or forced quit must not lose the history.
         self.save_history();
     }
 
-    pub fn history(&self) -> Vec<String> {
+    /// Oldest first.
+    pub fn history(&self) -> Vec<HistItem> {
         self.history.borrow().clone()
     }
 
+    pub fn clear_history(&self) {
+        self.history.borrow_mut().clear();
+        self.save_history();
+    }
+
     fn save_history(&self) {
-        let h = History { entries: self.history() };
+        let h = History { entries: vec![], items: self.history() };
         if let Ok(s) = toml::to_string(&h) {
             let _ = std::fs::create_dir_all(config::config_root());
             let _ = std::fs::write(config::config_root().join("history.toml"), s);
@@ -202,14 +272,14 @@ impl App {
 
     /// File ▸ Import Connections: SQL Developer / DBeaver files from their default locations
     /// (or a picked file), choose which to add. Names already in use get a numeric suffix.
-    fn import_connections(&self) {
+    fn import_connections(&self, pick: bool) {
         use rsqldev_core::migrate;
-        let mut files = migrate::default_files();
+        let mut files = if pick { vec![] } else { migrate::default_files() };
         if files.is_empty() {
             let d = FileDialog::builder(&self.frame)
                 .with_message("SQL Developer connections.json / connections.xml, or DBeaver data-sources.json")
                 .with_style(FileDialogStyle::Open)
-                .with_wildcard("Connection files (*.json;*.xml)|*.json;*.xml|All files (*)|*")
+                .with_wildcard("Connection files (*.json;*.xml;*.toml)|*.json;*.xml;*.toml|All files (*)|*")
                 .build();
             if d.show_modal() != ID_OK {
                 return;
@@ -288,6 +358,15 @@ impl App {
             self.disconnect(o);
             if o != cfg.name {
                 config::delete_password(o);
+                // Data Pump file records follow the renamed connection.
+                if let Ok(mut f) = rsqldev_core::datapump::load_files() {
+                    if f.iter().any(|r| r.conn == o) {
+                        rsqldev_core::datapump::rename_conn(&mut f, o, &cfg.name);
+                        if let Err(e) = rsqldev_core::datapump::save_files(&f) {
+                            ui::error(&self.frame, &format!("Data Pump file records still name \"{o}\": {e}"));
+                        }
+                    }
+                }
             }
         }
         if cfg.save_password && !pw.is_empty() {
@@ -304,7 +383,14 @@ impl App {
         self.save_conns();
         if go {
             let pw = (!pw.is_empty()).then_some(pw);
-            self.connect_with(&name, pw, |c| app().open_worksheet(c));
+            let n = name.clone();
+            self.connect_with(&name, pw, move |c| {
+                let app = app();
+                app.nav.expand_conn(&n);
+                if app.prefs().open_worksheet_on_connect {
+                    app.open_worksheet(c);
+                }
+            });
         }
     }
 
@@ -318,12 +404,50 @@ impl App {
     pub fn edit_connection(&self, name: &str) {
         let saved = self.conns.borrow().clone();
         let cfg = saved.iter().find(|c| c.name == name).cloned();
-        if let Some(r) = cfg.and_then(|c| connections::edit_dialog(&self.frame, Some(&c), &saved)) {
-            self.store(r);
+        if let Some(c) = cfg {
+            let Some(mut r) = connections::edit_dialog(&self.frame, Some(&c), &saved) else { return };
+            // The dialog has no field for the tree's name filters: keep them.
+            r.1.filters = c.filters;
+            self.end_work(Some(&c.name), move || app().store(r));
         }
     }
 
+    /// Connection ▸ Rename…: same settings and saved password under a new name.
+    pub fn rename_connection(&self, name: &str) {
+        let Some(cfg) = self.conns.borrow().iter().find(|c| c.name == name).cloned() else { return };
+        let Some(new) = ui::ask(&self.frame, "New connection name:", "Rename Connection", name).map(|s| s.trim().to_string()) else { return };
+        if new.is_empty() || new == name {
+            return;
+        }
+        if self.conns.borrow().iter().any(|c| c.name == new) {
+            return ui::error(&self.frame, &format!("A connection named \"{new}\" already exists."));
+        }
+        let pw = config::get_password(name).unwrap_or_default();
+        let (old, cfg) = (name.to_string(), ConnConfig { name: new, ..cfg });
+        self.end_work(Some(name), move || app().store((Some(old), cfg, pw, false)));
+    }
+
+    /// Connection ▸ Duplicate: a copy named "<name> (2)" with the saved password.
+    pub fn duplicate_connection(&self, name: &str) {
+        let Some(mut cfg) = self.conns.borrow().iter().find(|c| c.name == name).cloned() else { return };
+        let mut n = 2;
+        cfg.name = loop {
+            let candidate = format!("{name} ({n})");
+            if !self.conns.borrow().iter().any(|c| c.name == candidate) {
+                break candidate;
+            }
+            n += 1;
+        };
+        let pw = config::get_password(name).unwrap_or_default();
+        self.store((None, cfg, pw, false));
+    }
+
     pub fn delete_connection(&self, name: &str) {
+        let n = name.to_string();
+        self.end_work(Some(name), move || app().delete_now(&n));
+    }
+
+    fn delete_now(&self, name: &str) {
         self.disconnect(name);
         config::delete_password(name);
         self.conns.borrow_mut().retain(|c| c.name != name);
@@ -332,6 +456,63 @@ impl App {
 
     pub fn open_conn(&self, name: &str) -> Option<ConnRef> {
         self.open.borrow().get(name).filter(|c| c.borrow().is_up()).cloned()
+    }
+
+    /// Before a session ends (disconnect, delete, edit, quit): sessions of connection `name`
+    /// (all with None), worksheets' unshared ones too, that may hold uncommitted changes are
+    /// committed or rolled back as the user picks; `then` runs once the server confirmed.
+    /// Cancel, or a failed commit / rollback, keeps everything open.
+    pub fn end_work(&self, name: Option<&str>, then: impl FnOnce() + 'static) {
+        let dirty = self.dirty_conns(name);
+        if dirty.is_empty() {
+            return then();
+        }
+        let mut names: Vec<String> = dirty.iter().map(|c| c.borrow().cfg.name.clone()).collect();
+        names.dedup();
+        let d = MessageDialog::builder(
+            &self.frame,
+            &format!("{} may have changes that are not committed.\n\nCommit or roll them back?", names.join(", ")),
+            "Uncommitted Changes",
+        )
+        .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::Cancel | MessageDialogStyle::IconWarning)
+        .build();
+        d.set_yes_no_labels("Commit", "Rollback");
+        let commit = match d.show_modal() {
+            ID_YES => true,
+            ID_NO => false,
+            _ => return,
+        };
+        let left = Rc::new(std::cell::Cell::new(dirty.len()));
+        let failed = Rc::new(RefCell::new(Vec::<String>::new()));
+        let then = Rc::new(RefCell::new(Some(then)));
+        for c in dirty {
+            let (left, failed, then, name) = (left.clone(), failed.clone(), then.clone(), c.borrow().cfg.name.clone());
+            Conn::tx(&c, if commit { rsqldev_core::worker::Cmd::Commit } else { rsqldev_core::worker::Cmd::Rollback }, move |r| {
+                if let Err(e) = r {
+                    failed.borrow_mut().push(format!("{name}: {e}"));
+                }
+                left.set(left.get() - 1);
+                if left.get() == 0 {
+                    if failed.borrow().is_empty() {
+                        if let Some(f) = then.borrow_mut().take() {
+                            f();
+                        }
+                    } else {
+                        ui::error(&app().frame, &format!("{} failed, nothing was closed:\n{}", if commit { "Commit" } else { "Rollback" }, failed.borrow().join("\n")));
+                    }
+                }
+            });
+        }
+    }
+
+    /// Sessions (shared and worksheets' unshared ones) that may hold uncommitted changes.
+    fn dirty_conns(&self, name: Option<&str>) -> Vec<ConnRef> {
+        let mut all: Vec<ConnRef> = self.open.borrow().values().cloned().collect();
+        all.extend(self.pages.borrow().iter().filter_map(|p| if let Page::Sheet(s) = p { Some(s.conn()) } else { None }));
+        all.retain(|c| c.borrow().dirty && c.borrow().is_up() && name.is_none_or(|n| c.borrow().cfg.name == n));
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|c| seen.insert(Rc::as_ptr(c)));
+        all
     }
 
     pub fn disconnect(&self, name: &str) {
@@ -345,6 +526,7 @@ impl App {
                 Page::Obj(o) => o.key.starts_with(&format!("{name}|")),
                 Page::Sessions(s) => s.conn_name == name,
                 Page::TopSql(s) => s.conn_name == name,
+                Page::Reports(s) => s.conn_name == name,
                 Page::DataPump(s) => s.conn_name == name,
             };
             if mine {
@@ -362,6 +544,11 @@ impl App {
     }
 
     fn connect_with(&self, name: &str, pw: Option<String>, f: impl FnOnce(ConnRef) + 'static) {
+        self.connect_full(name, pw, None, f)
+    }
+
+    /// `new_pw`: Oracle password change on login (expired password).
+    fn connect_full(&self, name: &str, pw: Option<String>, new_pw: Option<String>, f: impl FnOnce(ConnRef) + 'static) {
         let existing = self.open.borrow().get(name).cloned();
         if let Some(c) = existing.filter(|c| !c.borrow().failed()) {
             let c2 = c.clone();
@@ -371,7 +558,7 @@ impl App {
                 }
             });
         }
-        let Some(cfg) = self.conns.borrow().iter().find(|c| c.name == name).cloned() else { return };
+        let Some(mut cfg) = self.conns.borrow().iter().find(|c| c.name == name).cloned() else { return };
         let file = registry::find(&cfg.driver).is_some_and(|d| d.backend.is_file());
         let pw = match pw.or_else(|| cfg.save_password.then(|| config::get_password(name)).flatten()) {
             Some(p) => p,
@@ -382,6 +569,10 @@ impl App {
             },
         };
         self.frame.set_status_text(&format!("Connecting to {name}…"), 0);
+        let startup = self.conns.borrow().iter().find(|c| c.name == name).map(|c| c.startup_sql.clone()).unwrap_or_default();
+        if let Some(np) = &new_pw {
+            cfg.options.insert("new_password".into(), np.clone());
+        }
         let c = Conn::open(cfg, pw.clone(), self.prefs());
         self.open.borrow_mut().insert(name.to_string(), c.clone());
         let name = name.to_string();
@@ -391,6 +582,15 @@ impl App {
             match r {
                 Ok(()) => {
                     app.frame.set_status_text(&format!("Connected: {name}"), 0);
+                    if let Some(np) = new_pw {
+                        // Later sessions (unshared worksheets) log in with the new password.
+                        c2.borrow_mut().cfg.options.remove("new_password");
+                        if c2.borrow().cfg.save_password {
+                            let _ = config::set_password(&name, &np);
+                        }
+                        app.status(0, &format!("Password of {name} changed"));
+                    }
+                    run_startup(&c2, &startup);
                     f(c2)
                 }
                 Err(fail) => {
@@ -402,6 +602,14 @@ impl App {
                                 crate::app().connect_with(&name, Some(pw), f);
                             }
                         }),
+                        // Oracle expired password: ask for a new one and log in with it.
+                        None if fail.error.contains("ORA-28001") => {
+                            let Some(np) = ui::ask_password(&app.frame, &format!("The password of {name} has expired.\n\nNew password:")) else { return };
+                            if ui::ask_password(&app.frame, "Confirm the new password:").as_deref() != Some(np.as_str()) {
+                                return ui::error(&app.frame, "The passwords differ; the password was not changed.");
+                            }
+                            crate::app().connect_full(&name, Some(pw), Some(np), f);
+                        }
                         None => ui::error(&app.frame, &format!("Connection \"{name}\" failed:\n\n{}", fail.error)),
                     }
                 }
@@ -437,11 +645,19 @@ impl App {
         let title = c.borrow().cfg.name.clone();
         let ws = Worksheet::new(&self.nb, c);
         self.add_page(Page::Sheet(ws.clone()), &title);
+        ws.paint_strip();
         ws.editor.set_focus();
     }
 
     pub fn open_object(&self, conn: &str, owner: &str, kind: &'static str, name: &str) {
         let Some(c) = self.open_conn(conn) else { return };
+        {
+            let mut r = self.recent_objs.borrow_mut();
+            let e = (conn.to_string(), owner.to_string(), kind, name.to_string());
+            r.retain(|x| *x != e);
+            r.insert(0, e);
+            r.truncate(20);
+        }
         // Select it in the Connections tree too (IntelliJ's select-in-project).
         let schema = c.borrow().schema.clone();
         self.nav.reveal(conn, &schema, owner, kind, name);
@@ -456,6 +672,43 @@ impl App {
     }
 
     /// View ▸ Find DB Object: name search across all schemas, open the pick in the object viewer.
+    /// Tools ▸ Search Source Code: hits as "OWNER.NAME (type) line n: text"; the picked object
+    /// opens in the viewer.
+    fn search_source(&self, c: ConnRef) {
+        let db = c.borrow().kind;
+        let Some(text) = ui::ask(&self.frame, "Text in the source (case-insensitive):", "Search Source Code", "").filter(|t| !t.trim().is_empty()) else { return };
+        let Some(sql) = dialect::source_search_sql(db, &text) else {
+            return ui::info(&self.frame, "No stored code to search on this database.");
+        };
+        let conn = c.borrow().cfg.name.clone();
+        Conn::meta_query(&c, &sql, move |r| {
+            let app = app();
+            let rows = match r {
+                Ok(r) => r.rows,
+                Err(e) => return ui::error(&app.frame, &e),
+            };
+            let hits: Vec<(String, String, &'static str, String)> = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let g = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+                    let kind = dialect::kind_const(g(2).trim_end_matches(" BODY"))?;
+                    let at = if g(3).is_empty() { String::new() } else { format!(" line {}: {}", g(3), g(4)) };
+                    Some((g(0), g(1), kind, at))
+                })
+                .collect();
+            if hits.is_empty() {
+                return ui::info(&app.frame, &format!("\"{text}\" was not found in stored code."));
+            }
+            let labels: Vec<String> = hits.iter().map(|(o, n, k, at)| format!("{o}.{n} ({}){at}", k.to_lowercase())).collect();
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let d = SingleChoiceDialog::builder(&app.frame, &format!("{} hit(s) (max 500):", hits.len()), "Search Source Code", &refs).build();
+            if d.show_modal() == ID_OK && d.get_selection() >= 0 {
+                let (o, n, k, _) = &hits[d.get_selection() as usize];
+                app.open_object(&conn, o, k, n);
+            }
+        });
+    }
+
     fn find_object(&self, c: ConnRef) {
         let Some(pat) = ui::ask(&self.frame, "Object name contains (* = any):", "Find DB Object", "").filter(|p| !p.trim().is_empty()) else { return };
         let conn = c.borrow().cfg.name.clone();
@@ -496,18 +749,20 @@ impl App {
         });
     }
 
-    pub fn ddl_to_worksheet(&self, conn: &str, owner: &str, kind: &'static str, name: &str) {
+    /// Quick DDL ▸ Worksheet / Clipboard / Save to File: the object's DDL (Oracle: DBMS_METADATA
+    /// with `;` and `/` terminators, runnable as a script).
+    pub fn quick_ddl(&self, conn: &str, owner: &str, kind: &'static str, name: &str, to: QuickDdl) {
         let Some(c) = self.open_conn(conn) else { return };
         let db = c.borrow().kind;
-        let Some((sql, col)) = dialect::tabs(db, kind).into_iter().find_map(|t| match t.view {
-            dialect::View::Ddl(s, col) => Some((s, col)),
-            dialect::View::Code(s) => Some((s, usize::MAX)),
-            _ => None,
-        }) else {
-            return;
+        let Some((sql, col)) = dialect::ddl_sql(db, kind, owner, name) else {
+            return ui::info(&self.frame, &format!("No DDL available for {kind} on this database."));
         };
-        let sql = dialect::fill(db, &sql, owner, name);
-        let c2 = c.clone();
+        let oracle = db == Kind::Oracle;
+        // One lane runs these in order: the terminator setting applies to GET_DDL only.
+        if oracle {
+            Conn::meta_query(&c, rsqldev_core::compare::ORA_TERMINATORS_ON, |_| {});
+        }
+        let (c2, file) = (c.clone(), format!("{name}.sql"));
         Conn::meta_query(&c, &sql, move |r| {
             let app = app();
             let text = match r {
@@ -515,12 +770,37 @@ impl App {
                 Ok(r) => r.rows.into_iter().next().and_then(|row| row.into_iter().nth(col).flatten()).unwrap_or_default(),
                 Err(e) => return ui::error(&app.frame, &e),
             };
-            app.open_worksheet(c2);
-            if let Some(ws) = app.current_sheet() {
-                ws.editor.set_text(text.trim_start());
-                ws.editor.set_save_point();
+            let text = format!("{}\n", text.trim());
+            match to {
+                QuickDdl::Worksheet => {
+                    app.open_worksheet(c2);
+                    if let Some(ws) = app.current_sheet() {
+                        ws.editor.set_text(&text);
+                        ws.editor.set_save_point();
+                    }
+                }
+                QuickDdl::Clipboard => {
+                    Clipboard::get().set_text(&text);
+                    app.status(0, "DDL copied to the clipboard");
+                }
+                QuickDdl::File => {
+                    let d = FileDialog::builder(&app.frame)
+                        .with_message("Save DDL")
+                        .with_default_file(&file)
+                        .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+                        .with_wildcard("SQL files (*.sql)|*.sql|All files (*)|*")
+                        .build();
+                    if let Some(p) = (d.show_modal() == ID_OK).then(|| d.get_path()).flatten() {
+                        if let Err(e) = std::fs::write(&p, &text) {
+                            ui::error(&app.frame, &format!("Saving {p} failed: {e}"));
+                        }
+                    }
+                }
             }
         });
+        if oracle {
+            Conn::meta_query(&c, rsqldev_core::compare::ORA_TERMINATORS_OFF, |_| {});
+        }
     }
 
     fn sheets(&self) -> Vec<SheetRef> {
@@ -617,6 +897,48 @@ impl App {
 
     pub fn status(&self, field: i32, text: &str) {
         self.frame.set_status_text(text, field);
+        if field == 0 && !text.trim().is_empty() {
+            self.log_line(text);
+        }
+    }
+
+    /// File ▸ Recent Files: `p` first, ten kept.
+    pub fn note_recent(&self, p: &std::path::Path) {
+        let s = p.display().to_string();
+        let mut prefs = self.prefs();
+        prefs.recent_files.retain(|x| *x != s);
+        prefs.recent_files.insert(0, s);
+        prefs.recent_files.truncate(10);
+        self.set_prefs(prefs);
+    }
+
+    pub fn remember_clip(&self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let mut c = self.clips.borrow_mut();
+        c.retain(|x| x != text);
+        c.insert(0, text.to_string());
+        c.truncate(20);
+    }
+
+    pub fn log_line(&self, text: &str) {
+        let mut l = self.log.borrow_mut();
+        l.push(format!("{}  {}", chrono::Local::now().format("%H:%M:%S"), text.trim()));
+        let n = l.len();
+        if n > 2000 {
+            l.drain(..n - 2000);
+        }
+    }
+
+    /// Bind values typed in a worksheet: remembered, and saved when the preference says so.
+    pub fn save_binds(&self) {
+        if !self.prefs.borrow().save_binds {
+            return;
+        }
+        if let Ok(s) = toml::to_string(&*self.binds.borrow()) {
+            let _ = std::fs::write(config::config_root().join("binds.toml"), s);
+        }
     }
 
     /// The selected tab's object viewer, when its Data tab is showing.
@@ -698,7 +1020,40 @@ impl App {
     fn menu_rest(&self, id: i32, sheet: Option<SheetRef>, editor_focus: bool) -> bool {
         match id {
             ID_NEW_CONN | ID_NEW => self.new_connection(),
-            ID_IMPORT_CONNS => self.import_connections(),
+            ID_IMPORT_CONNS => self.import_connections(false),
+            ID_IMPORT_FILE => self.import_connections(true),
+            ID_EXPORT_CONNS => {
+                let d = FileDialog::builder(&self.frame)
+                    .with_message("Export Connections (no passwords)")
+                    .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+                    .with_default_file("rsqldev-connections.toml")
+                    .with_wildcard("rsqldev connections (*.toml)|*.toml")
+                    .build();
+                if let Some(p) = (d.show_modal() == ID_OK).then(|| d.get_path()).flatten() {
+                    match config::connections_text(&self.conns.borrow()).map_err(|e| e.to_string()).and_then(|t| std::fs::write(&p, t).map_err(|e| e.to_string())) {
+                        Ok(()) => self.status(0, &format!("Exported {} connection(s) to {p}", self.conns.borrow().len())),
+                        Err(e) => ui::error(&self.frame, &format!("Export failed: {e}")),
+                    }
+                }
+            }
+            ID_EXT_PASTE => {
+                let clips = self.clips.borrow().clone();
+                if clips.is_empty() {
+                    return {
+                        ui::info(&self.frame, "Nothing copied in rsqldev yet.");
+                        true
+                    };
+                }
+                let labels: Vec<String> = clips.iter().map(|c| c.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(120).collect()).collect();
+                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                let d = SingleChoiceDialog::builder(&self.frame, "Paste:", "Extended Paste", &refs).build();
+                if d.show_modal() == ID_OK && d.get_selection() >= 0 {
+                    if let Some(s) = sheet {
+                        let e = s.editor;
+                        e.replace_selection(&clips[d.get_selection() as usize]);
+                    }
+                }
+            }
             ID_SESSIONS => self.pick_conn(|c| {
                 let a = app();
                 let title = format!("Sessions: {}", c.borrow().cfg.name);
@@ -726,6 +1081,12 @@ impl App {
                     ui::info(&app().frame, "Data Pump is available on Oracle connections");
                 }
             }),
+            ID_REPORTS => self.pick_conn(|c| {
+                let a = app();
+                let title = format!("Reports: {}", c.borrow().cfg.name);
+                let s = reports::Reports::new(&a.nb, c);
+                a.add_page(Page::Reports(s), &title);
+            }),
             ID_TOPSQL => self.pick_conn(|c| {
                 let a = app();
                 let title = format!("Top SQL: {}", c.borrow().cfg.name);
@@ -733,10 +1094,24 @@ impl App {
                 a.add_page(Page::TopSql(s), &title);
             }),
             ID_UPDATES => check_updates(true),
-            ID_OPEN => {
-                let d = FileDialog::builder(&self.frame).with_message("Open SQL file").with_style(FileDialogStyle::Open).with_wildcard("SQL files (*.sql)|*.sql|All files (*)|*").build();
-                if d.show_modal() == ID_OK {
-                    if let Some(p) = d.get_path() {
+            ID_OPEN | ID_RECENT => {
+                let picked = if id == ID_RECENT {
+                    let recent = self.prefs().recent_files;
+                    if recent.is_empty() {
+                        return {
+                            ui::info(&self.frame, "No recent files yet.");
+                            true
+                        };
+                    }
+                    let refs: Vec<&str> = recent.iter().map(String::as_str).collect();
+                    let d = SingleChoiceDialog::builder(&self.frame, "Open:", "Recent Files", &refs).build();
+                    (d.show_modal() == ID_OK && d.get_selection() >= 0).then(|| recent[d.get_selection() as usize].clone())
+                } else {
+                    let d = FileDialog::builder(&self.frame).with_message("Open SQL file").with_style(FileDialogStyle::Open).with_wildcard("SQL files (*.sql)|*.sql|All files (*)|*").build();
+                    (d.show_modal() == ID_OK).then(|| d.get_path()).flatten()
+                };
+                {
+                    if let Some(p) = picked {
                         self.pick_conn(move |c| {
                             let app = app();
                             app.open_worksheet(c);
@@ -791,10 +1166,32 @@ impl App {
                     s.save(false);
                 }
             }
-            ID_BACK | ID_FORWARD => {
+            ID_BACK | ID_FORWARD | ID_PREV_TAB | ID_NEXT_TAB => {
                 let (n, i) = (self.nb.page_count() as i32, self.nb.get_selection());
                 if n > 1 && i >= 0 {
-                    self.nb.set_selection(((i + if id == ID_BACK { n - 1 } else { 1 }) % n) as usize);
+                    self.nb.set_selection(((i + if matches!(id, ID_BACK | ID_PREV_TAB) { n - 1 } else { 1 }) % n) as usize);
+                }
+            }
+            ID_CLOSE_ALL => {
+                // Last tab first; stop when the user cancels one.
+                loop {
+                    let n = self.pages.borrow().len();
+                    let Some(i) = n.checked_sub(1) else { break };
+                    let panel = self.pages.borrow()[i].panel();
+                    let idx = self.nb.get_page_index(&panel);
+                    if idx >= 0 {
+                        self.nb.set_selection(idx as usize);
+                    }
+                    self.close_current();
+                    if self.pages.borrow().len() == n {
+                        break;
+                    }
+                }
+                if self.start.get().is_valid() {
+                    let idx = self.nb.get_page_index(&self.start.get());
+                    if idx >= 0 {
+                        self.nb.delete_page(idx as usize);
+                    }
                 }
             }
             ID_EXIT => self.frame.close(false),
@@ -807,8 +1204,10 @@ impl App {
                 match id {
                     ID_UNDO => e.undo(),
                     ID_REDO => e.redo(),
-                    ID_CUT => e.cut(),
-                    ID_COPY => e.copy(),
+                    ID_CUT | ID_COPY => {
+                        self.remember_clip(&e.get_selected_text());
+                        if id == ID_CUT { e.cut() } else { e.copy() }
+                    }
                     ID_PASTE => e.paste(),
                     _ => e.select_all(),
                 }
@@ -834,14 +1233,43 @@ impl App {
                     s.format_sql();
                 }
             }
+            ID_FORMAT_CLIP => {
+                if let Some(s) = sheet {
+                    s.format_to_clipboard();
+                }
+            }
+            ID_DESCRIBE => {
+                if let Some(s) = sheet {
+                    s.describe_at_caret();
+                }
+            }
+            ID_RENAME_TAB => {
+                let i = self.nb.get_selection();
+                if i >= 0 {
+                    let cur = self.nb.get_page_text(i as usize);
+                    if let Some(t) = ui::ask(&self.frame, "Tab name:", "Rename Tab", &cur).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+                        self.nb.set_page_text(i as usize, &t);
+                    }
+                }
+            }
+            ID_DISCONNECT_ALL => self.end_work(None, || {
+                let app = app();
+                let names: Vec<String> = app.open.borrow().keys().cloned().collect();
+                for n in names {
+                    app.disconnect(&n);
+                }
+                app.nav.reload(&app.conns.borrow());
+            }),
             ID_COMPLETE => {
                 if let Some(s) = sheet {
                     complete::show(s.editor, &s.conn(), true);
                 }
             }
-            ID_DUP_LINES | ID_LINES_UP | ID_LINES_DOWN | ID_BRACE | ID_BOOKMARK | ID_BOOKMARK_NEXT | ID_BOOKMARK_PREV => {
+            ID_DUP_LINES | ID_LINES_UP | ID_LINES_DOWN | ID_BRACE | ID_BOOKMARK | ID_BOOKMARK_NEXT | ID_BOOKMARK_PREV | ID_COMMENT | ID_GOTO_LINE => {
                 let Some(e) = sheet.map(|s| s.editor) else { return true };
                 match id {
+                    ID_COMMENT => editor::toggle_comment(e),
+                    ID_GOTO_LINE => editor::goto_line(e, &self.frame),
                     ID_DUP_LINES => editor::duplicate_lines(e),
                     ID_LINES_UP | ID_LINES_DOWN => editor::move_lines(e, id == ID_LINES_UP),
                     ID_BRACE => editor::goto_brace(e),
@@ -854,7 +1282,7 @@ impl App {
                     if id == ID_SNIPPET { snippets::insert(&self.frame, s.editor) } else { snippets::save_selection(&self.frame, s.editor) }
                 }
             }
-            ID_RUN | ID_SCRIPT | ID_EXPLAIN | ID_AUTOTRACE | ID_RUN_PLSQL | ID_COMMIT | ID_ROLLBACK | ID_CANCEL_STMT | ID_HISTORY | ID_CLEAR => {
+            ID_RUN | ID_SCRIPT | ID_EXPLAIN | ID_XPLAN | ID_AUTOTRACE | ID_RUN_PLSQL | ID_COMMIT | ID_ROLLBACK | ID_CANCEL_STMT | ID_HISTORY | ID_CLEAR => {
                 let Some(s) = sheet else { return true };
                 match id {
                     ID_RUN => s.run_statement(),
@@ -862,6 +1290,7 @@ impl App {
                     ID_EXPLAIN => s.explain_plan(),
                     ID_AUTOTRACE => s.autotrace(),
                     ID_RUN_PLSQL => s.run_plsql(),
+                    ID_XPLAN => s.explain_xplan(),
                     ID_COMMIT => s.commit(),
                     ID_ROLLBACK => s.rollback(),
                     ID_CANCEL_STMT => s.cancel(),
@@ -876,14 +1305,40 @@ impl App {
                     let (cfg, prefs) = (s.conn().borrow().cfg.clone(), self.prefs());
                     let pw = config::get_password(&cfg.name).or_else(|| ui::ask_password(&self.frame, "Password:"));
                     if let Some(pw) = pw {
+                        let startup = cfg.startup_sql.clone();
                         let c = Conn::open(cfg, pw, prefs);
                         let c2 = c.clone();
                         Conn::when_ready(&c, move |r| match r {
-                            Ok(()) => app().open_worksheet(c2),
+                            Ok(()) => {
+                                run_startup(&c2, &startup);
+                                app().open_worksheet(c2)
+                            }
                             Err(f) => ui::error(&app().frame, &f.error),
                         });
                     }
                 }
+            }
+            ID_LOG => {
+                let text = self.log.borrow().join("\n");
+                let dlg = Dialog::builder(&self.frame, "Log").with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(820, 480).build();
+                let view = editor::sql_view(&dlg, if text.is_empty() { "No messages yet." } else { &text });
+                view.goto_pos(view.get_length());
+                let s = BoxSizer::builder(Orientation::Vertical).build();
+                s.add(&view, 1, SizerFlag::Expand | SizerFlag::All, 6);
+                let bs = BoxSizer::builder(Orientation::Horizontal).build();
+                let clear = Button::builder(&dlg).with_label("Clear").build();
+                clear.on_click(move |_| {
+                    app().log.borrow_mut().clear();
+                    dlg.end_modal(ID_CANCEL);
+                });
+                bs.add(&clear, 0, SizerFlag::All, 4);
+                bs.add_stretch_spacer(1);
+                let close = Button::builder(&dlg).with_label("Close").with_id(ID_CANCEL).build();
+                bs.add(&close, 0, SizerFlag::All, 4);
+                s.add_sizer(&bs, 0, SizerFlag::Expand | SizerFlag::All, 4);
+                dlg.set_sizer(s, true);
+                dlg.show_modal();
+                dlg.destroy();
             }
             ID_TOGGLE_NAV => {
                 if self.nav_shown.replace(!self.nav_shown.get()) {
@@ -894,6 +1349,35 @@ impl App {
             }
             ID_DRIVERS => driver_manager::show(&self.frame),
             ID_COMPARE => compare::show(&self.frame),
+            ID_DATA_COMPARE => compare::show_data(&self.frame),
+            ID_DB_EXPORT => compare::show_export(&self.frame, false),
+            ID_DB_COPY => compare::show_export(&self.frame, true),
+            ID_ER => compare::show_er(&self.frame),
+            ID_PRINT => {
+                if let Some(s) = sheet {
+                    let sel = s.editor.get_selected_text();
+                    let text = if sel.trim().is_empty() { s.editor.get_text() } else { sel };
+                    let title = s.path.borrow().as_ref().and_then(|p| p.file_name()).map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| s.conn().borrow().cfg.name.clone());
+                    editor::print_text(&self.frame, &title, &text);
+                }
+            }
+            ID_SEARCH_SOURCE => self.pick_conn(|c| app().search_source(c)),
+            ID_RECENT_OBJS => {
+                let list = self.recent_objs.borrow().clone();
+                if list.is_empty() {
+                    return {
+                        ui::info(&self.frame, "No objects opened yet.");
+                        true
+                    };
+                }
+                let labels: Vec<String> = list.iter().map(|(c, o, k, n)| format!("{n}    {} · {o} · {c}", k.to_lowercase())).collect();
+                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                let d = SingleChoiceDialog::builder(&self.frame, "Open:", "Recent Objects", &refs).build();
+                if d.show_modal() == ID_OK && d.get_selection() >= 0 {
+                    let (c, o, k, n) = list[d.get_selection() as usize].clone();
+                    self.connect(&c.clone(), move |_| app().open_object(&c, &o, k, &n));
+                }
+            }
             ID_PREFERENCES => prefs::show(&self.frame),
             ID_ABOUT => ui::info(
                 &self.frame,
@@ -1017,13 +1501,20 @@ fn menus(frame: &Frame) {
     let file = Menu::builder()
         .append_item(ID_NEW_CONN, "New Connection…\tCtrl+Shift+C", "Create a database connection")
         .append_item(ID_IMPORT_CONNS, "&Import Connections…", "Import connections from Oracle SQL Developer or DBeaver")
+        .append_item(ID_IMPORT_FILE, "Import Connections from File…", "A SQL Developer / DBeaver file or an rsqldev export")
+        .append_item(ID_EXPORT_CONNS, "E&xport Connections…", "Save the connections (without passwords) to a file to import elsewhere")
         .append_item(ID_NEW_SHEET, "New SQL &Worksheet\tCtrl+N", "Open a SQL worksheet on a connection")
         .append_item(ID_OPEN, "&Open…\tCtrl+O", "Open a SQL file in a worksheet")
+        .append_item(ID_RECENT, "Recent &Files…", "Reopen one of the last SQL files opened or saved")
         .append_item(ID_SAVE, "&Save\tCtrl+S", "")
         .append_item(ID_SAVEAS, "Save &As…", "")
         .append_item(ID_SAVEALL, "Save A&ll\tCtrl+Shift+S", "")
         .append_item(ID_CLOSE_TAB, "&Close\tCtrl+W", "Close the current tab")
+        .append_item(ID_CLOSE_ALL, "Close A&ll\tCtrl+Shift+W", "Close every tab (asks for unsaved worksheets)")
+        .append_item(ID_RENAME_TAB, "Rena&me Tab…", "Rename the current tab")
+        .append_item(ID_DISCONNECT_ALL, "Disconnect All", "Close every connection (asks about uncommitted changes)")
         .append_item(ID_RECOVER, "&Recover Unsaved Worksheet…\tCtrl+Shift+T", "Reopen a worksheet closed without saving")
+        .append_item(ID_PRINT, "&Print…\tCtrl+P", "Print the worksheet (or its selection)")
         .append_separator()
         .append_item(ID_EXIT, "E&xit\tCtrl+Q", "")
         .build();
@@ -1034,19 +1525,24 @@ fn menus(frame: &Frame) {
         .append_item(ID_CUT, "Cu&t\tCtrl+X", "")
         .append_item(ID_COPY, "&Copy\tCtrl+C", "")
         .append_item(ID_PASTE, "&Paste\tCtrl+V", "")
+        .append_item(ID_EXT_PASTE, "E&xtended Paste…\tCtrl+Shift+V", "Paste one of the last texts copied in rsqldev")
         .append_item(ID_INSERT_ROW, "Insert &Row\tCtrl+I", "Data editor: new row after the cursor row")
         .append_item(ID_EDIT_VALUE, "Edit &Value…\tAlt+Enter", "Result grid: the cursor cell in an editor (long text, date picker, LOB)")
         .append_item(ID_SELECTALL, "Select &All\tCtrl+A", "")
         .append_separator()
         .append_item(ID_COMPLETE, "Completion &Insight\tRawCtrl+Space", "Complete keywords, tables and columns")
         .append_item(ID_FORMAT, "F&ormat SQL\tCtrl+Shift+F", "Format the selection, or the whole worksheet (also Ctrl+F7)")
+        .append_item(ID_FORMAT_CLIP, "Format to Clip&board", "The formatted selection (or worksheet) on the clipboard; the editor is unchanged")
+        .append_item(ID_DESCRIBE, "Popup Describe\tShift+F4", "Columns of the table or view under the caret")
         .append_item(ID_SNIPPET, "Insert S&nippet…\tCtrl+Shift+J", "Insert a SQL template at the caret")
         .append_item(ID_SNIPPET_SAVE, "Save Selection as Snippet…", "Keep the selected SQL as one of your snippets")
         .append_separator()
+        .append_item(ID_COMMENT, "Toggle Line Co&mment\tCtrl+/", "-- on every selected line, or off when all have one (Alt+Shift+C: block comment)")
         .append_item(ID_DUP_LINES, "&Duplicate Lines\tCtrl+Shift+D", "")
         .append_item(ID_LINES_UP, "Move Lines &Up\tAlt+Up", "")
         .append_item(ID_LINES_DOWN, "Move Lines Do&wn\tAlt+Down", "")
         .append_item(ID_BRACE, "Go to &Matching Bracket\tCtrl+]", "")
+        .append_item(ID_GOTO_LINE, "&Go to Line…\tCtrl+G", "")
         .append_separator()
         .append_item(ID_BOOKMARK, "Toggle &Bookmark\tCtrl+K", "")
         .append_item(ID_BOOKMARK_NEXT, "Ne&xt Bookmark\tF2", "")
@@ -1060,15 +1556,21 @@ fn menus(frame: &Frame) {
     let view = Menu::builder()
         .append_item(ID_TOGGLE_NAV, "&Connections\tCtrl+Shift+L", "Show or hide the Connections navigator")
         .append_item(ID_FIND_OBJECT, "Find DB &Object…\tCtrl+Shift+O", "Find tables, views, packages… by name in every schema")
+        .append_item(ID_RECENT_OBJS, "Recent O&bjects…", "Reopen one of the last objects opened in the viewer")
+        .append_item(ID_LOG, "&Log…", "Status messages and errors of this session, with their time")
+        .append_separator()
+        .append_item(ID_NEXT_TAB, "&Next Tab\tAlt+PgDn", "")
+        .append_item(ID_PREV_TAB, "&Previous Tab\tAlt+PgUp", "")
         .append_separator()
         .append_radio_item(ID_THEME_LIGHT, "&Light Appearance", "SQL Developer's default look")
         .append_radio_item(ID_THEME_DARK, "&Dark Appearance", "")
         .append_radio_item(ID_THEME_SYSTEM, "&Follow System Appearance", "")
         .build();
     let run = Menu::builder()
-        .append_item(ID_RUN, "Run &Statement\tCtrl+Enter", "")
+        .append_item(ID_RUN, "Run &Statement\tCtrl+Enter", "Also F9")
         .append_item(ID_SCRIPT, "Run S&cript\tF5", "")
         .append_item(ID_EXPLAIN, "&Explain Plan\tF10", "")
+        .append_item(ID_XPLAN, "Explain Plan (DBMS_&XPLAN)", "Oracle's formatted plan with predicates and notes")
         .append_item(ID_AUTOTRACE, "&Autotrace\tF6", "Run the query and show its plan with actual rows and time")
         .append_item(ID_RUN_PLSQL, "Run &PL/SQL…\tCtrl+F10", "Open an anonymous block calling the procedure or function under the caret")
         .append_separator()
@@ -1085,10 +1587,16 @@ fn menus(frame: &Frame) {
         .append_separator()
         .append_item(ID_SESSIONS, "S&essions…", "Sessions and locks of a connection: who blocks whom, kill session")
         .append_item(ID_TOPSQL, "&Top SQL…", "Heaviest statements on the server: elapsed, CPU, reads, executions, cost")
+        .append_item(ID_REPORTS, "&Reports…", "Version, storage, invalid objects, tables without a primary key, users, locks, waits…")
         .append_item(ID_DP_EXPORT, "Data Pump &Export…", "Export schemas, tables or the whole database with Oracle Data Pump (Oracle only)")
         .append_item(ID_DP_IMPORT, "Data Pump &Import…", "Import a dump file, uploading it first if it is on this computer (Oracle only)")
         .append_item(ID_DP_JOBS, "Data Pump &Jobs && Files…", "Running Data Pump jobs and the dump and log files on the server (Oracle only)")
         .append_item(ID_COMPARE, "Schema &Compare…", "Compare two schemas and open a script that brings the target in line")
+        .append_item(ID_DATA_COMPARE, "Data Co&mpare…", "Compare a table's rows on two connections / schemas by primary key; open the sync script")
+        .append_item(ID_DB_EXPORT, "Database E&xport…", "DDL of a schema's objects, with table data as INSERTs, into one .sql file")
+        .append_item(ID_DB_COPY, "Database Cop&y…", "A schema's objects and data scripted into a worksheet on another connection / schema")
+        .append_item(ID_ER, "E&R Diagram…", "A schema's tables and foreign keys as an SVG picture")
+        .append_item(ID_SEARCH_SOURCE, "Search Source Code…", "Find text in stored procedures, packages, triggers and views")
         .append_item(ID_DRIVERS, "&Drivers…", "Download or locate native client drivers")
         .append_item(ID_PREFERENCES, "&Preferences…", "")
         .build();
@@ -1134,12 +1642,13 @@ fn toolbar(frame: &Frame) {
     add(ID_FORWARD, "forward", "Forward", "Forward (next tab)");
     tb.add_separator();
     add(ID_WORKSHEET, "worksheet", "SQL Worksheet", "Open SQL Worksheet (Alt+F10)");
+    add(ID_FIND_OBJECT, "filter", "Find DB Object", "Find DB Object (Ctrl+Shift+O)");
     add(ID_DRIVERS, "drivers", "Drivers", "Drivers…");
     tb.realize();
 }
 
 const SHORTCUTS: &str = "Worksheet
-  Run Statement            Ctrl/Cmd+Enter
+  Run Statement            Ctrl/Cmd+Enter or F9
   Run Script               F5
   Explain Plan             F10
   Autotrace                F6
@@ -1147,6 +1656,7 @@ const SHORTCUTS: &str = "Worksheet
   Commit / Rollback        F11 / F12 (also in a table's Data tab)
   Cancel                   Ctrl/Cmd+.
   SQL History              F8
+  History previous / next  Ctrl/Cmd+Up / Down (with Shift: append)
   Clear                    Ctrl/Cmd+D
 
 Data tab (table editor)
@@ -1161,6 +1671,11 @@ Editor
   Completion Insight       Ctrl+Space (also after typing alias.)
   Format SQL               Ctrl/Cmd+Shift+F (or Ctrl/Cmd+F7)
   Insert Snippet           Ctrl/Cmd+Shift+J
+  Toggle Line Comment      Ctrl/Cmd+/
+  Toggle Block Comment     Alt+Shift+C
+  Upper / Lower / InitCap  Alt+'
+  Go to Line               Ctrl/Cmd+G
+  Popup Describe           Shift+F4
   Duplicate Lines          Ctrl/Cmd+Shift+D
   Move Lines Up / Down     Alt+Up / Alt+Down
   Matching Bracket         Ctrl/Cmd+]
@@ -1173,7 +1688,8 @@ Editor
 Files and tabs
   New Connection           Ctrl/Cmd+Shift+C
   Open / Save / Save All   Ctrl/Cmd+O / S / Shift+S
-  Close Tab                Ctrl/Cmd+W
+  Close Tab / Close All    Ctrl/Cmd+W / Ctrl/Cmd+Shift+W
+  Next / Previous Tab      Alt+PgDn / Alt+PgUp
   Recover Worksheet        Ctrl/Cmd+Shift+T
   New SQL Worksheet        Ctrl/Cmd+N (also Alt+F10)
   Find DB Object           Ctrl/Cmd+Shift+O
@@ -1270,6 +1786,7 @@ fn start_page(parent: &AuiNotebook, recover: &[autosave::Slot]) -> Panel {
 fn main() {
     SystemOptions::set_option_by_int("msw.no-manifest-check", 1);
     let prefs0 = config::load_prefs();
+    grid::set_null_text(&prefs0.null_display);
     rsqldev_core::lob::cleanup_stale();
     let _ = wxdragon::main(move |_| {
         if let Some(a) = wxdragon::app::get_app() {
@@ -1325,7 +1842,14 @@ fn start(prefs0: config::Prefs) {
         let nav = Navigator::new(&left);
         left.add_page(&nav.panel, "Connections", true);
         let nb = AuiNotebook::builder(&split).with_style(nb_flags(true)).build();
-        let recover = autosave::list();
+        // Worksheets open at the last quit come back by themselves when their connection
+        // needs no password prompt; the others stay on the Start Page.
+        let saved = config::load_connections();
+        let (reopen, recover): (Vec<autosave::Slot>, Vec<autosave::Slot>) = autosave::list().into_iter().partition(|s| {
+            prefs0.reopen_worksheets
+                && s.open
+                && saved.iter().any(|c| c.name == s.conn && (registry::find(&c.driver).is_some_and(|d| d.backend.is_file()) || (c.save_password && config::get_password(&c.name).is_some())))
+        });
         let start = start_page(&nb, &recover);
         nb.add_page(&start, "Start Page", true);
         split.split_vertically(&left, &nb, 300);
@@ -1350,7 +1874,11 @@ fn start(prefs0: config::Prefs) {
             conns: RefCell::new(config::load_connections()),
             open: RefCell::default(),
             pages: RefCell::default(),
-            history: RefCell::new(history.entries),
+            history: RefCell::new(history.entries.into_iter().map(|sql| HistItem { sql, ..Default::default() }).chain(history.items).collect()),
+            binds: RefCell::new(std::fs::read_to_string(config::config_root().join("binds.toml")).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default()),
+            log: RefCell::default(),
+            clips: RefCell::default(),
+            recent_objs: RefCell::default(),
             _timer: timer,
             tabs_seen: std::cell::Cell::new(usize::MAX),
         });
@@ -1382,8 +1910,19 @@ fn start(prefs0: config::Prefs) {
         });
         frame.on_close(move |e| {
             let app = app();
+            // Uncommitted changes: keep the window, commit or roll back, then close again.
+            if let WindowEventData::General(ev) = &e {
+                if ev.can_veto() && !app.dirty_conns(None).is_empty() {
+                    ev.veto();
+                    return app.end_work(None, || crate::app().frame.close(true));
+                }
+            }
             app.save_history();
             app.autosave_tick();
+            for s in app.sheets() {
+                let path = s.path.borrow().as_ref().map(|p| p.display().to_string());
+                autosave::write_open(s.autosave_id, &s.conn().borrow().cfg.name, path, &s.editor.get_text());
+            }
             app.open.borrow_mut().clear();
             rsqldev_core::lob::cleanup_mine();
             // The event loop outlives the frame while other top-level windows remain (an
@@ -1395,8 +1934,30 @@ fn start(prefs0: config::Prefs) {
         frame.set_status_text(if a.conns.borrow().is_empty() { "No connections yet: File ▸ New Connection…" } else { "Ready" }, 0);
         if let Ok(name) = std::env::var("RSQLDEV_SELFTEST") {
             selftest(name);
-        } else if a.prefs().check_updates {
-            check_updates(false);
+        } else {
+            for s in reopen {
+                a.recover(s);
+            }
+            if a.prefs().check_updates {
+                check_updates(false);
+            }
+        }
+    }
+}
+
+/// A connection's startup SQL, queued on both of its sessions before anything else runs
+/// there; failures go to the status bar and the log.
+fn run_startup(c: &ConnRef, sql: &str) {
+    let (name, kind) = (c.borrow().cfg.name.clone(), c.borrow().kind);
+    for item in rsqldev_core::script::split(sql, kind).into_iter().filter(|i| i.kind != rsqldev_core::script::Kind::Command) {
+        let n = name.clone();
+        Conn::work_query(c, &item.text, move |r| {
+            if let Err(e) = r {
+                app().status(0, &format!("{n}: startup SQL failed: {e}"));
+            }
+        });
+        if c.borrow().has_meta() {
+            Conn::meta_query(c, &item.text, |_| {});
         }
     }
 }
@@ -1536,7 +2097,7 @@ fn selftest(name: String) {
                 }
                 20 => {
                     let a = app();
-                    eprintln!("SELFTEST pages={} history={}", a.pages.borrow().len(), a.history().len());
+                    eprintln!("SELFTEST pages={} history={} uncommitted={}", a.pages.borrow().len(), a.history().len(), a.dirty_conns(None).len());
                     if std::env::var("RSQLDEV_SELFTEST_KEEP").is_ok() {
                         // Leave a representative screen for screenshots: sample table, query, object viewer.
                         ws.editor.set_text("create table employees (employee_id int primary key, first_name varchar(30), last_name varchar(30), salary numeric(10,2), hire_date date);\ninsert into employees values (100, 'Steven', 'King', 24000, DATE '2003-06-17');\ninsert into employees values (101, 'Neena', 'Kochhar', 17000, DATE '2005-09-21');\ninsert into employees values (102, 'Lex', null, 17000, DATE '2001-01-13');\ncommit;\n");

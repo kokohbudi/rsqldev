@@ -45,6 +45,8 @@ const COMMANDS: &[(&str, usize)] = &[
     ("BTITLE", 3),
     ("BREAK", 3),
     ("COMPUTE", 4),
+    ("EXIT", 4),
+    ("QUIT", 4),
 ];
 
 /// Canonical SQL*Plus command name for the first word of a line, if it is one.
@@ -293,12 +295,52 @@ pub fn statement_at(items: &[Item], pos: usize) -> Option<&Item> {
     items.iter().find(|it| it.start <= pos && pos <= it.end).or_else(|| items.iter().rev().find(|it| it.end <= pos)).or(items.first())
 }
 
-/// Substitution variables (`&name`, `&&name`), SQL*Plus style.
+/// Substitution variables (`&name`, `&&name`), SQL*Plus style, and the script's SET options.
 #[derive(Debug, Default, Clone)]
 pub struct Defines {
     pub vars: BTreeMap<String, String>,
     pub disabled: bool,
+    pub set: Settings,
 }
+
+/// SQL*Plus SET / WHENEVER options the script runner honours; layout options (PAGESIZE,
+/// LINESIZE, ...) are accepted and ignored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settings {
+    pub feedback: bool,
+    pub timing: bool,
+    pub echo: bool,
+    pub heading: bool,
+    /// SET NULL text for NULL cells.
+    pub null: String,
+    /// WHENEVER SQLERROR EXIT: stop at the first error, then commit (Some(true)), roll back
+    /// (Some(false)) or leave the transaction (None). Outer None = continue.
+    pub on_error: Option<Option<bool>>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { feedback: true, timing: false, echo: false, heading: true, null: String::new(), on_error: None }
+    }
+}
+
+/// COMMIT / ROLLBACK named among EXIT / WHENEVER words.
+fn tx_word(words: &[&str]) -> Option<bool> {
+    if words.contains(&"COMMIT") {
+        Some(true)
+    } else if words.contains(&"ROLLBACK") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// SET options accepted without effect (output layout of SQL*Plus).
+const SET_IGNORED: &[&str] = &[
+    "PAGESIZE", "LINESIZE", "VERIFY", "TERMOUT", "TRIMSPOOL", "TRIMOUT", "SQLBLANKLINES", "LONG", "LONGCHUNKSIZE", "TAB", "WRAP", "NEWPAGE", "ARRAYSIZE",
+    "COLSEP", "UNDERLINE", "NUMWIDTH", "NUMFORMAT", "EMBEDDED", "SHOWMODE", "FLUSH", "AUTOPRINT", "AUTOTRACE", "SCAN", "ESCAPE", "CONCAT", "APPINFO",
+    "SQLPROMPT", "SQLTERMINATOR", "TIME", "COPYCOMMIT", "EXITCOMMIT", "LOBPREFETCH", "STATEMENTCACHE", "MARKUP", "SUFFIX", "ENCODING", "SECUREDCOL",
+];
 
 impl Defines {
     /// Replace substitution variables; unknown ones are asked via `ask` (None = cancel run).
@@ -462,6 +504,9 @@ pub enum Action {
     Rerun,
     Clear,
     Nothing,
+    /// EXIT / QUIT: stop the script, then commit (Some(true)) / roll back (Some(false)).
+    Exit(Option<bool>),
+    Autocommit(bool),
     Unsupported(String),
 }
 
@@ -478,14 +523,40 @@ pub fn command(text: &str, defs: &mut Defines) -> Action {
     let up = rest.to_uppercase();
     let arg1 = up.split_whitespace().next().unwrap_or("");
     match cmd {
-        "SET" => match arg1 {
-            a if "SERVEROUTPUT".starts_with(a) && a.len() >= 9 => Action::Output(up.split_whitespace().nth(1) == Some("ON")),
-            a if "DEFINE".starts_with(a) && a.len() >= 3 => {
-                defs.disabled = up.split_whitespace().nth(1) == Some("OFF");
-                Action::Nothing
+        "SET" => {
+            let val = up.split_whitespace().nth(1).unwrap_or("");
+            let is = |name: &str, min: usize| arg1.len() >= min && name.starts_with(arg1);
+            let on = val == "ON";
+            let s = &mut defs.set;
+            match () {
+                _ if is("SERVEROUTPUT", 9) => return Action::Output(on),
+                _ if is("DEFINE", 3) => defs.disabled = val == "OFF",
+                _ if is("FEEDBACK", 4) => s.feedback = !matches!(val, "OFF" | "0"),
+                _ if is("TIMING", 4) => s.timing = on,
+                _ if is("ECHO", 4) => s.echo = on,
+                _ if is("HEADING", 3) => s.heading = val != "OFF",
+                // SET NULL keeps the text's case: "SET NULL (null)".
+                _ if is("NULL", 4) => s.null = rest.split_once(char::is_whitespace).map_or("", |x| x.1).trim().trim_matches(['"', '\'']).to_string(),
+                // SET AUTOCOMMIT n commits every n statements in SQL*Plus; here n > 0 = ON.
+                _ if is("AUTOCOMMIT", 4) => return Action::Autocommit(on || val == "IMMEDIATE" || val.parse::<u32>().is_ok_and(|n| n > 0)),
+                _ if SET_IGNORED.iter().any(|n| is(n, 3.min(n.len()))) => {}
+                _ => return Action::Unsupported(t.into()),
             }
-            _ => Action::Unsupported(t.into()),
-        },
+            Action::Nothing
+        }
+        "WHENEVER" => {
+            let w: Vec<&str> = up.split_whitespace().collect();
+            match (w.first().copied(), w.get(1).copied()) {
+                (Some("SQLERROR"), Some("EXIT")) => defs.set.on_error = Some(tx_word(&w)),
+                (Some("SQLERROR"), Some("CONTINUE")) => defs.set.on_error = None,
+                (Some("OSERROR"), _) => {}
+                _ => return Action::Unsupported(t.into()),
+            }
+            Action::Nothing
+        }
+        // A worksheet stays connected: EXIT only stops the script (and commits / rolls back
+        // when told to; SQL*Plus would commit by default, a worksheet leaves that to the user).
+        "EXIT" | "QUIT" => Action::Exit(tx_word(&up.split_whitespace().collect::<Vec<_>>())),
         "DEFINE" => {
             if let Some((k, v)) = rest.split_once('=') {
                 defs.vars.insert(k.trim().to_uppercase(), v.trim().trim_matches('"').trim_matches('\'').to_string());
@@ -519,16 +590,32 @@ pub fn command(text: &str, defs: &mut Defines) -> Action {
 }
 
 
+/// Script Output: the worksheet line (1-based) an output line points at. "Error starting at
+/// line : N" gives N; a compiler message "L/C ..." below it gives N + L - 1.
+pub fn error_target(output: &str, at: usize) -> Option<usize> {
+    let lines: Vec<&str> = output.lines().collect();
+    let start = |l: &str| l.trim().strip_prefix("Error starting at line : ")?.split_whitespace().next()?.parse::<usize>().ok();
+    let line = lines.get(at)?;
+    if let Some(n) = start(line) {
+        return Some(n);
+    }
+    let (l, rest) = line.trim_start().split_once('/')?;
+    let l: usize = l.parse().ok()?;
+    rest.split(|c: char| !c.is_ascii_digit()).next()?.parse::<usize>().ok()?;
+    let n = lines[..at].iter().rev().find_map(|x| start(x))?;
+    Some(n + l - 1)
+}
+
 /// SQL*Plus style text table for the Script Output pane.
-pub fn format_table(cols: &[crate::Column], rows: &[Vec<crate::Cell>]) -> String {
+pub fn format_table(cols: &[crate::Column], rows: &[Vec<crate::Cell>], set: &Settings) -> String {
     if cols.is_empty() {
         return String::new();
     }
-    let cell = |v: &crate::Cell| crate::lob::display(v.as_deref().unwrap_or("")).replace(['\n', '\r'], " ");
+    let cell = |v: &crate::Cell| crate::lob::display(v.as_deref().unwrap_or(&set.null)).replace(['\n', '\r'], " ");
     let w: Vec<usize> = cols
         .iter()
         .enumerate()
-        .map(|(i, c)| rows.iter().map(|r| cell(&r[i]).chars().count()).chain([c.name.chars().count()]).max().unwrap_or(0).min(60))
+        .map(|(i, c)| rows.iter().map(|r| cell(&r[i]).chars().count()).chain(set.heading.then(|| c.name.chars().count())).max().unwrap_or(0).min(60))
         .collect();
     let pad = |s: String, i: usize| {
         let n = s.chars().count();
@@ -536,15 +623,20 @@ pub fn format_table(cols: &[crate::Column], rows: &[Vec<crate::Cell>]) -> String
         let fill = " ".repeat(w[i].saturating_sub(s.chars().count()));
         if cols[i].numeric { format!("{fill}{s}") } else { format!("{s}{fill}") }
     };
-    let mut out = cols.iter().enumerate().map(|(i, c)| pad(c.name.clone(), i)).collect::<Vec<_>>().join(" ").trim_end().to_string();
-    out.push('\n');
-    out.push_str(&w.iter().map(|n| "-".repeat(*n)).collect::<Vec<_>>().join(" "));
-    for r in rows {
-        out.push('\n');
-        out.push_str(r.iter().enumerate().map(|(i, v)| pad(cell(v), i)).collect::<Vec<_>>().join(" ").trim_end());
+    let mut lines = vec![];
+    if set.heading {
+        lines.push(cols.iter().enumerate().map(|(i, c)| pad(c.name.clone(), i)).collect::<Vec<_>>().join(" ").trim_end().to_string());
+        lines.push(w.iter().map(|n| "-".repeat(*n)).collect::<Vec<_>>().join(" "));
     }
+    for r in rows {
+        lines.push(r.iter().enumerate().map(|(i, v)| pad(cell(v), i)).collect::<Vec<_>>().join(" ").trim_end().to_string());
+    }
+    let mut out = lines.join("\n");
     let n = rows.len();
-    out.push_str(&format!("\n\n{n} row{} selected.\n", if n == 1 { "" } else { "s" }));
+    if set.feedback {
+        out.push_str(&format!("\n\n{n} row{} selected.", if n == 1 { "" } else { "s" }));
+    }
+    out.push('\n');
     out
 }
 
@@ -701,7 +793,42 @@ mod tests {
         assert_eq!(feedback("CREATE TABLE emp (id int)", None), "Table EMP created.");
         assert_eq!(feedback("drop table emp", None), "Table EMP dropped.");
         let cols = vec![crate::Column { name: "ID".into(), type_name: "NUMBER".into(), numeric: true }, crate::Column { name: "NAME".into(), type_name: "".into(), numeric: false }];
-        let t = format_table(&cols, &[vec![Some("7".into()), Some("Ann".into())]]);
+        let t = format_table(&cols, &[vec![Some("7".into()), Some("Ann".into())]], &Settings::default());
         assert_eq!(t, "ID NAME\n-- ----\n 7 Ann\n\n1 row selected.\n");
+        let quiet = Settings { heading: false, feedback: false, null: "-".into(), ..Settings::default() };
+        assert_eq!(format_table(&cols, &[vec![Some("7".into()), None]], &quiet), "7 -\n");
+    }
+
+    #[test]
+    fn error_lines() {
+        let out = "Table T created.\n\nError starting at line : 7 in command -\ncreate procedure p as\nError report -\nProcedure P compiled with errors\nLINE/COL ERROR\n3/3 PLS-00201: identifier 'X' must be declared\n";
+        assert_eq!(error_target(out, 2), Some(7));
+        assert_eq!(error_target(out, 7), Some(9));
+        assert_eq!(error_target(out, 6), None);
+        assert_eq!(error_target(out, 0), None);
+        assert_eq!(error_target("12/4 x", 0), None);
+    }
+
+    #[test]
+    fn set_whenever_exit() {
+        let mut d = Defines::default();
+        for c in ["SET FEEDBACK OFF", "set timing on", "SET ECHO ON", "SET HEA OFF", "SET NULL '(null)'", "SET PAGESIZE 0", "SET LINES 200", "SET VERIFY OFF"] {
+            assert_eq!(command(c, &mut d), Action::Nothing, "{c}");
+        }
+        assert_eq!(d.set, Settings { feedback: false, timing: true, echo: true, heading: false, null: "(null)".into(), on_error: None });
+        assert_eq!(command("SET AUTOCOMMIT ON", &mut d), Action::Autocommit(true));
+        assert_eq!(command("SET AUTOCOMMIT OFF", &mut d), Action::Autocommit(false));
+        assert_eq!(command("SET SERVEROUTPUT ON SIZE UNLIMITED", &mut d), Action::Output(true));
+        assert!(matches!(command("SET FOO BAR", &mut d), Action::Unsupported(_)));
+        command("WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK", &mut d);
+        assert_eq!(d.set.on_error, Some(Some(false)));
+        command("WHENEVER SQLERROR EXIT", &mut d);
+        assert_eq!(d.set.on_error, Some(None));
+        command("WHENEVER SQLERROR CONTINUE", &mut d);
+        assert_eq!(d.set.on_error, None);
+        assert_eq!(command("exit", &mut d), Action::Exit(None));
+        assert_eq!(command("QUIT COMMIT", &mut d), Action::Exit(Some(true)));
+        assert_eq!(command_name("exit;"), Some("EXIT"));
+        assert_eq!(command_name("existing"), None);
     }
 }

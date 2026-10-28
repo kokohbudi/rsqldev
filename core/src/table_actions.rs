@@ -30,6 +30,179 @@ pub fn rename(db: Db, owner: &str, name: &str, new: &str) -> R<String> {
     })
 }
 
+/// Rename… on a view / sequence / synonym / trigger node. `schema` = the session's current
+/// schema (Oracle RENAME works on its own objects only).
+pub fn rename_object(db: Db, kind: &str, owner: &str, name: &str, new: &str, schema: &str) -> R<String> {
+    use crate::dialect::{SEQUENCE, SYNONYM, TRIGGER, VIEW};
+    let (t, n) = (table(db, owner, name), ident(db, new));
+    if n.is_empty() {
+        return Err("A name is needed".into());
+    }
+    match (db, kind) {
+        (Db::Oracle, TRIGGER) => Ok(format!("ALTER TRIGGER {t} RENAME TO {}", quote(db, &n))),
+        (Db::Oracle, VIEW | SEQUENCE | SYNONYM) if owner.eq_ignore_ascii_case(schema) => Ok(format!("RENAME {} TO {}", quote(db, name), quote(db, &n))),
+        (Db::Oracle, VIEW | SEQUENCE | SYNONYM) => Err(format!("Oracle renames only its own objects: connect as {owner}")),
+        (Db::Postgres, VIEW | SEQUENCE) => Ok(format!("ALTER {kind} {t} RENAME TO {}", quote(db, &n))),
+        (Db::Mysql, VIEW) => Ok(format!("RENAME TABLE {t} TO {}", table(db, owner, &n))),
+        _ => Err(no(db, &format!("rename for a {}", kind.to_lowercase()))),
+    }
+}
+
+/// Table ▸ Gather Statistics.
+pub fn gather_stats(db: Db, owner: &str, name: &str) -> R<String> {
+    let t = table(db, owner, name);
+    Ok(match db {
+        Db::Oracle => format!("BEGIN DBMS_STATS.GATHER_TABLE_STATS(ownname => '{}', tabname => '{}', cascade => TRUE); END;", lit(owner), lit(name)),
+        Db::Postgres | Db::Sqlite => format!("ANALYZE {t}"),
+        Db::Mysql => format!("ANALYZE TABLE {t}"),
+        Db::Mssql => format!("UPDATE STATISTICS {t}"),
+        _ => return Err(no(db, "statistics gathering")),
+    })
+}
+
+/// Oracle node actions on schema-wide or special objects (the confirmation shows them).
+pub fn compile_invalid(owner: &str) -> String {
+    format!("BEGIN DBMS_UTILITY.COMPILE_SCHEMA(schema => '{}', compile_all => FALSE); END;", lit(owner))
+}
+
+/// Materialized view ▸ Refresh Data (complete).
+pub fn refresh_mview(db: Db, owner: &str, name: &str) -> R<String> {
+    match db {
+        Db::Oracle => Ok(format!("BEGIN DBMS_MVIEW.REFRESH('{}', 'C'); END;", lit(&table(db, owner, name)))),
+        Db::Postgres => Ok(format!("REFRESH MATERIALIZED VIEW {}", table(db, owner, name))),
+        _ => Err(no(db, "materialized view refresh")),
+    }
+}
+
+/// Recycle Bin ▸ Flashback (restore) / Purge, by the BIN$ name.
+pub fn recycle(name: &str, restore: bool) -> String {
+    let q = quote(Db::Oracle, name);
+    if restore { format!("FLASHBACK TABLE {q} TO BEFORE DROP") } else { format!("PURGE TABLE {q}") }
+}
+
+// ---- Users (Oracle) ----
+
+/// New / Edit User. Empty fields leave the setting alone when editing.
+#[derive(Default, Debug, Clone)]
+pub struct UserSpec {
+    pub name: String,
+    pub password: String,
+    pub default_ts: String,
+    pub temp_ts: String,
+    pub quota_unlimited: bool,
+    /// Create: privileges / roles granted at once (CREATE SESSION, RESOURCE, ...).
+    pub grants: Vec<String>,
+    /// Edit: Some(true) lock, Some(false) unlock.
+    pub lock: Option<bool>,
+    pub expire: bool,
+}
+
+fn password(pw: &str) -> R<String> {
+    if pw.contains('"') || pw.contains('\0') {
+        return Err("A password cannot contain double quotes".into());
+    }
+    Ok(format!("\"{pw}\""))
+}
+
+/// Privilege / role list: words of letters, digits, _ $ # and spaces, comma separated.
+fn privs(list: &str) -> R<String> {
+    let items: Vec<String> = list.split(',').map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase()).filter(|s| !s.is_empty()).collect();
+    if items.is_empty() || items.iter().any(|p| !p.chars().all(|c| c.is_ascii_alphanumeric() || "_$# ".contains(c))) {
+        return Err("Privileges and roles are names separated by commas, e.g. CREATE SESSION, RESOURCE".into());
+    }
+    Ok(items.join(", "))
+}
+
+pub fn create_user(u: &UserSpec) -> R<Vec<String>> {
+    let n = quote(Db::Oracle, &ident(Db::Oracle, &u.name));
+    if u.name.trim().is_empty() || u.password.is_empty() {
+        return Err("A user name and a password are needed".into());
+    }
+    let mut s = format!("CREATE USER {n} IDENTIFIED BY {}", password(&u.password)?);
+    if !u.default_ts.trim().is_empty() {
+        s += &format!(" DEFAULT TABLESPACE {}", quote(Db::Oracle, &ident(Db::Oracle, &u.default_ts)));
+        if u.quota_unlimited {
+            s += &format!(" QUOTA UNLIMITED ON {}", quote(Db::Oracle, &ident(Db::Oracle, &u.default_ts)));
+        }
+    }
+    if !u.temp_ts.trim().is_empty() {
+        s += &format!(" TEMPORARY TABLESPACE {}", quote(Db::Oracle, &ident(Db::Oracle, &u.temp_ts)));
+    }
+    let mut out = vec![s];
+    if !u.grants.is_empty() {
+        out.push(format!("GRANT {} TO {n}", privs(&u.grants.join(","))?));
+    }
+    Ok(out)
+}
+
+pub fn alter_user(u: &UserSpec) -> R<Vec<String>> {
+    let n = quote(Db::Oracle, &u.name);
+    let mut parts = vec![];
+    if !u.password.is_empty() {
+        parts.push(format!("IDENTIFIED BY {}", password(&u.password)?));
+    }
+    if !u.default_ts.trim().is_empty() {
+        let ts = quote(Db::Oracle, &ident(Db::Oracle, &u.default_ts));
+        parts.push(format!("DEFAULT TABLESPACE {ts}"));
+        if u.quota_unlimited {
+            parts.push(format!("QUOTA UNLIMITED ON {ts}"));
+        }
+    }
+    if !u.temp_ts.trim().is_empty() {
+        parts.push(format!("TEMPORARY TABLESPACE {}", quote(Db::Oracle, &ident(Db::Oracle, &u.temp_ts))));
+    }
+    match u.lock {
+        Some(true) => parts.push("ACCOUNT LOCK".into()),
+        Some(false) => parts.push("ACCOUNT UNLOCK".into()),
+        None => {}
+    }
+    if u.expire {
+        parts.push("PASSWORD EXPIRE".into());
+    }
+    if parts.is_empty() {
+        return Err("Nothing to change".into());
+    }
+    Ok(vec![format!("ALTER USER {n} {}", parts.join(" "))])
+}
+
+pub fn grant(list: &str, user: &str, admin: bool, revoke: bool) -> R<String> {
+    let p = privs(list)?;
+    let u = quote(Db::Oracle, user);
+    Ok(if revoke { format!("REVOKE {p} FROM {u}") } else { format!("GRANT {p} TO {u}{}", if admin { " WITH ADMIN OPTION" } else { "" }) })
+}
+
+pub fn drop_user(user: &str, cascade: bool) -> String {
+    format!("DROP USER {}{}", quote(Db::Oracle, user), if cascade { " CASCADE" } else { "" })
+}
+
+/// Statements as shown and in error messages: the password replaced by asterisks.
+pub fn masked(stmts: &[String], pw: &str) -> Vec<String> {
+    if pw.is_empty() {
+        return stmts.to_vec();
+    }
+    stmts.iter().map(|s| s.replace(&format!("\"{pw}\""), "********")).collect()
+}
+
+/// Scheduler job node actions (Oracle DBMS_SCHEDULER): Run, Stop, Enable, Disable, Drop.
+pub fn job_action(owner: &str, name: &str, action: &str) -> String {
+    let job = lit(&format!("{}.{}", quote(Db::Oracle, owner), quote(Db::Oracle, name)));
+    match action {
+        "RUN" => format!("BEGIN DBMS_SCHEDULER.RUN_JOB('{job}', use_current_session => FALSE); END;"),
+        "STOP" => format!("BEGIN DBMS_SCHEDULER.STOP_JOB('{job}'); END;"),
+        "ENABLE" => format!("BEGIN DBMS_SCHEDULER.ENABLE('{job}'); END;"),
+        "DISABLE" => format!("BEGIN DBMS_SCHEDULER.DISABLE('{job}'); END;"),
+        _ => format!("BEGIN DBMS_SCHEDULER.DROP_JOB('{job}'); END;"),
+    }
+}
+
+/// Enable / Disable on an Oracle trigger node.
+pub fn trigger_state(db: Db, owner: &str, name: &str, on: bool) -> R<String> {
+    match db {
+        Db::Oracle => Ok(format!("ALTER TRIGGER {} {}", table(db, owner, name), if on { "ENABLE" } else { "DISABLE" })),
+        _ => Err(no(db, "trigger enable / disable without its table (use the table's Trigger ▸ menu)")),
+    }
+}
+
 /// Copy…: a new table with the same columns, with or without the rows.
 pub fn copy(db: Db, owner: &str, name: &str, new_owner: &str, new_name: &str, data: bool) -> R<Vec<String>> {
     let src = table(db, owner, name);
@@ -296,6 +469,47 @@ pub fn drop_trigger(db: Db, owner: &str, name: &str, trigger: &str) -> R<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn users() {
+        let u = UserSpec { name: "app".into(), password: "s3cret".into(), default_ts: "users".into(), quota_unlimited: true, grants: vec!["create session".into(), "RESOURCE".into()], ..Default::default() };
+        let s = create_user(&u).unwrap();
+        assert_eq!(s, ["CREATE USER \"APP\" IDENTIFIED BY \"s3cret\" DEFAULT TABLESPACE \"USERS\" QUOTA UNLIMITED ON \"USERS\"", "GRANT CREATE SESSION, RESOURCE TO \"APP\""]);
+        assert!(!masked(&s, "s3cret").concat().contains("s3cret"));
+        assert!(create_user(&UserSpec { password: "a\"b".into(), ..u.clone() }).is_err());
+        assert_eq!(alter_user(&UserSpec { name: "APP".into(), lock: Some(true), expire: true, ..Default::default() }).unwrap(), ["ALTER USER \"APP\" ACCOUNT LOCK PASSWORD EXPIRE"]);
+        assert!(alter_user(&UserSpec { name: "APP".into(), ..Default::default() }).is_err());
+        assert_eq!(grant("select any table", "APP", true, false).unwrap(), "GRANT SELECT ANY TABLE TO \"APP\" WITH ADMIN OPTION");
+        assert!(grant("dba; drop user x", "APP", false, true).is_err());
+        assert_eq!(drop_user("APP", true), "DROP USER \"APP\" CASCADE");
+    }
+
+    #[test]
+    fn scheduler_jobs() {
+        assert_eq!(job_action("HR", "NIGHTLY", "RUN"), "BEGIN DBMS_SCHEDULER.RUN_JOB('\"HR\".\"NIGHTLY\"', use_current_session => FALSE); END;");
+        assert_eq!(job_action("HR", "J'1", "DROP"), "BEGIN DBMS_SCHEDULER.DROP_JOB('\"HR\".\"J''1\"'); END;");
+    }
+
+    #[test]
+    fn oracle_node_actions() {
+        assert_eq!(gather_stats(Db::Oracle, "O'X", "T").unwrap(), "BEGIN DBMS_STATS.GATHER_TABLE_STATS(ownname => 'O''X', tabname => 'T', cascade => TRUE); END;");
+        assert_eq!(gather_stats(Db::Mssql, "dbo", "t").unwrap(), "UPDATE STATISTICS [dbo].[t]");
+        assert!(gather_stats(Db::Clickhouse, "d", "t").is_err());
+        assert_eq!(refresh_mview(Db::Oracle, "HR", "MV").unwrap(), "BEGIN DBMS_MVIEW.REFRESH('\"HR\".\"MV\"', 'C'); END;");
+        assert_eq!(recycle("BIN$ab==$0", true), "FLASHBACK TABLE \"BIN$ab==$0\" TO BEFORE DROP");
+        assert_eq!(compile_invalid("HR"), "BEGIN DBMS_UTILITY.COMPILE_SCHEMA(schema => 'HR', compile_all => FALSE); END;");
+    }
+
+    #[test]
+    fn object_renames() {
+        assert_eq!(rename_object(Db::Oracle, "TRIGGER", "HR", "T1", "t2", "SCOTT").unwrap(), r#"ALTER TRIGGER "HR"."T1" RENAME TO "T2""#);
+        assert_eq!(rename_object(Db::Oracle, "VIEW", "HR", "V", "w", "hr").unwrap(), r#"RENAME "V" TO "W""#);
+        assert!(rename_object(Db::Oracle, "SEQUENCE", "HR", "S", "s2", "SCOTT").is_err());
+        assert_eq!(rename_object(Db::Postgres, "SEQUENCE", "public", "s", "S2", "public").unwrap(), r#"ALTER SEQUENCE "public"."s" RENAME TO "s2""#);
+        assert!(rename_object(Db::Mssql, "VIEW", "dbo", "v", "w", "dbo").is_err());
+        assert!(rename_object(Db::Oracle, "TRIGGER", "HR", "T1", " ", "HR").is_err());
+        assert_eq!(trigger_state(Db::Oracle, "HR", "T1", false).unwrap(), r#"ALTER TRIGGER "HR"."T1" DISABLE"#);
+    }
 
     #[test]
     fn table_actions() {

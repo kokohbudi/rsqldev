@@ -32,8 +32,6 @@ pub struct Worksheet {
     task: StaticText,
     elapsed: StaticText,
     defines: RefCell<Defines>,
-    /// Last value typed per bind name (upper case), offered again next run.
-    binds: RefCell<std::collections::HashMap<String, String>>,
     pub path: RefCell<Option<PathBuf>>,
     last: RefCell<Option<String>>,
     /// SPOOL target, open for appending (unbuffered: the file shows output as it comes).
@@ -52,6 +50,9 @@ pub struct Worksheet {
     /// Bumped per Run Statement: a late editability check of an older run is dropped.
     run_gen: Cell<u64>,
     last_line: Cell<i32>,
+    strip: Panel,
+    /// Ctrl/Cmd+Up / Down position in SQL History, counted back from the newest entry.
+    hist_at: Cell<Option<usize>>,
 }
 
 const P_RESULT: usize = 0;
@@ -123,10 +124,13 @@ impl Worksheet {
 
         let split = SplitterWindow::builder(&panel).build();
         let editor = editor::new_editor(&split, &prefs.editor_font, prefs.editor_font_size);
+        if !prefs.line_numbers {
+            editor.set_margin_width(0, 0);
+        }
         let bottom = AuiNotebook::builder(&split).with_style(AuiNotebookStyle::from_bits_retain(0x1 | 0x20 | 0x100)).build();
         // Output panes: read-only, highlighted like the editor.
         let mono = |p: &Panel| editor::sql_view(p, "");
-        let (qp, qs, qb, status) = pane(&bottom, &[("refresh", "Refresh (re-run)"), ("export", "Export…"), ("edit", "View / Edit Value… (Alt+Enter)")]);
+        let (qp, qs, qb, status) = pane(&bottom, &[("refresh", "Refresh (re-run)"), ("export", "Export…"), ("edit", "View / Edit Value… (Alt+Enter)"), ("pin", "Pin: keep this result in a tab of its own"), ("actions", "Show SQL: the statement of this result")]);
         let results = ResultGrid::new(&qp);
         results.st.borrow_mut().db = Some(conn.borrow().kind);
         qs.add(&results.grid, 1, SizerFlag::Expand, 0);
@@ -151,7 +155,11 @@ impl Worksheet {
         split.set_minimum_pane_size(60);
 
         let find = crate::find::FindBar::new(&panel, editor);
+        // Connection colour strip (production warning), shown when the connection has one.
+        let strip = Panel::builder(&panel).build();
+        strip.set_min_size(Size::new(-1, 4));
         let s = BoxSizer::builder(Orientation::Vertical).build();
+        s.add(&strip, 0, SizerFlag::Expand, 0);
         s.add_sizer(&bar, 0, SizerFlag::Expand, 0);
         s.add(&find.panel, 0, SizerFlag::Expand, 0);
         s.add(&split, 1, SizerFlag::Expand, 0);
@@ -176,7 +184,6 @@ impl Worksheet {
             task,
             elapsed,
             defines: RefCell::default(),
-            binds: RefCell::default(),
             path: RefCell::default(),
             last: RefCell::default(),
             spool: RefCell::default(),
@@ -188,6 +195,8 @@ impl Worksheet {
             last_line: Cell::new(1),
             b_cancel,
             busy: Cell::new(false),
+            hist_at: Cell::new(None),
+            strip,
             autosave_id: crate::autosave::next_id(),
             unsaved: Cell::new(false),
         });
@@ -208,6 +217,8 @@ impl Worksheet {
             (qb[0], Worksheet::rerun),
             (qb[1], |w| w.results.export_dialog()),
             (qb[2], |w| w.results.edit_value()),
+            (qb[3], Worksheet::pin_result),
+            (qb[4], Worksheet::show_sql),
             (sb[0], |w| editor::show(&w.script_out, "")),
             (sb[1], |w| save_text(&w.panel, &w.script_out.get_text())),
             (db[0], |w| w.set_output(true)),
@@ -232,6 +243,7 @@ impl Worksheet {
                     ws.results.st.borrow_mut().db = Some(c.borrow().kind);
                     *ws.conn.borrow_mut() = c;
                     crate::app().retitle(&ws.panel, &name);
+                    ws.paint_strip();
                 }
             });
         });
@@ -259,6 +271,16 @@ impl Worksheet {
                 }
             }
         });
+        // Double-click on an error in Script Output: go to its line in the worksheet.
+        let w = Rc::downgrade(&ws);
+        ws.script_out.on_stc_double_click(move |_| {
+            let Some(w) = w.upgrade() else { return };
+            let at = w.script_out.line_from_position(w.script_out.get_current_pos()) as usize;
+            if let Some(n) = script::error_target(&w.script_out.get_text(), at) {
+                w.editor.goto_line(n as i32 - 1);
+                w.editor.set_focus();
+            }
+        });
         // Autosave copies the text only after a change (no 2-second full-text copy and compare).
         let w = Rc::downgrade(&ws);
         ws.editor.on_stc_change(move |_| {
@@ -266,12 +288,30 @@ impl Worksheet {
                 w.unsaved.set(true);
             }
         });
-        // Ctrl/Cmd+F7 formats too (SQL Developer's key; the menu shows Ctrl/Cmd+Shift+F).
+        // SQL Developer's editor keys without a menu item: Ctrl/Cmd+F7 formats (the menu shows
+        // Ctrl/Cmd+Shift+F), F9 runs the statement, Ctrl/Cmd+Up / Down step through SQL History
+        // (with Shift: append), Alt+' cycles the case, Alt+Shift+C toggles a block comment.
         let w = Rc::downgrade(&ws);
         ws.editor.on_key_down(move |e| {
             if let (WindowEventData::Keyboard(k), Some(w)) = (&e, w.upgrade()) {
-                if k.cmd_down() && k.get_key_code() == Some(wxdragon::keycode::WXK_F7) {
-                    return w.format_sql();
+                use wxdragon::keycode::{WXK_DOWN, WXK_F7, WXK_F9, WXK_UP};
+                let (code, cmd, alt, shift) = (k.get_key_code().unwrap_or(0), k.cmd_down(), k.alt_down(), k.shift_down());
+                match code {
+                    WXK_F7 if cmd => return w.format_sql(),
+                    wxdragon::keycode::WXK_F4 if shift && !cmd => return w.describe_at_caret(),
+                    // Code templates: abbreviation + Tab.
+                    wxdragon::keycode::WXK_TAB if !cmd && !alt && !shift && !w.editor.auto_comp_active() && w.editor.get_selected_text().is_empty() => {
+                        let (e, pos) = (w.editor, w.editor.get_current_pos());
+                        if let Some((start, body, caret)) = rsqldev_core::config::expand_template(&crate::app().prefs().code_templates, &e.get_text(), pos as usize) {
+                            crate::editor::replace(&e, start as i32, pos, &body);
+                            return e.goto_pos((start + caret) as i32);
+                        }
+                    }
+                    WXK_F9 if !cmd && !alt && !shift => return w.run_statement(),
+                    WXK_UP | WXK_DOWN if cmd && !alt => return w.history_step(code == WXK_UP, shift),
+                    c if c == '\'' as i32 && alt && !cmd => return w.toggle_case(),
+                    c if c == 'C' as i32 && alt && shift && !cmd => return crate::editor::toggle_block_comment(w.editor),
+                    _ => {}
                 }
             }
             e.skip(true);
@@ -340,6 +380,44 @@ impl Worksheet {
             e.set_target_end(b);
             e.replace_target(&out);
         }
+    }
+
+    /// Edit ▸ Format to Clipboard: the editor text stays as it is.
+    pub fn format_to_clipboard(&self) {
+        let e = self.editor;
+        let sel = e.get_selected_text();
+        let part = if sel.trim().is_empty() { e.get_text() } else { sel };
+        Clipboard::get().set_text(&rsqldev_core::format::script(&part, self.kind()));
+        crate::app().status(0, "Formatted SQL copied to the clipboard");
+    }
+
+    /// Shift+F4: the columns of the table / view named under the caret, in a popup.
+    pub fn describe_at_caret(&self) {
+        let ident = ident_at(&self.editor.get_text(), self.editor.get_current_pos() as usize);
+        if ident.is_empty() {
+            return;
+        }
+        let db = self.kind();
+        let (owner, name) = match ident.rsplit_once('.') {
+            Some((o, n)) => (dialect::fold(db, o.rsplit('.').next().unwrap_or(o)), dialect::fold(db, n)),
+            None => (self.conn().borrow().schema.clone(), dialect::fold(db, &ident)),
+        };
+        let Some(sql) = dialect::describe_sql(db, &owner, &name) else { return };
+        let panel = self.panel;
+        Conn::meta_query(&self.conn(), &sql, move |r| match r {
+            Ok(r) if r.rows.is_empty() => crate::ui::info(&panel, &format!("{ident}: no table or view with columns found.")),
+            Ok(r) => {
+                let text = script::format_table(&r.cols, &r.rows, &script::Settings { feedback: false, ..Default::default() });
+                let dlg = Dialog::builder(&panel, &format!("Describe {owner}.{name}")).with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(760, 420).build();
+                let view = editor::sql_view(&dlg, &text);
+                let s = BoxSizer::builder(Orientation::Vertical).build();
+                s.add(&view, 1, SizerFlag::Expand | SizerFlag::All, 6);
+                dlg.set_sizer(s, true);
+                dlg.show_modal();
+                dlg.destroy();
+            }
+            Err(e) => crate::ui::error(&panel, &e),
+        });
     }
 
     pub fn conn(&self) -> ConnRef {
@@ -418,13 +496,20 @@ impl Worksheet {
     fn substitute(&self, sql: &str) -> Option<String> {
         let p = self.panel;
         let sql = self.defines.borrow_mut().substitute(sql, &mut |name| crate::ui::ask(&p, &format!("Enter value for {name}:"), "Enter Substitution Variable", ""))?;
-        let mut last = self.binds.borrow_mut();
-        script::bind_literals(&sql, &mut |name| {
+        let app = crate::app();
+        let mut changed = false;
+        let out = script::bind_literals(&sql, &mut |name| {
             let key = name.to_uppercase();
-            let v = crate::ui::ask(&p, &format!("Value for :{name} (empty = NULL):"), "Enter Binds", last.get(&key).map_or("", String::as_str))?;
-            last.insert(key, v.clone());
+            let cur = app.binds.borrow().get(&key).cloned().unwrap_or_default();
+            let v = crate::ui::ask(&p, &format!("Value for :{name} (empty = NULL):"), "Enter Binds", &cur)?;
+            changed |= v != cur;
+            app.binds.borrow_mut().insert(key, v.clone());
             Some(v)
-        })
+        });
+        if changed {
+            app.save_binds();
+        }
+        out
     }
 
     /// DELETE / UPDATE without WHERE: ask before it touches every row.
@@ -503,7 +588,7 @@ impl Worksheet {
         if !self.allow(&sql) {
             return;
         }
-        crate::app().add_history(&sql);
+        crate::app().add_history(&sql, &self.conn().borrow().cfg.name, false);
         let line = self.line_of(item.start);
         let sql = if item.kind == script::Kind::Block { format!("\u{1}{sql}") } else { sql };
         self.run_sql_grid(sql, line);
@@ -656,7 +741,7 @@ impl Worksheet {
         self.started.set(Some(Instant::now()));
         self.running.set(true);
         self.set_busy(true);
-        crate::app().add_history(&text);
+        crate::app().add_history(&text, &self.conn().borrow().cfg.name, true);
         self.run_items(items, 0);
     }
 
@@ -733,6 +818,17 @@ impl Worksheet {
                         Err(e) => self.out(&format!("SP2-0310: unable to open file \"{}\": {e}", p.display())),
                     }
                 }
+                Action::Exit(tx) => return self.stop_script("EXIT", tx, items, Box::new(next)),
+                Action::Autocommit(on) => {
+                    self.conn().borrow_mut().prefs.autocommit = on;
+                    let me = self.weak();
+                    return Conn::tx(&self.conn(), Cmd::Autocommit(on), move |r| {
+                        if let Some(me) = me.upgrade() {
+                            me.out(&r.map(str::to_string).unwrap_or_else(|e| e));
+                        }
+                        next(items)
+                    });
+                }
                 Action::Unsupported(t) => self.out(&format!("Command skipped (not supported): {t}")),
             }
             return next(items);
@@ -753,14 +849,20 @@ impl Worksheet {
         *self.last.borrow_mut() = Some(sql.clone());
         let me = self.weak();
         let line = self.line_of(start);
+        let set = self.defines.borrow().set.clone();
+        if set.echo {
+            self.out(&format!("\n{}", sql.trim_start_matches('\u{1}')));
+        }
+        let t0 = Instant::now();
         Conn::work_query(&self.conn(), &sql.clone(), move |r| {
             let Some(me) = me.upgrade() else { return };
+            let failed = r.is_err();
             match r {
                 Ok(r) => {
-                    if r.cols.is_empty() {
+                    if !r.cols.is_empty() {
+                        me.out(&script::format_table(&r.cols, &r.rows, &set));
+                    } else if set.feedback {
                         me.out(&format!("\n{}\n", script::feedback(&sql, r.affected)));
-                    } else {
-                        me.out(&script::format_table(&r.cols, &r.rows));
                     }
                     me.dbms_lines(&r.output);
                 }
@@ -769,7 +871,32 @@ impl Worksheet {
                     me.mark_errors(line, &e);
                 }
             }
-            next(items);
+            if set.timing {
+                let ms = t0.elapsed().as_millis();
+                me.out(&format!("Elapsed: {:02}:{:02}:{:02}.{:03}", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000));
+            }
+            match set.on_error {
+                Some(tx) if failed => me.stop_script("WHENEVER SQLERROR EXIT", tx, items, next),
+                _ => next(items),
+            }
+        });
+    }
+
+    /// EXIT / WHENEVER SQLERROR EXIT: the rest of the script is skipped; commit or roll back
+    /// first when the command says so.
+    fn stop_script(&self, why: &str, tx: Option<bool>, items: Vec<Item>, next: Box<dyn FnOnce(Vec<Item>)>) {
+        self.running.set(false);
+        let msg = format!("\nScript stopped ({why}).");
+        let Some(commit) = tx else {
+            self.out(&msg);
+            return next(items);
+        };
+        let me = self.weak();
+        Conn::tx(&self.conn(), if commit { Cmd::Commit } else { Cmd::Rollback }, move |r| {
+            if let Some(me) = me.upgrade() {
+                me.out(&format!("{msg} {}", r.map(str::to_string).unwrap_or_else(|e| e)));
+            }
+            next(items)
         });
     }
 
@@ -787,8 +914,20 @@ impl Worksheet {
     }
 
     pub fn explain_plan(&self) {
+        self.explain_with(false)
+    }
+
+    /// Run ▸ Explain Plan (DBMS_XPLAN), Oracle: the formatted text plan.
+    pub fn explain_xplan(&self) {
+        if self.kind() != Kind::Oracle {
+            return crate::ui::info(&self.panel, "DBMS_XPLAN is Oracle's; use Explain Plan (F10).");
+        }
+        self.explain_with(true)
+    }
+
+    fn explain_with(&self, xplan: bool) {
         let Some(sql) = self.current_sql() else { return };
-        let ex = dialect::explain(self.kind(), &sql);
+        let ex = if xplan { dialect::explain_xplan(&sql) } else { dialect::explain(self.kind(), &sql) };
         self.bottom.set_selection(P_EXPLAIN);
         self.explain.reset();
         self.set_busy(true);
@@ -804,23 +943,31 @@ impl Worksheet {
         let sel = self.editor.get_selected_text();
         let guess = if sel.trim().is_empty() { ident_at(&self.editor.get_text(), self.editor.get_current_pos() as usize) } else { sel.trim().to_string() };
         let Some(name) = crate::ui::ask(&self.panel, "Procedure or function ([owner.][package.]name):", "Run PL/SQL", &guess).filter(|n| !n.trim().is_empty()) else { return };
-        let c = self.conn();
-        let c2 = c.clone();
-        Conn::meta_query(&c, &dialect::plsql_args_sql(name.trim()), move |r| {
-            let app = crate::app();
-            match r.map(|r| dialect::plsql_block(&r.rows)) {
-                Ok(Some(block)) => {
-                    app.open_worksheet(c2);
-                    if let Some(ws) = app.current_sheet() {
-                        ws.editor.set_text(&block);
-                    }
-                }
-                Ok(None) => crate::ui::info(&app.frame, &format!("No procedure or function {} visible to this user.", name.trim())),
-                Err(e) => crate::ui::error(&app.frame, &e),
-            }
-        });
+        run_plsql_on(self.conn(), &name);
     }
+}
 
+/// Run PL/SQL: a worksheet with an anonymous block calling `name` ([owner.][package.]name),
+/// one variable per argument (Run ▸ Run PL/SQL, and Run… on a tree node).
+pub fn run_plsql_on(c: ConnRef, name: &str) {
+    let name = name.to_string();
+    let c2 = c.clone();
+    Conn::meta_query(&c, &dialect::plsql_args_sql(name.trim()), move |r| {
+        let app = crate::app();
+        match r.map(|r| dialect::plsql_block(&r.rows)) {
+            Ok(Some(block)) => {
+                app.open_worksheet(c2);
+                if let Some(ws) = app.current_sheet() {
+                    ws.editor.set_text(&block);
+                }
+            }
+            Ok(None) => crate::ui::info(&app.frame, &format!("No procedure or function {} visible to this user.", name.trim())),
+            Err(e) => crate::ui::error(&app.frame, &e),
+        }
+    });
+}
+
+impl Worksheet {
     /// Run the query and show the plan with actual rows / time (Oracle ALLSTATS LAST,
     /// EXPLAIN ANALYZE elsewhere) in the Explain Plan pane.
     pub fn autotrace(&self) {
@@ -886,6 +1033,9 @@ impl Worksheet {
     }
 
     pub fn cancel(&self) {
+        if self.results.cancel_export() {
+            return self.status.set_label("Export cancelled");
+        }
         self.running.set(false);
         self.set_busy(false);
         self.conn().borrow().cancel();
@@ -896,21 +1046,107 @@ impl Worksheet {
         self.editor.clear_all();
     }
 
+    /// Run ▸ SQL History (F8): newest first, filtered as you type; Append inserts at the caret
+    /// (also double-click), Replace swaps the worksheet text (one undo step).
     pub fn history(&self) {
-        let h = crate::app().history();
+        const APPEND: i32 = 1;
+        const REPLACE: i32 = 2;
+        const CLEAR: i32 = 3;
+        let mut h = crate::app().history();
         if h.is_empty() {
             return crate::ui::info(&self.panel, "SQL History is empty: statements you run are listed here.");
         }
-        let labels: Vec<String> = h.iter().rev().map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(120).collect()).collect();
-        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        let d = SingleChoiceDialog::builder(&self.panel, "Select a statement to insert:", "SQL History", &refs).build();
-        if d.show_modal() == ID_OK {
-            let i = d.get_selection();
-            if i >= 0 {
-                let sql = &h[h.len() - 1 - i as usize];
-                self.editor.insert_text(self.editor.get_current_pos(), &format!("{sql}\n"));
-            }
+        h.reverse();
+        let h = Rc::new(h);
+        let dlg = Dialog::builder(&self.panel, "SQL History").with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(960, 520).build();
+        let filter = TextCtrl::builder(&dlg).build();
+        let list = ListCtrl::builder(&dlg).with_style(ListCtrlStyle::Report | ListCtrlStyle::SingleSel).build();
+        for (i, (t, w)) in [("SQL", 560), ("Connection", 140), ("Type", 70), ("Executed", 150)].into_iter().enumerate() {
+            list.insert_column(i as i64, t, ListColumnFormat::Left, w);
         }
+        let shown: Rc<RefCell<Vec<usize>>> = Rc::default();
+        let fill = {
+            let (h, shown) = (h.clone(), shown.clone());
+            move |pat: &str| {
+                let pat = pat.trim().to_lowercase();
+                list.delete_all_items();
+                let mut s = shown.borrow_mut();
+                s.clear();
+                for (i, e) in h.iter().enumerate().filter(|(_, e)| pat.is_empty() || e.sql.to_lowercase().contains(&pat) || e.conn.to_lowercase().contains(&pat)) {
+                    let row = s.len() as i64;
+                    let one: String = e.sql.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
+                    list.insert_item(row, &one, None);
+                    list.set_item_text_by_column(row, 1, &e.conn);
+                    list.set_item_text_by_column(row, 2, if e.script { "Script" } else { "Statement" });
+                    let when = chrono::DateTime::from_timestamp(e.at, 0).filter(|_| e.at > 0).map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
+                    list.set_item_text_by_column(row, 3, &when);
+                    s.push(i);
+                }
+            }
+        };
+        fill("");
+        let f2 = fill.clone();
+        filter.on_text_changed(move |_| f2(&filter.get_value()));
+        list.on_item_activated(move |_| dlg.end_modal(APPEND));
+        let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+        for (label, code) in [("Append", APPEND), ("Replace", REPLACE), ("Clear History…", CLEAR), ("Close", ID_CANCEL)] {
+            let b = Button::builder(&dlg).with_label(label).build();
+            b.on_click(move |_| dlg.end_modal(code));
+            buttons.add(&b, 0, SizerFlag::All, 4);
+        }
+        let top = BoxSizer::builder(Orientation::Horizontal).build();
+        top.add(&StaticText::builder(&dlg).with_label("Filter:").build(), 0, SizerFlag::AlignCenterVertical | SizerFlag::Right, 6);
+        top.add(&filter, 1, SizerFlag::Expand, 0);
+        let s = BoxSizer::builder(Orientation::Vertical).build();
+        s.add_sizer(&top, 0, SizerFlag::Expand | SizerFlag::All, 8);
+        s.add(&list, 1, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
+        s.add_sizer(&buttons, 0, SizerFlag::AlignRight | SizerFlag::All, 6);
+        dlg.set_sizer(s, true);
+        if list.get_item_count() > 0 {
+            list.set_item_state(0, ListItemState::Selected | ListItemState::Focused, ListItemState::Selected | ListItemState::Focused);
+        }
+        filter.set_focus();
+        let code = dlg.show_modal();
+        let sel = list.get_first_selected_item();
+        let picked = (sel >= 0).then(|| shown.borrow().get(sel as usize).map(|i| h[*i].sql.clone())).flatten();
+        dlg.destroy();
+        let e = self.editor;
+        match (code, picked) {
+            (CLEAR, _) => {
+                if crate::ui::confirm(&self.panel, "Clear the whole SQL History?") {
+                    crate::app().clear_history();
+                }
+            }
+            (APPEND, Some(sql)) => e.insert_text(e.get_current_pos(), &format!("{sql}\n")),
+            (REPLACE, Some(sql)) => crate::editor::replace(&e, 0, e.get_length(), &sql),
+            _ => {}
+        }
+    }
+
+    /// Ctrl/Cmd+Up / Down: replace the worksheet text with the previous (older) / next statement
+    /// of SQL History; with `append` it goes below the text instead. One undo step each.
+    fn history_step(&self, older: bool, append: bool) {
+        let h = crate::app().history();
+        if h.is_empty() {
+            return;
+        }
+        let at = match (self.hist_at.get(), older) {
+            (None, true) => 0,
+            (None, false) => return,
+            (Some(i), true) => (i + 1).min(h.len() - 1),
+            (Some(i), false) => i.saturating_sub(1),
+        };
+        self.hist_at.set(Some(at));
+        let sql = h[h.len() - 1 - at].sql.trim_end();
+        let e = self.editor;
+        let len = e.get_length();
+        if append {
+            let sep = if len == 0 || e.get_text().ends_with('\n') { "" } else { "\n" };
+            crate::editor::replace(&e, len, len, &format!("{sep}{sql}\n"));
+        } else {
+            crate::editor::replace(&e, 0, len, sql);
+        }
+        e.goto_pos(e.get_length());
     }
 
     /// (fetched rows, all fetched, script output) for the self-test.
@@ -919,10 +1155,64 @@ impl Worksheet {
         (st.rows.len(), st.done, self.script_out.get_text())
     }
 
+    /// Pin: the fetched rows of the Query Result copied into a tab of their own (closable), so
+    /// the next run does not replace them.
+    fn pin_result(&self) {
+        let (cols, rows) = {
+            let st = self.results.st.borrow();
+            if st.cols.is_empty() {
+                return;
+            }
+            let h = st.hidden;
+            (st.cols[h..].to_vec(), st.rows.iter().filter(|r| !r.deleted).map(|r| r.cur[h..].to_vec()).collect::<Vec<_>>())
+        };
+        let label: String = self.last.borrow().as_deref().unwrap_or("").trim_start_matches('\u{1}').split_whitespace().collect::<Vec<_>>().join(" ").chars().take(28).collect();
+        let (p, s, btns, note) = pane(&self.bottom, &[("clear", "Close this pinned result"), ("export", "Export…")]);
+        let g = ResultGrid::new(&p);
+        g.st.borrow_mut().db = Some(self.kind());
+        s.add(&g.grid, 1, SizerFlag::Expand, 0);
+        p.set_sizer(s, true);
+        note.set_label(&format!("{} rows, pinned {}", rows.len(), chrono::Local::now().format("%H:%M:%S")));
+        g.set(cols, rows);
+        self.bottom.add_page(&p, &format!("Pinned: {label}"), true);
+        let bottom = self.bottom;
+        btns[0].on_click(move |_| {
+            let i = bottom.get_page_index(&p);
+            if i >= 0 {
+                bottom.delete_page(i as usize);
+            }
+        });
+        let g2 = g.clone();
+        btns[1].on_click(move |_| g2.export_dialog());
+    }
+
+    /// Show SQL: the statement whose result the Query Result holds.
+    fn show_sql(&self) {
+        let Some(sql) = self.last.borrow().clone() else { return };
+        let dlg = Dialog::builder(&self.panel, "SQL").with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(640, 320).build();
+        let view = editor::sql_view(&dlg, sql.trim_start_matches('\u{1}'));
+        let s = BoxSizer::builder(Orientation::Vertical).build();
+        s.add(&view, 1, SizerFlag::Expand | SizerFlag::All, 6);
+        dlg.set_sizer(s, true);
+        dlg.show_modal();
+        dlg.destroy();
+    }
+
+    /// The connection's colour above the toolbar, or nothing.
+    pub fn paint_strip(&self) {
+        let rgb = rsqldev_core::config::conn_colour(&self.conn().borrow().cfg.color);
+        if let Some(rgb) = rgb {
+            self.strip.set_background_color(crate::theme::c(rgb));
+        }
+        self.strip.show(rgb.is_some());
+        self.panel.layout();
+    }
+
     pub fn open_file(&self, p: PathBuf) -> std::io::Result<()> {
         let s = std::fs::read_to_string(&p)?;
         self.editor.set_text(&s);
         self.editor.empty_undo_buffer();
+        crate::app().note_recent(&p);
         *self.path.borrow_mut() = Some(p);
         Ok(())
     }
@@ -949,6 +1239,7 @@ impl Worksheet {
         match std::fs::write(&path, self.editor.get_text()) {
             Ok(()) => {
                 self.editor.set_save_point();
+                crate::app().note_recent(&path);
                 self.status.set_label(&format!("Saved {}", path.display()));
                 *self.path.borrow_mut() = Some(path);
             }

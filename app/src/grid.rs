@@ -10,7 +10,18 @@ use std::rc::Rc;
 use std::sync::mpsc::TryRecvError;
 use wxdragon::prelude::*;
 
-pub const NULL_TEXT: &str = "(null)";
+thread_local! {
+    static NULL_TEXT: std::cell::RefCell<String> = std::cell::RefCell::new("(null)".into());
+}
+
+/// Text shown for NULL in result grids (Preferences ▸ Display NULL as).
+pub fn null_text() -> String {
+    NULL_TEXT.with(|t| t.borrow().clone())
+}
+
+pub fn set_null_text(s: &str) {
+    NULL_TEXT.with(|t| *t.borrow_mut() = s.to_string());
+}
 
 #[derive(Clone, Default)]
 pub struct Row {
@@ -54,6 +65,69 @@ impl Row {
     }
 }
 
+/// A column filter: text the value contains (lower case), or exact values (None = NULL).
+#[derive(Clone)]
+enum ColFilter {
+    Contains(String),
+    In(Vec<Option<String>>),
+}
+
+impl ColFilter {
+    fn ok(&self, v: Option<&str>) -> bool {
+        match self {
+            ColFilter::Contains(t) => v.is_some_and(|v| rsqldev_core::lob::display(v).to_lowercase().contains(t)),
+            ColFilter::In(set) => set.iter().any(|s| s.as_deref() == v),
+        }
+    }
+}
+
+/// Filter Column…: a "contains" text, or ticked distinct values of the fetched rows (as SQL
+/// Developer). Outer None = cancelled, inner None = no filter on this column.
+fn filter_dialog(parent: &Grid, name: &str, values: &[Option<String>], more: bool, cur: Option<&ColFilter>) -> Option<Option<ColFilter>> {
+    let dlg = Dialog::builder(parent, &format!("Filter Column {name}")).with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(420, 480).build();
+    let text = TextCtrl::builder(&dlg).build();
+    let label = |v: &Option<String>| v.as_deref().map_or_else(null_text, |s| rsqldev_core::lob::display(s).chars().take(200).collect());
+    let list = CheckListBox::builder(&dlg).with_choices(values.iter().map(label).collect()).build();
+    match cur {
+        Some(ColFilter::Contains(t)) => text.set_value(t),
+        Some(ColFilter::In(set)) => {
+            for (i, v) in values.iter().enumerate() {
+                list.check(i as u32, set.contains(v));
+            }
+        }
+        None => {}
+    }
+    let s = BoxSizer::builder(Orientation::Vertical).build();
+    s.add(&StaticText::builder(&dlg).with_label("Rows whose value contains:").build(), 0, SizerFlag::Left | SizerFlag::Top | SizerFlag::Right, 10);
+    s.add(&text, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    let hint = if more { "or exactly one of (first 1000 distinct values of the fetched rows):" } else { "or exactly one of (values of the fetched rows):" };
+    s.add(&StaticText::builder(&dlg).with_label(hint).build(), 0, SizerFlag::Left | SizerFlag::Right, 10);
+    s.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    let bs = BoxSizer::builder(Orientation::Horizontal).build();
+    let clear = Button::builder(&dlg).with_label("Clear").build();
+    clear.on_click(move |_| dlg.end_modal(ID_NO));
+    bs.add(&clear, 0, SizerFlag::All, 4);
+    bs.add_stretch_spacer(1);
+    for (l, id) in [("Cancel", ID_CANCEL), ("OK", ID_OK)] {
+        let b = Button::builder(&dlg).with_label(l).with_id(id).build();
+        b.on_click(move |_| dlg.end_modal(id));
+        bs.add(&b, 0, SizerFlag::All, 4);
+    }
+    s.add_sizer(&bs, 0, SizerFlag::Expand | SizerFlag::All, 6);
+    dlg.set_sizer(s, true);
+    text.set_focus();
+    let code = dlg.show_modal();
+    let ticked: Vec<Option<String>> = (0..values.len()).filter(|i| list.is_checked(*i as u32)).map(|i| values[i].clone()).collect();
+    let t = text.get_value().trim().to_lowercase();
+    dlg.destroy();
+    match code {
+        ID_OK if !ticked.is_empty() => Some(Some(ColFilter::In(ticked))),
+        ID_OK if !t.is_empty() => Some(Some(ColFilter::Contains(t))),
+        ID_OK | ID_NO => Some(None),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 pub struct State {
     pub cols: Vec<Column>,
@@ -69,8 +143,10 @@ pub struct State {
     pub on_change: Option<Rc<dyn Fn(&State)>>,
     /// Export target table name and dialect for INSERT export.
     pub db: Option<Kind>,
-    /// Column filters (column, lowercase text): rows not containing the text are hidden.
-    filters: Vec<(usize, String)>,
+    /// Column filters: rows a filter rejects are hidden.
+    filters: Vec<(usize, ColFilter)>,
+    /// The export streaming the rest of the cursor to a file: 0 running, 1 cancel asked, 2 done.
+    export_cancel: Option<Rc<std::cell::Cell<u8>>>,
     /// Last "Find in Results" text, for Find Next.
     find: String,
     /// Count every row of the result on the server (set by the worksheet / data tab).
@@ -132,6 +208,8 @@ const ID_REVERT: i32 = 7025;
 const ID_PASTE: i32 = 7026;
 const ID_RECORD: i32 = 7027;
 const ID_SORT_DLG: i32 = 7028;
+const ID_COPY_HEADS: i32 = 7029;
+const ID_EXPORT_DLG: i32 = 7030;
 
 impl ResultGrid {
     pub fn new(parent: &dyn WxWidget) -> ResultGrid {
@@ -541,6 +619,7 @@ impl ResultGrid {
         // (null) placeholder, ≥ 4.5:1 in both palettes (see theme tests).
         let (grey, text, bg) = (crate::theme::c(p.null), crate::theme::c(p.text), crate::theme::c(p.bg));
         let row = &st.rows[ri];
+        let null = null_text();
         for (ci, v) in row.cur.iter().enumerate() {
             let (r, c) = (ri as i32, ci as i32);
             match v {
@@ -551,7 +630,7 @@ impl ResultGrid {
                     }
                 }
                 None => {
-                    g.set_cell_value(r, c, NULL_TEXT);
+                    g.set_cell_value(r, c, &null);
                     g.set_cell_text_colour(r, c, &grey);
                 }
             }
@@ -609,7 +688,7 @@ impl ResultGrid {
         st.edited = true;
         let Some(row) = st.rows.get_mut(r as usize) else { return };
         row.edit();
-        row.cur[c as usize] = if v.is_empty() || v == NULL_TEXT { None } else { Some(v) };
+        row.cur[c as usize] = if v.is_empty() || *v == null_text() { None } else { Some(v) };
         row.blobs.remove(&(c as usize));
         Self::mark_row(self.grid, &st, r as usize);
         drop(st);
@@ -806,7 +885,7 @@ impl ResultGrid {
                     continue;
                 }
                 self.st.borrow_mut().rows[r].blobs.remove(&c);
-                self.put(r, c, if v.is_empty() || v == NULL_TEXT { None } else { Some(v.clone()) });
+                self.put(r, c, if v.is_empty() || *v == null_text() { None } else { Some(v.clone()) });
                 done += 1;
             }
         }
@@ -929,6 +1008,7 @@ impl ResultGrid {
             .append_separator()
             .append_item(ID_COPY, "Copy", "Copy selected cells")
             .append_item(ID_COPY_HDR, "Copy with Headers", "Copy selected cells with column names")
+            .append_item(ID_COPY_HEADS, "Copy Selected Column Header(s)", "The names of the selected columns, tab separated")
             .append_item(ID_COPY_CSV, "Copy as CSV", "")
             .append_item(ID_COPY_MD, "Copy as Markdown", "")
             .append_item(ID_COPY_IN, "Copy as IN List", "Distinct values of the first selected column: (a, b, c)")
@@ -951,6 +1031,7 @@ impl ResultGrid {
         }
         let mut m = b
             .append_item(ID_FETCH_ALL, "Fetch All Rows", "Fetch every remaining row")
+            .append_item(ID_EXPORT_DLG, "Export…", "Format, header, delimiter, selected rows only, to a file or the clipboard")
             .append_item(ID_CSV, "Export CSV…", "")
             .append_item(ID_XLSX, "Export Excel…", "")
             .append_item(ID_JSON, "Export JSON…", "")
@@ -1049,7 +1130,7 @@ impl ResultGrid {
         row.edit();
         row.cur[c] = v.clone();
         let p = crate::theme::p();
-        self.grid.set_cell_value(r as i32, c as i32, v.as_deref().unwrap_or(NULL_TEXT));
+        self.grid.set_cell_value(r as i32, c as i32, v.as_deref().unwrap_or(&null_text()));
         self.grid.set_cell_text_colour(r as i32, c as i32, &crate::theme::c(if v.is_some() { p.text } else { p.null }));
         Self::mark_row(self.grid, &st, r);
     }
@@ -1142,22 +1223,30 @@ impl ResultGrid {
             return;
         }
         let has = !self.st.borrow().filters.is_empty();
-        let mut b = Menu::builder().append_item(ID_FILTER, "Filter Column…", "Show only rows whose value contains a text").append_item(SORT, "Sort", "");
+        let mut b = Menu::builder().append_item(ID_FILTER, "Filter Column…", "Show only rows whose value contains a text or is one of the ticked values").append_item(SORT, "Sort", "");
         if has {
-            b = b.append_item(ID_CLEAR_FILTERS, "Clear Filters", "");
+            b = b.append_item(ID_CLEAR_FILTERS, "Remove All Filters", "");
         }
         let mut m = b.build();
         let me = self.clone();
         m.on_selected(move |e| match e.get_id() {
             ID_FILTER => {
-                let name = me.st.borrow().cols[col].name.clone();
-                let cur = me.st.borrow().filters.iter().find(|f| f.0 == col).map(|f| f.1.clone()).unwrap_or_default();
-                if let Some(t) = crate::ui::ask(&me.grid, &format!("Show rows where {name} contains (empty = no filter):"), "Filter Column", &cur) {
+                let (name, cur, values, more) = {
+                    let st = me.st.borrow();
+                    let mut seen = std::collections::BTreeSet::new();
+                    for r in st.rows.iter().filter(|r| !r.new) {
+                        seen.insert(r.cur[col].clone());
+                        if seen.len() > 1000 {
+                            break;
+                        }
+                    }
+                    let more = seen.len() > 1000;
+                    (st.cols[col].name.clone(), st.filters.iter().find(|f| f.0 == col).map(|f| f.1.clone()), seen.into_iter().take(1000).collect::<Vec<_>>(), more)
+                };
+                if let Some(f) = filter_dialog(&me.grid, &name, &values, more, cur.as_ref()) {
                     let mut st = me.st.borrow_mut();
                     st.filters.retain(|f| f.0 != col);
-                    if !t.is_empty() {
-                        st.filters.push((col, t.to_lowercase()));
-                    }
+                    st.filters.extend(f.map(|f| (col, f)));
                     drop(st);
                     me.apply_filters(0);
                 }
@@ -1181,7 +1270,7 @@ impl ResultGrid {
         g.begin_batch();
         let mut shown = if from == 0 { 0 } else { st.shown };
         for (r, row) in st.rows.iter().enumerate().skip(from) {
-            let ok = row.new || st.filters.iter().all(|(c, t)| row.cur[*c].as_deref().is_some_and(|v| rsqldev_core::lob::display(v).to_lowercase().contains(t)));
+            let ok = row.new || st.filters.iter().all(|(c, f)| f.ok(row.cur[*c].as_deref()));
             if ok {
                 g.show_row(r as i32);
                 shown += 1;
@@ -1198,7 +1287,23 @@ impl ResultGrid {
 
     /// Stream the result to a file: rows already in the grid first, then the rest of the open
     /// cursor straight into the file (never into the grid), so memory stays flat.
-    fn export_to(&self, fmt: export::Format, path: std::path::PathBuf) {
+    /// `only`: these rows (selected rows) instead of the whole result.
+    fn export_to(&self, fmt: export::Format, path: std::path::PathBuf, opts: &export::Options, only: Option<Vec<Vec<Cell>>>) {
+        if let Some(rows) = only {
+            let (cols, _) = self.selection(true);
+            let db = self.st.borrow().db.unwrap_or(Kind::Oracle);
+            let res = export::Export::create_with(&path, fmt, &cols, db, opts).and_then(|mut x| {
+                x.rows(&rows)?;
+                x.finish()
+            });
+            return match res {
+                Ok(n) => crate::app().status(0, &format!("Exported {n} rows to {}", path.display())),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    crate::ui::error(&self.grid, &format!("Export failed: {e:#}"))
+                }
+            };
+        }
         let (vis, cols, hidden, db, rx) = {
             let mut st = self.st.borrow_mut();
             let vis: Vec<usize> = (st.hidden..st.cols.len()).collect();
@@ -1213,7 +1318,7 @@ impl ResultGrid {
             crate::ui::error(grid, &format!("Export failed: {e:#}"));
         };
         // Rows already in the grid, written 1,000 at a time (no copy of the whole result).
-        let written = export::Export::create(&path, fmt, &cols, db, "EXPORT_TABLE").and_then(|mut x| {
+        let written = export::Export::create_with(&path, fmt, &cols, db, opts).and_then(|mut x| {
             let st = self.st.borrow();
             let mut buf: Vec<Vec<Cell>> = Vec::with_capacity(1000);
             for r in st.rows.iter().filter(|r| !r.deleted) {
@@ -1237,7 +1342,17 @@ impl ResultGrid {
         };
         let Some(rx) = rx else { return done(ex, &path) };
         let mut ex = Some(ex);
+        let cancel = Rc::new(std::cell::Cell::new(0u8));
+        self.st.borrow_mut().export_cancel = Some(cancel.clone());
         crate::hub::every_tick(move || {
+            if cancel.get() == 1 {
+                // Dropping the receiver stops the fetch; the partial file goes.
+                rx.borrow_mut().take();
+                drop(ex.take());
+                let _ = std::fs::remove_file(&path);
+                crate::app().status(0, "Export cancelled");
+                return false;
+            }
             let r = rx.borrow();
             // Bounded per tick so the UI stays responsive while a big result drains.
             for _ in 0..20 {
@@ -1253,14 +1368,16 @@ impl ResultGrid {
                         // Streamed rows never reach the grid: free their spilled LOB files now.
                         b.iter().flatten().flatten().for_each(|v| rsqldev_core::lob::release(v));
                         if let Err(e) = res {
+                            cancel.set(2);
                             fail(&grid, &path, e);
                             return false;
                         }
-                        crate::app().status(0, &format!("Exporting… {} rows", x.count()));
+                        crate::app().status(0, &format!("Exporting… {} rows (Run ▸ Cancel stops)", x.count()));
                     }
                     Ok(Event::Columns(_)) => {}
                     Err(TryRecvError::Empty) => return true,
                     Ok(Event::Rows(_)) | Err(TryRecvError::Disconnected) => {
+                        cancel.set(2);
                         done(ex.take().unwrap(), &path);
                         return false;
                     }
@@ -1270,16 +1387,97 @@ impl ResultGrid {
         });
     }
 
+    /// Stop a running export (Run ▸ Cancel). True when one was running.
+    pub fn cancel_export(&self) -> bool {
+        match self.st.borrow_mut().export_cancel.take() {
+            Some(c) if c.get() == 0 => {
+                c.set(1);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Export… button: pick a format, then save.
+    /// Rows touched by the selection (every visible column), else the cursor row.
+    fn selected_rows(&self) -> Vec<Vec<Cell>> {
+        let st = self.st.borrow();
+        let mut idx: Vec<usize> = self.grid.get_selected_blocks().iter().flat_map(|b| b.top_row.max(0) as usize..=b.bottom_row.max(0) as usize).collect();
+        if idx.is_empty() && self.grid.get_grid_cursor_row() >= 0 {
+            idx.push(self.grid.get_grid_cursor_row() as usize);
+        }
+        idx.sort_unstable();
+        idx.dedup();
+        idx.iter().filter_map(|r| st.rows.get(*r)).filter(|r| !r.deleted).map(|r| r.cur[st.hidden..].to_vec()).collect()
+    }
+
+    /// Export…: format, header, delimiter, INSERT table name, all or selected rows, to a file
+    /// (the whole result streams) or the clipboard (fetched rows).
     pub fn export_dialog(&self) {
-        let d = SingleChoiceDialog::builder(&self.grid, "Format:", "Export", &["CSV", "Excel (xlsx)", "JSON", "INSERT statements"]).build();
+        use export::Format::*;
+        const FORMATS: [(&str, export::Format, &str); 6] = [("CSV / delimited", Csv, "csv"), ("Excel (xlsx)", Xlsx, "xlsx"), ("JSON", Json, "json"), ("INSERT statements", Inserts, "sql"), ("HTML", Html, "html"), ("XML", Xml, "xml")];
+        const DELIMS: [(&str, char); 4] = [(", (comma)", ','), ("; (semicolon)", ';'), ("Tab", '\t'), ("| (pipe)", '|')];
+        let dlg = Dialog::builder(&self.grid, "Export").with_style(DialogStyle::DefaultDialogStyle).with_size(420, 380).build();
+        let fmt = Choice::builder(&dlg).with_choices(FORMATS.iter().map(|f| f.0.to_string()).collect()).build();
+        fmt.set_selection(0);
+        let header = CheckBox::builder(&dlg).with_label("Header row (column names)").build();
+        header.set_value(true);
+        let delim = Choice::builder(&dlg).with_choices(DELIMS.iter().map(|d| d.0.to_string()).collect()).build();
+        delim.set_selection(0);
+        let table = TextCtrl::builder(&dlg).with_value("EXPORT_TABLE").build();
+        let r_all = RadioButton::builder(&dlg).with_label("All rows").first_in_group().build();
+        let r_sel = RadioButton::builder(&dlg).with_label("Selected rows").build();
+        let o_file = RadioButton::builder(&dlg).with_label("File").first_in_group().build();
+        let o_clip = RadioButton::builder(&dlg).with_label("Clipboard (fetched rows)").build();
+        let g = FlexGridSizer::builder(0, 2).with_vgap(8).with_hgap(10).build();
+        g.add_growable_col(1, 1);
+        crate::ui::row(&dlg, &g, "Format", &fmt);
+        crate::ui::row(&dlg, &g, "", &header);
+        crate::ui::row(&dlg, &g, "Delimiter", &delim);
+        crate::ui::row(&dlg, &g, "INSERT table", &table);
+        crate::ui::row(&dlg, &g, "Rows", &r_all);
+        crate::ui::row(&dlg, &g, "", &r_sel);
+        crate::ui::row(&dlg, &g, "Save to", &o_file);
+        crate::ui::row(&dlg, &g, "", &o_clip);
+        let bs = BoxSizer::builder(Orientation::Horizontal).build();
+        bs.add_stretch_spacer(1);
+        for (l, id) in [("Cancel", ID_CANCEL), ("OK", ID_OK)] {
+            let b = Button::builder(&dlg).with_label(l).with_id(id).build();
+            b.on_click(move |_| dlg.end_modal(id));
+            bs.add(&b, 0, SizerFlag::All, 4);
+        }
+        let s = BoxSizer::builder(Orientation::Vertical).build();
+        s.add_sizer(&g, 1, SizerFlag::Expand | SizerFlag::All, 12);
+        s.add_sizer(&bs, 0, SizerFlag::Expand | SizerFlag::All, 6);
+        dlg.set_sizer(s, true);
+        let ok = dlg.show_modal() == ID_OK;
+        let (f, ext) = FORMATS.get(fmt.get_selection().unwrap_or(0) as usize).map(|f| (f.1, f.2)).unwrap_or((Csv, "csv"));
+        let opts = export::Options { header: header.get_value(), delimiter: DELIMS.get(delim.get_selection().unwrap_or(0) as usize).map_or(',', |d| d.1), table: table.get_value().trim().to_string() };
+        let (selected, clip) = (r_sel.get_value(), o_clip.get_value());
+        dlg.destroy();
+        if !ok {
+            return;
+        }
+        let only = selected.then(|| self.selected_rows());
+        if clip {
+            if f == Xlsx {
+                return crate::ui::info(&self.grid, "Excel exports go to a file.");
+            }
+            let (cols, all) = self.selection(true);
+            let rows = only.unwrap_or(all);
+            let db = self.st.borrow().db.unwrap_or(Kind::Oracle);
+            Clipboard::get().set_text(&export::text_with(f, db, &opts, &cols, &rows));
+            return crate::app().status(0, &format!("Copied {} rows to the clipboard", rows.len()));
+        }
+        let d = FileDialog::builder(&self.grid)
+            .with_message("Export")
+            .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+            .with_default_file(&format!("export.{ext}"))
+            .with_wildcard(&format!("{} (*.{ext})|*.{ext}|All files (*)|*", FORMATS.iter().find(|x| x.2 == ext).map_or("", |x| x.0)))
+            .build();
         if d.show_modal() == ID_OK {
-            match d.get_selection() {
-                0 => self.menu(ID_CSV),
-                1 => self.menu(ID_XLSX),
-                2 => self.menu(ID_JSON),
-                3 => self.menu(ID_INSERT),
-                _ => {}
+            if let Some(p) = d.get_path() {
+                self.export_to(f, std::path::PathBuf::from(p), &opts, only);
             }
         }
     }
@@ -1322,9 +1520,16 @@ impl ResultGrid {
                     f()
                 }
             }
+            ID_COPY_HEADS => {
+                let (c, _) = self.selection(false);
+                Clipboard::get().set_text(&c.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join("\t"));
+            }
+            ID_EXPORT_DLG => self.export_dialog(),
             ID_COPY | ID_COPY_HDR => {
                 let (c, r) = self.selection(false);
-                Clipboard::get().set_text(&export::tsv((id == ID_COPY_HDR).then_some(&c[..]), &r));
+                let t = export::tsv((id == ID_COPY_HDR).then_some(&c[..]), &r);
+                crate::app().remember_clip(&t);
+                Clipboard::get().set_text(&t);
             }
             ID_FETCH_ALL => self.fetch_all(|| {}),
             ID_CSV | ID_XLSX | ID_JSON | ID_INSERT => {
@@ -1350,7 +1555,7 @@ impl ResultGrid {
                     ID_JSON => export::Format::Json,
                     _ => export::Format::Inserts,
                 };
-                self.export_to(fmt, std::path::PathBuf::from(path));
+                self.export_to(fmt, std::path::PathBuf::from(path), &export::Options::default(), None);
             }
             _ => {}
         }

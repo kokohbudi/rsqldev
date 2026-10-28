@@ -14,6 +14,9 @@ pub fn open_url(url: &str) {
 }
 
 pub fn error(parent: &dyn WxWidget, msg: &str) {
+    if let Some(a) = crate::try_app() {
+        a.log_line(&format!("Error: {msg}"));
+    }
     MessageDialog::builder(parent, msg, "rsqldev").with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError).build().show_modal();
 }
 

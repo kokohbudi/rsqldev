@@ -155,6 +155,61 @@ pub fn script(db: Db, src: &Side, tgt: &Side, diffs: &[((&'static str, String), 
     out
 }
 
+// ---- Data Compare ----
+
+/// Rows of one table on both sides, matched by primary key.
+#[derive(Debug, Default, PartialEq)]
+pub struct DataDiff {
+    /// Statements bringing the target in line: INSERT (only in source), UPDATE (changed),
+    /// DELETE (only in target).
+    pub inserts: Vec<String>,
+    pub updates: Vec<String>,
+    pub deletes: Vec<String>,
+    pub same: usize,
+}
+
+/// Compare `src` and `tgt` rows (columns `src_cols` / `tgt_cols`, matched by name) of a table
+/// with primary key `pk`; statements address `target` (the qualified target table).
+pub fn data_diff(db: Db, target: &str, src_cols: &[crate::Column], tgt_cols: &[crate::Column], pk: &[String], src: &[Vec<crate::Cell>], tgt: &[Vec<crate::Cell>]) -> Result<DataDiff, String> {
+    if pk.is_empty() {
+        return Err("The table has no primary key: rows cannot be matched".into());
+    }
+    // Target values reordered to the source's column order.
+    let map: Vec<usize> = src_cols
+        .iter()
+        .map(|c| tgt_cols.iter().position(|t| t.name.eq_ignore_ascii_case(&c.name)).ok_or_else(|| format!("Column {} is missing in the target", c.name)))
+        .collect::<Result<_, _>>()?;
+    if tgt_cols.len() != src_cols.len() {
+        return Err("The target table has other columns than the source".into());
+    }
+    let key = crate::dml::Key::new(src_cols, None, pk);
+    if key.all_columns {
+        return Err("Primary key columns not found in the result".into());
+    }
+    let kv = |r: &[crate::Cell]| key.cols.iter().map(|&i| r[i].clone()).collect::<Vec<_>>();
+    let tgt: Vec<Vec<crate::Cell>> = tgt.iter().map(|r| map.iter().map(|&i| r[i].clone()).collect()).collect();
+    let by_key: BTreeMap<Vec<crate::Cell>, &Vec<crate::Cell>> = tgt.iter().map(|r| (kv(r), r)).collect();
+    let mut d = DataDiff::default();
+    let mut seen = std::collections::BTreeSet::new();
+    for r in src {
+        let k = kv(r);
+        match by_key.get(&k) {
+            None => d.inserts.push(crate::dml::insert(db, target, src_cols, None, r, &[])),
+            Some(old) => match crate::dml::update(db, target, src_cols, &key, None, old, r, &[]) {
+                Some(u) => d.updates.push(u),
+                None => d.same += 1,
+            },
+        }
+        seen.insert(k);
+    }
+    for r in &tgt {
+        if !seen.contains(&kv(r)) {
+            d.deletes.push(crate::dml::delete(db, target, src_cols, &key, r));
+        }
+    }
+    Ok(d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +259,22 @@ mod tests {
         assert!(out.lines().all(|l| l.is_empty() || l.starts_with("--")), "{out}");
         // DBMS_METADATA terminators are kept as they come.
         assert_eq!(statement(Db::Oracle, "CREATE OR REPLACE PACKAGE \"HR\".\"P\" AS\nEND;\n/\n", "HR", "QA"), "CREATE OR REPLACE PACKAGE \"QA\".\"P\" AS\nEND;\n/");
+    }
+
+    #[test]
+    fn data_compare() {
+        let col = |n: &str, num: bool| crate::Column { name: n.into(), type_name: "".into(), numeric: num };
+        let src_cols = vec![col("ID", true), col("NAME", false)];
+        let tgt_cols = vec![col("NAME", false), col("ID", true)];
+        let v = |a: &str, b: &str| vec![Some(a.to_string()), Some(b.to_string())];
+        let src = vec![v("1", "a"), v("2", "b"), v("3", "c")];
+        let tgt = vec![v("a", "1"), v("x", "2"), v("z", "9")];
+        let d = data_diff(Db::Oracle, "\"HR\".\"T\"", &src_cols, &tgt_cols, &["ID".into()], &src, &tgt).unwrap();
+        assert_eq!(d.same, 1);
+        assert_eq!(d.inserts, ["INSERT INTO \"HR\".\"T\" (\"ID\", \"NAME\") VALUES (3, 'c')"]);
+        assert_eq!(d.updates, ["UPDATE \"HR\".\"T\" SET \"NAME\" = 'b' WHERE \"ID\" = 2"]);
+        assert_eq!(d.deletes, ["DELETE FROM \"HR\".\"T\" WHERE \"ID\" = 9"]);
+        assert!(data_diff(Db::Oracle, "t", &src_cols, &tgt_cols, &[], &src, &tgt).is_err());
+        assert!(data_diff(Db::Oracle, "t", &src_cols, &[col("ID", true)], &["ID".into()], &src, &tgt).is_err());
     }
 }

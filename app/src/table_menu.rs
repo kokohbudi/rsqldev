@@ -10,6 +10,7 @@ use std::rc::Rc;
 use wxdragon::prelude::*;
 
 const T_RENAME: i32 = 7201;
+const T_STATS: i32 = 7211;
 const T_COPY: i32 = 7202;
 const T_DROP: i32 = 7203;
 const T_TRUNCATE: i32 = 7204;
@@ -66,6 +67,9 @@ pub fn append(m: &Menu, db: Kind) {
         t = t.append_item(T_PARALLEL, "Parallel…", "").append_item(T_NOPARALLEL, "No Parallel…", "").append_item(T_LOGGING, "Logging…", "");
     }
     t = t.append_separator().append_item(T_COUNT, "Count Rows…", "");
+    if ta::gather_stats(db, "o", "t").is_ok() {
+        t = t.append_item(T_STATS, "Gather Statistics…", "Refresh the optimizer statistics of the table (and its indexes)");
+    }
     m.append_separator();
     m.append_submenu(t.build(), "Table", "");
 
@@ -115,14 +119,16 @@ pub fn append(m: &Menu, db: Kind) {
     }
 }
 
-enum F {
+pub(crate) enum F {
     Text(&'static str, String),
+    /// Masked, not trimmed.
+    Password(&'static str),
     Choice(&'static str, Vec<String>),
     Check(&'static str, bool),
 }
 
 /// A small options form: one value per field (`"1"` / `""` for check boxes). None = Cancel.
-fn form(parent: &dyn WxWidget, title: &str, fields: Vec<F>) -> Option<Vec<String>> {
+pub(crate) fn form(parent: &dyn WxWidget, title: &str, fields: Vec<F>) -> Option<Vec<String>> {
     let dlg = Dialog::builder(parent, title).with_style(DialogStyle::DefaultDialogStyle).build();
     let g = FlexGridSizer::builder(0, 2).with_vgap(6).with_hgap(10).build();
     g.add_growable_col(1, 1);
@@ -134,6 +140,12 @@ fn form(parent: &dyn WxWidget, title: &str, fields: Vec<F>) -> Option<Vec<String
                 t.set_min_size(Size::new(300, -1));
                 crate::ui::row(&dlg, &g, l, &t);
                 read.push(Box::new(move || t.get_value().trim().to_string()));
+            }
+            F::Password(l) => {
+                let t = TextCtrl::builder(&dlg).with_style(TextCtrlStyle::Password).build();
+                t.set_min_size(Size::new(300, -1));
+                crate::ui::row(&dlg, &g, l, &t);
+                read.push(Box::new(move || t.get_value()));
             }
             F::Choice(l, v) => {
                 let c = Choice::builder(&dlg).with_choices(v).build();
@@ -254,6 +266,7 @@ pub fn run(id: i32, conn: ConnRef, owner: String, name: String, done: Rc<dyn Fn(
                 confirm_run(p, &conn, one(ta::logging(db, &owner, &name, v[0] == "LOGGING")), done);
             }
         }
+        T_STATS => confirm_run(p, &conn, one(ta::gather_stats(db, &owner, &name)), done),
         T_COUNT => {
             Conn::meta_query(&conn, &format!("SELECT COUNT(*) FROM {tq}"), move |r| match r {
                 Ok(r) => crate::ui::info(&frame, &format!("{shown}: {} rows", r.rows.first().and_then(|r| r[0].clone()).unwrap_or_default())),
