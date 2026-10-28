@@ -133,18 +133,27 @@ pub fn show_data(frame: &Frame) {
 /// the metadata session; Oracle DDL comes with its ; and / terminators.
 // ponytail: each table's rows are read whole before they are written; stream per batch if
 // huge tables need it (the grid's Export streams).
-pub fn show_export(frame: &Frame) {
+pub fn show_export(frame: &Frame, copy: bool) {
+    let title = if copy { "Database Copy" } else { "Database Export" };
     let names = crate::app().connection_names();
     if names.is_empty() {
         return crate::ui::info(frame, "Create a connection first.");
     }
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let d = SingleChoiceDialog::builder(frame, "Connection:", "Database Export", &refs).build();
-    if d.show_modal() != ID_OK || d.get_selection() < 0 {
-        return;
-    }
-    let conn = names[d.get_selection() as usize].clone();
-    let Some(schema) = crate::ui::ask(frame, "Schema (empty = the connection's current schema):", "Database Export", "") else { return };
+    let pick = |msg: &str| {
+        let d = SingleChoiceDialog::builder(frame, msg, title, &refs).build();
+        (d.show_modal() == ID_OK && d.get_selection() >= 0).then(|| names[d.get_selection() as usize].clone())
+    };
+    let Some(conn) = pick(if copy { "Source connection:" } else { "Connection:" }) else { return };
+    let Some(schema) = crate::ui::ask(frame, "Schema (empty = the connection's current schema):", title, "") else { return };
+    // Copy: the script goes to a worksheet on the target, the schema renamed.
+    let target = if copy {
+        let Some(t) = pick("Target connection (a worksheet with the script opens there):") else { return };
+        let Some(ts) = crate::ui::ask(frame, "Target schema (empty = the target's current schema):", title, "") else { return };
+        Some((t, ts))
+    } else {
+        None
+    };
     let frame = *frame;
     crate::app().connect(&conn, move |c| {
         let db = c.borrow().kind;
@@ -154,7 +163,7 @@ pub fn show_export(frame: &Frame) {
             .collect();
         let labels: Vec<String> = kinds.iter().map(|k| k.to_lowercase()).collect();
         let lrefs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        let md = MultiChoiceDialog::builder(&frame, "Object types to export:", "Database Export", &lrefs).build();
+        let md = MultiChoiceDialog::builder(&frame, "Object types:", title, &lrefs).build();
         md.set_selections(&(0..kinds.len() as i32).collect::<Vec<_>>());
         if md.show_modal() != ID_OK {
             return;
@@ -164,12 +173,18 @@ pub fn show_export(frame: &Frame) {
             return;
         }
         let data = picked.contains(&dialect::TABLE) && crate::ui::confirm(&frame, "Include table data (INSERT statements)?");
-        let fd = FileDialog::builder(&frame).with_message("Export to").with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt).with_default_file("export.sql").with_wildcard("SQL files (*.sql)|*.sql").build();
-        let Some(path) = (fd.show_modal() == ID_OK).then(|| fd.get_path()).flatten() else { return };
-        let file = match std::fs::File::create(&path) {
-            Ok(f) => std::rc::Rc::new(std::cell::RefCell::new(std::io::BufWriter::new(f))),
-            Err(e) => return crate::ui::error(&frame, &format!("{path}: {e}")),
+        let (sink, path) = match &target {
+            Some(_) => (Sink::Text(vec![]), String::new()),
+            None => {
+                let fd = FileDialog::builder(&frame).with_message("Export to").with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt).with_default_file("export.sql").with_wildcard("SQL files (*.sql)|*.sql").build();
+                let Some(path) = (fd.show_modal() == ID_OK).then(|| fd.get_path()).flatten() else { return };
+                match std::fs::File::create(&path) {
+                    Ok(f) => (Sink::File(std::io::BufWriter::new(f)), path),
+                    Err(e) => return crate::ui::error(&frame, &format!("{path}: {e}")),
+                }
+            }
         };
+        let file = std::rc::Rc::new(std::cell::RefCell::new(sink));
         schema_of(&c.clone(), schema, move |owner| {
             let lists: Vec<String> = picked.iter().filter_map(|k| dialect::list_sql(db, k, &owner)).collect();
             let objs: std::rc::Rc<std::cell::RefCell<Vec<(&'static str, String)>>> = Default::default();
@@ -186,7 +201,13 @@ pub fn show_export(frame: &Frame) {
                         }
                     }
                 },
-                move || export_objects(c2, owner, objs.take(), data, file, path),
+                move || match target {
+                    None => export_objects(c2, owner, objs.take(), data, file, path, None),
+                    Some((t, ts)) => crate::app().connect(&t, move |tc| {
+                        let tc2 = tc.clone();
+                        schema_of(&tc, ts, move |towner| export_objects(c2, owner, objs.take(), data, file, path, Some((tc2, towner))));
+                    }),
+                },
                 0,
             );
         });
@@ -200,9 +221,42 @@ enum Job {
     Data(String),
 }
 
-fn export_objects(c: ConnRef, owner: String, objs: Vec<(&'static str, String)>, data: bool, file: std::rc::Rc<std::cell::RefCell<std::io::BufWriter<std::fs::File>>>, path: String) {
+/// Where Database Export / Copy writes.
+enum Sink {
+    File(std::io::BufWriter<std::fs::File>),
+    Text(Vec<u8>),
+}
+
+impl std::io::Write for Sink {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Sink::File(f) => f.write(b),
+            Sink::Text(v) => v.write(b),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Sink::File(f) => f.flush(),
+            Sink::Text(_) => Ok(()),
+        }
+    }
+}
+
+/// `to`: Database Copy's target connection and schema (the source schema prefix renamed).
+fn export_objects(c: ConnRef, owner: String, objs: Vec<(&'static str, String)>, data: bool, file: std::rc::Rc<std::cell::RefCell<Sink>>, path: String, to: Option<(ConnRef, String)>) {
     use std::io::Write;
     let db = c.borrow().kind;
+    if to.as_ref().is_some_and(|t| t.0.borrow().kind != db) {
+        return crate::ui::error(&crate::app().frame, "Database Copy needs two connections to the same kind of database (the script is in the source's SQL dialect).");
+    }
+    let towner = to.as_ref().map(|t| t.1.clone()).filter(|t| *t != owner);
+    let rename = {
+        let (from, into) = (format!("{}.", dialect::quote(db, &owner)), towner.as_ref().map(|t| format!("{}.", dialect::quote(db, t))));
+        move |s: &str| match &into {
+            Some(i) => s.replace(&from, i),
+            None => s.to_string(),
+        }
+    };
     let mut jobs: Vec<String> = vec![];
     let mut what: Vec<Job> = vec![];
     if db == rsqldev_core::registry::Kind::Oracle {
@@ -217,7 +271,7 @@ fn export_objects(c: ConnRef, owner: String, objs: Vec<(&'static str, String)>, 
         // Table data right after the tables (before views, code and triggers).
         if data && *kind == dialect::TABLE {
             jobs.push(format!("SELECT * FROM {}", dialect::qualified(db, &owner, name)));
-            what.push(Job::Data(dialect::qualified(db, &owner, name)));
+            what.push(Job::Data(dialect::qualified(db, towner.as_deref().unwrap_or(&owner), name)));
         }
     }
     if db == rsqldev_core::registry::Kind::Oracle {
@@ -242,7 +296,7 @@ fn export_objects(c: ConnRef, owner: String, objs: Vec<(&'static str, String)>, 
                     let text = text.trim();
                     // Oracle brings its own terminators; others get a ; when missing.
                     let end = if oracle || text.ends_with(';') { "" } else { ";" };
-                    let _ = writeln!(f, "-- {label}\n{text}{end}\n");
+                    let _ = writeln!(f, "-- {label}\n{}{end}\n", rename(text));
                 }
                 (Job::Data(table), Ok(r)) => {
                     let opts = rsqldev_core::export::Options { table: table.clone(), ..Default::default() };
@@ -252,9 +306,18 @@ fn export_objects(c: ConnRef, owner: String, objs: Vec<(&'static str, String)>, 
         },
         move || {
             let res = file.borrow_mut().flush();
-            match res {
-                Ok(()) => crate::app().status(0, &format!("Exported {n} objects to {path}")),
-                Err(e) => crate::ui::error(&crate::app().frame, &format!("{path}: {e}")),
+            let app = crate::app();
+            match (to, res) {
+                (Some((tc, _)), _) => {
+                    let Sink::Text(v) = &*file.borrow() else { return };
+                    app.open_worksheet(tc);
+                    if let Some(ws) = app.current_sheet() {
+                        ws.editor.set_text(&String::from_utf8_lossy(v));
+                    }
+                    app.status(0, &format!("Database Copy: {n} objects scripted; review, then Run Script (F5)"));
+                }
+                (None, Ok(())) => app.status(0, &format!("Exported {n} objects to {path}")),
+                (None, Err(e)) => crate::ui::error(&app.frame, &format!("{path}: {e}")),
             }
         },
         0,
