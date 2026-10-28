@@ -908,6 +908,13 @@ pub fn explain(db: Db, sql: &str) -> Explain {
     }
 }
 
+/// Explain Plan (DBMS_XPLAN), Oracle: the formatted plan with predicates and notes.
+pub fn explain_xplan(sql: &str) -> Explain {
+    let mut e = explain(Db::Oracle, sql);
+    e.stmts[2] = "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY('PLAN_TABLE', 'rsqldev', 'ALL'))".into();
+    e
+}
+
 /// Autotrace: run the query and show its plan with actual rows and timings. Queries only (the
 /// statement really runs). `tag` makes the Oracle cursor findable in v$sql even when DBMS
 /// output or another call ran on the session in between. None = engine not supported.

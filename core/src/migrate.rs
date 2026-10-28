@@ -44,6 +44,10 @@ pub fn default_files() -> Vec<PathBuf> {
 /// Parse any supported file (detected by content).
 pub fn read(path: &Path) -> crate::Result<Vec<Found>> {
     let text = std::fs::read_to_string(path)?;
+    // rsqldev's own export (File ▸ Export Connections).
+    if text.contains("[[connection]]") {
+        return Ok(crate::config::parse_connections(&text)?.into_iter().map(|conn| Found { conn, source: "rsqldev" }).collect());
+    }
     Ok(if text.trim_start().starts_with('<') {
         sqldeveloper_xml(&text)
     } else {

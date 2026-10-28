@@ -1502,7 +1502,9 @@ impl ResultGrid {
             ID_EXPORT_DLG => self.export_dialog(),
             ID_COPY | ID_COPY_HDR => {
                 let (c, r) = self.selection(false);
-                Clipboard::get().set_text(&export::tsv((id == ID_COPY_HDR).then_some(&c[..]), &r));
+                let t = export::tsv((id == ID_COPY_HDR).then_some(&c[..]), &r);
+                crate::app().remember_clip(&t);
+                Clipboard::get().set_text(&t);
             }
             ID_FETCH_ALL => self.fetch_all(|| {}),
             ID_CSV | ID_XLSX | ID_JSON | ID_INSERT => {

@@ -120,6 +120,10 @@ const ID_FORMAT_CLIP: i32 = ID_HIGHEST + 58;
 const ID_RENAME_TAB: i32 = ID_HIGHEST + 59;
 const ID_DISCONNECT_ALL: i32 = ID_HIGHEST + 60;
 const ID_REPORTS: i32 = ID_HIGHEST + 62;
+const ID_XPLAN: i32 = ID_HIGHEST + 63;
+const ID_EXT_PASTE: i32 = ID_HIGHEST + 64;
+const ID_EXPORT_CONNS: i32 = ID_HIGHEST + 65;
+const ID_IMPORT_FILE: i32 = ID_HIGHEST + 66;
 const ID_DESCRIBE: i32 = ID_HIGHEST + 61;
 
 enum Page {
@@ -191,6 +195,8 @@ pub struct App {
     pub binds: RefCell<std::collections::BTreeMap<String, String>>,
     /// View ▸ Log: status messages and errors of this run, with their time.
     log: RefCell<Vec<String>>,
+    /// Edit ▸ Extended Paste: the last texts copied in rsqldev, newest first.
+    clips: RefCell<Vec<String>>,
     _timer: Timer<Frame>,
     /// Tab count at the last prune of `pages` (pruning only when it changes).
     tabs_seen: std::cell::Cell<usize>,
@@ -256,14 +262,14 @@ impl App {
 
     /// File ▸ Import Connections: SQL Developer / DBeaver files from their default locations
     /// (or a picked file), choose which to add. Names already in use get a numeric suffix.
-    fn import_connections(&self) {
+    fn import_connections(&self, pick: bool) {
         use rsqldev_core::migrate;
-        let mut files = migrate::default_files();
+        let mut files = if pick { vec![] } else { migrate::default_files() };
         if files.is_empty() {
             let d = FileDialog::builder(&self.frame)
                 .with_message("SQL Developer connections.json / connections.xml, or DBeaver data-sources.json")
                 .with_style(FileDialogStyle::Open)
-                .with_wildcard("Connection files (*.json;*.xml)|*.json;*.xml|All files (*)|*")
+                .with_wildcard("Connection files (*.json;*.xml;*.toml)|*.json;*.xml;*.toml|All files (*)|*")
                 .build();
             if d.show_modal() != ID_OK {
                 return;
@@ -815,6 +821,16 @@ impl App {
         }
     }
 
+    pub fn remember_clip(&self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let mut c = self.clips.borrow_mut();
+        c.retain(|x| x != text);
+        c.insert(0, text.to_string());
+        c.truncate(20);
+    }
+
     pub fn log_line(&self, text: &str) {
         let mut l = self.log.borrow_mut();
         l.push(format!("{}  {}", chrono::Local::now().format("%H:%M:%S"), text.trim()));
@@ -913,7 +929,40 @@ impl App {
     fn menu_rest(&self, id: i32, sheet: Option<SheetRef>, editor_focus: bool) -> bool {
         match id {
             ID_NEW_CONN | ID_NEW => self.new_connection(),
-            ID_IMPORT_CONNS => self.import_connections(),
+            ID_IMPORT_CONNS => self.import_connections(false),
+            ID_IMPORT_FILE => self.import_connections(true),
+            ID_EXPORT_CONNS => {
+                let d = FileDialog::builder(&self.frame)
+                    .with_message("Export Connections (no passwords)")
+                    .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+                    .with_default_file("rsqldev-connections.toml")
+                    .with_wildcard("rsqldev connections (*.toml)|*.toml")
+                    .build();
+                if let Some(p) = (d.show_modal() == ID_OK).then(|| d.get_path()).flatten() {
+                    match config::connections_text(&self.conns.borrow()).map_err(|e| e.to_string()).and_then(|t| std::fs::write(&p, t).map_err(|e| e.to_string())) {
+                        Ok(()) => self.status(0, &format!("Exported {} connection(s) to {p}", self.conns.borrow().len())),
+                        Err(e) => ui::error(&self.frame, &format!("Export failed: {e}")),
+                    }
+                }
+            }
+            ID_EXT_PASTE => {
+                let clips = self.clips.borrow().clone();
+                if clips.is_empty() {
+                    return {
+                        ui::info(&self.frame, "Nothing copied in rsqldev yet.");
+                        true
+                    };
+                }
+                let labels: Vec<String> = clips.iter().map(|c| c.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(120).collect()).collect();
+                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                let d = SingleChoiceDialog::builder(&self.frame, "Paste:", "Extended Paste", &refs).build();
+                if d.show_modal() == ID_OK && d.get_selection() >= 0 {
+                    if let Some(s) = sheet {
+                        let e = s.editor;
+                        e.replace_selection(&clips[d.get_selection() as usize]);
+                    }
+                }
+            }
             ID_SESSIONS => self.pick_conn(|c| {
                 let a = app();
                 let title = format!("Sessions: {}", c.borrow().cfg.name);
@@ -1050,8 +1099,10 @@ impl App {
                 match id {
                     ID_UNDO => e.undo(),
                     ID_REDO => e.redo(),
-                    ID_CUT => e.cut(),
-                    ID_COPY => e.copy(),
+                    ID_CUT | ID_COPY => {
+                        self.remember_clip(&e.get_selected_text());
+                        if id == ID_CUT { e.cut() } else { e.copy() }
+                    }
                     ID_PASTE => e.paste(),
                     _ => e.select_all(),
                 }
@@ -1126,7 +1177,7 @@ impl App {
                     if id == ID_SNIPPET { snippets::insert(&self.frame, s.editor) } else { snippets::save_selection(&self.frame, s.editor) }
                 }
             }
-            ID_RUN | ID_SCRIPT | ID_EXPLAIN | ID_AUTOTRACE | ID_RUN_PLSQL | ID_COMMIT | ID_ROLLBACK | ID_CANCEL_STMT | ID_HISTORY | ID_CLEAR => {
+            ID_RUN | ID_SCRIPT | ID_EXPLAIN | ID_XPLAN | ID_AUTOTRACE | ID_RUN_PLSQL | ID_COMMIT | ID_ROLLBACK | ID_CANCEL_STMT | ID_HISTORY | ID_CLEAR => {
                 let Some(s) = sheet else { return true };
                 match id {
                     ID_RUN => s.run_statement(),
@@ -1134,6 +1185,7 @@ impl App {
                     ID_EXPLAIN => s.explain_plan(),
                     ID_AUTOTRACE => s.autotrace(),
                     ID_RUN_PLSQL => s.run_plsql(),
+                    ID_XPLAN => s.explain_xplan(),
                     ID_COMMIT => s.commit(),
                     ID_ROLLBACK => s.rollback(),
                     ID_CANCEL_STMT => s.cancel(),
@@ -1311,6 +1363,8 @@ fn menus(frame: &Frame) {
     let file = Menu::builder()
         .append_item(ID_NEW_CONN, "New Connection…\tCtrl+Shift+C", "Create a database connection")
         .append_item(ID_IMPORT_CONNS, "&Import Connections…", "Import connections from Oracle SQL Developer or DBeaver")
+        .append_item(ID_IMPORT_FILE, "Import Connections from File…", "A SQL Developer / DBeaver file or an rsqldev export")
+        .append_item(ID_EXPORT_CONNS, "E&xport Connections…", "Save the connections (without passwords) to a file to import elsewhere")
         .append_item(ID_NEW_SHEET, "New SQL &Worksheet\tCtrl+N", "Open a SQL worksheet on a connection")
         .append_item(ID_OPEN, "&Open…\tCtrl+O", "Open a SQL file in a worksheet")
         .append_item(ID_SAVE, "&Save\tCtrl+S", "")
@@ -1331,6 +1385,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_CUT, "Cu&t\tCtrl+X", "")
         .append_item(ID_COPY, "&Copy\tCtrl+C", "")
         .append_item(ID_PASTE, "&Paste\tCtrl+V", "")
+        .append_item(ID_EXT_PASTE, "E&xtended Paste…\tCtrl+Shift+V", "Paste one of the last texts copied in rsqldev")
         .append_item(ID_INSERT_ROW, "Insert &Row\tCtrl+I", "Data editor: new row after the cursor row")
         .append_item(ID_EDIT_VALUE, "Edit &Value…\tAlt+Enter", "Result grid: the cursor cell in an editor (long text, date picker, LOB)")
         .append_item(ID_SELECTALL, "Select &All\tCtrl+A", "")
@@ -1374,6 +1429,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_RUN, "Run &Statement\tCtrl+Enter", "Also F9")
         .append_item(ID_SCRIPT, "Run S&cript\tF5", "")
         .append_item(ID_EXPLAIN, "&Explain Plan\tF10", "")
+        .append_item(ID_XPLAN, "Explain Plan (DBMS_&XPLAN)", "Oracle's formatted plan with predicates and notes")
         .append_item(ID_AUTOTRACE, "&Autotrace\tF6", "Run the query and show its plan with actual rows and time")
         .append_item(ID_RUN_PLSQL, "Run &PL/SQL…\tCtrl+F10", "Open an anonymous block calling the procedure or function under the caret")
         .append_separator()
@@ -1675,6 +1731,7 @@ fn start(prefs0: config::Prefs) {
             history: RefCell::new(history.entries.into_iter().map(|sql| HistItem { sql, ..Default::default() }).chain(history.items).collect()),
             binds: RefCell::new(std::fs::read_to_string(config::config_root().join("binds.toml")).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default()),
             log: RefCell::default(),
+            clips: RefCell::default(),
             _timer: timer,
             tabs_seen: std::cell::Cell::new(usize::MAX),
         });

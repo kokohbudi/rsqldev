@@ -905,8 +905,20 @@ impl Worksheet {
     }
 
     pub fn explain_plan(&self) {
+        self.explain_with(false)
+    }
+
+    /// Run ▸ Explain Plan (DBMS_XPLAN), Oracle: the formatted text plan.
+    pub fn explain_xplan(&self) {
+        if self.kind() != Kind::Oracle {
+            return crate::ui::info(&self.panel, "DBMS_XPLAN is Oracle's; use Explain Plan (F10).");
+        }
+        self.explain_with(true)
+    }
+
+    fn explain_with(&self, xplan: bool) {
         let Some(sql) = self.current_sql() else { return };
-        let ex = dialect::explain(self.kind(), &sql);
+        let ex = if xplan { dialect::explain_xplan(&sql) } else { dialect::explain(self.kind(), &sql) };
         self.bottom.set_selection(P_EXPLAIN);
         self.explain.reset();
         self.set_busy(true);

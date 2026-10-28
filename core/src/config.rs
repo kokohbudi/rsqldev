@@ -189,6 +189,15 @@ pub fn load_connections() -> Vec<ConnConfig> {
     read::<ConnFile>("connections.toml").connection
 }
 
+/// File ▸ Export Connections: the same format as connections.toml (passwords are never in it).
+pub fn connections_text(c: &[ConnConfig]) -> Result<String> {
+    Ok(toml::to_string(&ConnFile { connection: c.to_vec() })?)
+}
+
+pub fn parse_connections(text: &str) -> Result<Vec<ConnConfig>> {
+    Ok(toml::from_str::<ConnFile>(text)?.connection)
+}
+
 pub fn save_connections(c: &[ConnConfig]) -> Result<()> {
     write("connections.toml", &ConnFile { connection: c.to_vec() })
 }
@@ -223,6 +232,14 @@ pub fn delete_password(conn_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::name_matches;
+
+    #[test]
+    fn export_import_round_trip() {
+        let c = vec![super::ConnConfig { name: "hr".into(), driver: "oracle".into(), host: "db".into(), ..Default::default() }];
+        let t = super::connections_text(&c).unwrap();
+        assert!(t.contains("[[connection]]"));
+        assert_eq!(super::parse_connections(&t).unwrap(), c);
+    }
 
     #[test]
     fn templates_expand() {
