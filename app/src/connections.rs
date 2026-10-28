@@ -46,6 +46,7 @@ const M_DDL_FILE: i32 = 7121;
 const M_RENAME_CONN: i32 = 7122;
 const M_DUP_CONN: i32 = 7123;
 const M_RECONNECT: i32 = 7124;
+const M_EDIT_SOURCE: i32 = 7125;
 
 /// Saved name filter of a tree folder (Apply Filter…).
 fn filter_of(conn: &str, owner: &str, kind: &str) -> Option<String> {
@@ -459,6 +460,9 @@ impl Navigator {
                     .append_item(M_DDL_CLIP, "Quick DDL ▸ Clipboard", "")
                     .append_item(M_DDL_FILE, "Quick DDL ▸ Save to File…", "")
                     .append_separator();
+                if matches!(*kind, dialect::PACKAGE | dialect::PROCEDURE | dialect::FUNCTION | dialect::TRIGGER | dialect::TYPE | dialect::VIEW) {
+                    b = b.append_item(M_EDIT_SOURCE, "Edit…", "The source as CREATE OR REPLACE in a worksheet: Run Script (F5) compiles it, errors are marked");
+                }
                 if *kind == dialect::TABLE {
                     b = b
                         .append_item(M_EDIT_TABLE, "Edit…", "Columns, keys, constraints, indexes and storage, with the DDL shown first")
@@ -548,6 +552,7 @@ impl Navigator {
                 crate::table_menu::run(id, c, owner, name, done);
             }
             (M_OPEN, Node::Obj { conn, owner, kind, name }) => app.open_object(&conn, &owner, kind, &name),
+            (M_EDIT_SOURCE, Node::Obj { conn, owner, kind, name }) => app.quick_ddl(&conn, &owner, kind, &name, crate::QuickDdl::Worksheet),
             (M_DDL | M_DDL_CLIP | M_DDL_FILE, Node::Obj { conn, owner, kind, name }) => {
                 let to = match id {
                     M_DDL_CLIP => crate::QuickDdl::Clipboard,

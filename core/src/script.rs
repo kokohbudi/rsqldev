@@ -590,6 +590,22 @@ pub fn command(text: &str, defs: &mut Defines) -> Action {
 }
 
 
+/// Script Output: the worksheet line (1-based) an output line points at. "Error starting at
+/// line : N" gives N; a compiler message "L/C ..." below it gives N + L - 1.
+pub fn error_target(output: &str, at: usize) -> Option<usize> {
+    let lines: Vec<&str> = output.lines().collect();
+    let start = |l: &str| l.trim().strip_prefix("Error starting at line : ")?.split_whitespace().next()?.parse::<usize>().ok();
+    let line = lines.get(at)?;
+    if let Some(n) = start(line) {
+        return Some(n);
+    }
+    let (l, rest) = line.trim_start().split_once('/')?;
+    let l: usize = l.parse().ok()?;
+    rest.split(|c: char| !c.is_ascii_digit()).next()?.parse::<usize>().ok()?;
+    let n = lines[..at].iter().rev().find_map(|x| start(x))?;
+    Some(n + l - 1)
+}
+
 /// SQL*Plus style text table for the Script Output pane.
 pub fn format_table(cols: &[crate::Column], rows: &[Vec<crate::Cell>], set: &Settings) -> String {
     if cols.is_empty() {
@@ -781,6 +797,16 @@ mod tests {
         assert_eq!(t, "ID NAME\n-- ----\n 7 Ann\n\n1 row selected.\n");
         let quiet = Settings { heading: false, feedback: false, null: "-".into(), ..Settings::default() };
         assert_eq!(format_table(&cols, &[vec![Some("7".into()), None]], &quiet), "7 -\n");
+    }
+
+    #[test]
+    fn error_lines() {
+        let out = "Table T created.\n\nError starting at line : 7 in command -\ncreate procedure p as\nError report -\nProcedure P compiled with errors\nLINE/COL ERROR\n3/3 PLS-00201: identifier 'X' must be declared\n";
+        assert_eq!(error_target(out, 2), Some(7));
+        assert_eq!(error_target(out, 7), Some(9));
+        assert_eq!(error_target(out, 6), None);
+        assert_eq!(error_target(out, 0), None);
+        assert_eq!(error_target("12/4 x", 0), None);
     }
 
     #[test]

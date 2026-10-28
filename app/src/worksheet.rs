@@ -265,6 +265,16 @@ impl Worksheet {
                 }
             }
         });
+        // Double-click on an error in Script Output: go to its line in the worksheet.
+        let w = Rc::downgrade(&ws);
+        ws.script_out.on_stc_double_click(move |_| {
+            let Some(w) = w.upgrade() else { return };
+            let at = w.script_out.line_from_position(w.script_out.get_current_pos()) as usize;
+            if let Some(n) = script::error_target(&w.script_out.get_text(), at) {
+                w.editor.goto_line(n as i32 - 1);
+                w.editor.set_focus();
+            }
+        });
         // Autosave copies the text only after a change (no 2-second full-text copy and compare).
         let w = Rc::downgrade(&ws);
         ws.editor.on_stc_change(move |_| {
