@@ -515,7 +515,7 @@ impl Worksheet {
         if !self.allow(&sql) {
             return;
         }
-        crate::app().add_history(&sql);
+        crate::app().add_history(&sql, &self.conn().borrow().cfg.name, false);
         let line = self.line_of(item.start);
         let sql = if item.kind == script::Kind::Block { format!("\u{1}{sql}") } else { sql };
         self.run_sql_grid(sql, line);
@@ -668,7 +668,7 @@ impl Worksheet {
         self.started.set(Some(Instant::now()));
         self.running.set(true);
         self.set_busy(true);
-        crate::app().add_history(&text);
+        crate::app().add_history(&text, &self.conn().borrow().cfg.name, true);
         self.run_items(items, 0);
     }
 
@@ -950,20 +950,80 @@ impl Worksheet {
         self.editor.clear_all();
     }
 
+    /// Run ▸ SQL History (F8): newest first, filtered as you type; Append inserts at the caret
+    /// (also double-click), Replace swaps the worksheet text (one undo step).
     pub fn history(&self) {
-        let h = crate::app().history();
+        const APPEND: i32 = 1;
+        const REPLACE: i32 = 2;
+        const CLEAR: i32 = 3;
+        let mut h = crate::app().history();
         if h.is_empty() {
             return crate::ui::info(&self.panel, "SQL History is empty: statements you run are listed here.");
         }
-        let labels: Vec<String> = h.iter().rev().map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(120).collect()).collect();
-        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        let d = SingleChoiceDialog::builder(&self.panel, "Select a statement to insert:", "SQL History", &refs).build();
-        if d.show_modal() == ID_OK {
-            let i = d.get_selection();
-            if i >= 0 {
-                let sql = &h[h.len() - 1 - i as usize];
-                self.editor.insert_text(self.editor.get_current_pos(), &format!("{sql}\n"));
+        h.reverse();
+        let h = Rc::new(h);
+        let dlg = Dialog::builder(&self.panel, "SQL History").with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(960, 520).build();
+        let filter = TextCtrl::builder(&dlg).build();
+        let list = ListCtrl::builder(&dlg).with_style(ListCtrlStyle::Report | ListCtrlStyle::SingleSel).build();
+        for (i, (t, w)) in [("SQL", 560), ("Connection", 140), ("Type", 70), ("Executed", 150)].into_iter().enumerate() {
+            list.insert_column(i as i64, t, ListColumnFormat::Left, w);
+        }
+        let shown: Rc<RefCell<Vec<usize>>> = Rc::default();
+        let fill = {
+            let (h, shown) = (h.clone(), shown.clone());
+            move |pat: &str| {
+                let pat = pat.trim().to_lowercase();
+                list.delete_all_items();
+                let mut s = shown.borrow_mut();
+                s.clear();
+                for (i, e) in h.iter().enumerate().filter(|(_, e)| pat.is_empty() || e.sql.to_lowercase().contains(&pat) || e.conn.to_lowercase().contains(&pat)) {
+                    let row = s.len() as i64;
+                    let one: String = e.sql.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
+                    list.insert_item(row, &one, None);
+                    list.set_item_text_by_column(row, 1, &e.conn);
+                    list.set_item_text_by_column(row, 2, if e.script { "Script" } else { "Statement" });
+                    let when = chrono::DateTime::from_timestamp(e.at, 0).filter(|_| e.at > 0).map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
+                    list.set_item_text_by_column(row, 3, &when);
+                    s.push(i);
+                }
             }
+        };
+        fill("");
+        let f2 = fill.clone();
+        filter.on_text_changed(move |_| f2(&filter.get_value()));
+        list.on_item_activated(move |_| dlg.end_modal(APPEND));
+        let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+        for (label, code) in [("Append", APPEND), ("Replace", REPLACE), ("Clear History…", CLEAR), ("Close", ID_CANCEL)] {
+            let b = Button::builder(&dlg).with_label(label).build();
+            b.on_click(move |_| dlg.end_modal(code));
+            buttons.add(&b, 0, SizerFlag::All, 4);
+        }
+        let top = BoxSizer::builder(Orientation::Horizontal).build();
+        top.add(&StaticText::builder(&dlg).with_label("Filter:").build(), 0, SizerFlag::AlignCenterVertical | SizerFlag::Right, 6);
+        top.add(&filter, 1, SizerFlag::Expand, 0);
+        let s = BoxSizer::builder(Orientation::Vertical).build();
+        s.add_sizer(&top, 0, SizerFlag::Expand | SizerFlag::All, 8);
+        s.add(&list, 1, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
+        s.add_sizer(&buttons, 0, SizerFlag::AlignRight | SizerFlag::All, 6);
+        dlg.set_sizer(s, true);
+        if list.get_item_count() > 0 {
+            list.set_item_state(0, ListItemState::Selected | ListItemState::Focused, ListItemState::Selected | ListItemState::Focused);
+        }
+        filter.set_focus();
+        let code = dlg.show_modal();
+        let sel = list.get_first_selected_item();
+        let picked = (sel >= 0).then(|| shown.borrow().get(sel as usize).map(|i| h[*i].sql.clone())).flatten();
+        dlg.destroy();
+        let e = self.editor;
+        match (code, picked) {
+            (CLEAR, _) => {
+                if crate::ui::confirm(&self.panel, "Clear the whole SQL History?") {
+                    crate::app().clear_history();
+                }
+            }
+            (APPEND, Some(sql)) => e.insert_text(e.get_current_pos(), &format!("{sql}\n")),
+            (REPLACE, Some(sql)) => crate::editor::replace(&e, 0, e.get_length(), &sql),
+            _ => {}
         }
     }
 
@@ -981,7 +1041,7 @@ impl Worksheet {
             (Some(i), false) => i.saturating_sub(1),
         };
         self.hist_at.set(Some(at));
-        let sql = h[h.len() - 1 - at].trim_end();
+        let sql = h[h.len() - 1 - at].sql.trim_end();
         let e = self.editor;
         let len = e.get_length();
         if append {

@@ -137,8 +137,24 @@ impl Page {
 
 #[derive(Serialize, Deserialize, Default)]
 struct History {
-    #[serde(default)]
+    /// Older history files: statement text only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     entries: Vec<String>,
+    #[serde(default)]
+    items: Vec<HistItem>,
+}
+
+/// One SQL History entry.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct HistItem {
+    pub sql: String,
+    #[serde(default)]
+    pub conn: String,
+    /// Executed, Unix seconds (0 = before history kept it).
+    #[serde(default)]
+    pub at: i64,
+    #[serde(default)]
+    pub script: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -160,7 +176,7 @@ pub struct App {
     conns: RefCell<Vec<ConnConfig>>,
     open: RefCell<HashMap<String, ConnRef>>,
     pages: RefCell<Vec<Page>>,
-    history: RefCell<Vec<String>>,
+    history: RefCell<Vec<HistItem>>,
     _timer: Timer<Frame>,
     /// Tab count at the last prune of `pages` (pruning only when it changes).
     tabs_seen: std::cell::Cell<usize>,
@@ -186,11 +202,11 @@ impl App {
         *self.prefs.borrow_mut() = p;
     }
 
-    pub fn add_history(&self, sql: &str) {
+    pub fn add_history(&self, sql: &str, conn: &str, script: bool) {
         let sql = sql.trim().to_string();
         let mut h = self.history.borrow_mut();
-        h.retain(|s| *s != sql);
-        h.push(sql);
+        h.retain(|s| s.sql != sql);
+        h.push(HistItem { sql, conn: conn.to_string(), at: chrono::Local::now().timestamp(), script });
         let n = h.len();
         if n > 500 {
             h.drain(..n - 500);
@@ -200,12 +216,18 @@ impl App {
         self.save_history();
     }
 
-    pub fn history(&self) -> Vec<String> {
+    /// Oldest first.
+    pub fn history(&self) -> Vec<HistItem> {
         self.history.borrow().clone()
     }
 
+    pub fn clear_history(&self) {
+        self.history.borrow_mut().clear();
+        self.save_history();
+    }
+
     fn save_history(&self) {
-        let h = History { entries: self.history() };
+        let h = History { entries: vec![], items: self.history() };
         if let Ok(s) = toml::to_string(&h) {
             let _ = std::fs::create_dir_all(config::config_root());
             let _ = std::fs::write(config::config_root().join("history.toml"), s);
@@ -1529,7 +1551,7 @@ fn start(prefs0: config::Prefs) {
             conns: RefCell::new(config::load_connections()),
             open: RefCell::default(),
             pages: RefCell::default(),
-            history: RefCell::new(history.entries),
+            history: RefCell::new(history.entries.into_iter().map(|sql| HistItem { sql, ..Default::default() }).chain(history.items).collect()),
             _timer: timer,
             tabs_seen: std::cell::Cell::new(usize::MAX),
         });
