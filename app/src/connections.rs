@@ -599,6 +599,11 @@ impl Navigator {
                         let stmt = match (db, kind) {
                             (Kind::Postgres, dialect::FUNCTION | dialect::PROCEDURE) => format!("DROP {kind} {}.{name}", dialect::quote(db, &owner)),
                             (Kind::Postgres, dialect::TRIGGER) => return crate::ui::info(&self.tree, "Drop the trigger from its table's Triggers tab (needs ON table)."),
+                            // Index nodes are `table.index` here.
+                            (Kind::Mysql | Kind::Mssql, dialect::INDEX) => match name.split_once('.') {
+                                Some((t, i)) => format!("DROP INDEX {} ON {}", dialect::quote(db, i), dialect::qualified(db, &owner, t)),
+                                None => return,
+                            },
                             // Oracle names a database link bare (dots belong to the name) and
                             // only its owner can drop it.
                             (Kind::Oracle, dialect::DBLINK) if !owner.eq_ignore_ascii_case(&c.borrow().schema) => {

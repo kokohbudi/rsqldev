@@ -272,10 +272,12 @@ pub fn folders(db: Db) -> &'static [(&'static str, &'static str)] {
             ("Triggers", TRIGGER),
             ("Sequences", SEQUENCE),
         ],
-        Db::Mysql => &[("Tables", TABLE), ("Views", VIEW), ("Procedures", PROCEDURE), ("Functions", FUNCTION), ("Triggers", TRIGGER)],
+        // MySQL / SQL Server index names are unique per table: nodes are `table.index`.
+        Db::Mysql => &[("Tables", TABLE), ("Views", VIEW), ("Indexes", INDEX), ("Procedures", PROCEDURE), ("Functions", FUNCTION), ("Triggers", TRIGGER)],
         Db::Mssql => &[
             ("Tables", TABLE),
             ("Views", VIEW),
+            ("Indexes", INDEX),
             ("Procedures", PROCEDURE),
             ("Functions", FUNCTION),
             ("Triggers", TRIGGER),
@@ -341,6 +343,8 @@ pub fn list_sql(db: Db, kind: &str, owner: &str) -> Option<String> {
         (Db::Mysql, VIEW) => "SELECT table_name FROM information_schema.views WHERE table_schema = '{o}' ORDER BY 1".into(),
         (Db::Mysql, k @ (PROCEDURE | FUNCTION)) => format!("SELECT routine_name FROM information_schema.routines WHERE routine_schema = '{{o}}' AND routine_type = '{k}' ORDER BY 1"),
         (Db::Mysql, TRIGGER) => "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = '{o}' ORDER BY 1".into(),
+        (Db::Mysql, INDEX) => "SELECT DISTINCT CONCAT(table_name, '.', index_name) FROM information_schema.statistics WHERE table_schema = '{o}' ORDER BY 1".into(),
+        (Db::Mssql, INDEX) => "SELECT t.name + '.' + i.name FROM sys.indexes i JOIN sys.tables t ON t.object_id = i.object_id WHERE t.schema_id = SCHEMA_ID('{o}') AND i.name IS NOT NULL ORDER BY 1".into(),
         (Db::Mssql, TABLE) => ms("'U'"),
         (Db::Mssql, VIEW) => ms("'V'"),
         (Db::Mssql, PROCEDURE) => ms("'P'"),
@@ -543,6 +547,10 @@ fn mysql_tabs(kind: &str) -> Vec<Tab> {
             tab("Code", View::Ddl("SHOW CREATE TRIGGER {q}".into(), 2)),
             tab("Details", d("SELECT * FROM information_schema.triggers WHERE trigger_schema = '{o}' AND trigger_name = '{n}'")),
         ],
+        INDEX => vec![tab(
+            "Columns",
+            g("SELECT seq_in_index, column_name, CASE non_unique WHEN 0 THEN 'UNIQUE' ELSE 'NONUNIQUE' END AS uniqueness, collation, index_type, sub_part, cardinality FROM information_schema.statistics WHERE table_schema = '{o}' AND CONCAT(table_name, '.', index_name) = '{n}' ORDER BY seq_in_index"),
+        )],
         _ => vec![],
     }
 }
@@ -574,6 +582,10 @@ fn mssql_tabs(kind: &str) -> Vec<Tab> {
         PROCEDURE | FUNCTION | TRIGGER => vec![tab("Code", code()), tab("Details", d("SELECT * FROM sys.objects WHERE object_id = OBJECT_ID('{lq}')"))],
         SYNONYM => vec![tab("Details", d("SELECT * FROM sys.synonyms WHERE object_id = OBJECT_ID('{lq}')"))],
         SEQUENCE => vec![tab("Details", d("SELECT * FROM sys.sequences WHERE object_id = OBJECT_ID('{lq}')"))],
+        INDEX => vec![tab(
+            "Columns",
+            g("SELECT ic.key_ordinal, c.name AS column_name, CASE ic.is_descending_key WHEN 1 THEN 'DESC' ELSE 'ASC' END AS sort, ic.is_included_column, i.type_desc, i.is_unique, i.is_primary_key FROM sys.indexes i JOIN sys.tables t ON t.object_id = i.object_id JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE t.schema_id = SCHEMA_ID('{o}') AND t.name + '.' + i.name = '{n}' ORDER BY ic.is_included_column, ic.key_ordinal".into()),
+        )],
         _ => vec![],
     }
 }
