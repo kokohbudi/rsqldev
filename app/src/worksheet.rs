@@ -290,6 +290,14 @@ impl Worksheet {
                 match code {
                     WXK_F7 if cmd => return w.format_sql(),
                     wxdragon::keycode::WXK_F4 if shift && !cmd => return w.describe_at_caret(),
+                    // Code templates: abbreviation + Tab.
+                    wxdragon::keycode::WXK_TAB if !cmd && !alt && !shift && !w.editor.auto_comp_active() && w.editor.get_selected_text().is_empty() => {
+                        let (e, pos) = (w.editor, w.editor.get_current_pos());
+                        if let Some((start, body, caret)) = rsqldev_core::config::expand_template(&crate::app().prefs().code_templates, &e.get_text(), pos as usize) {
+                            crate::editor::replace(&e, start as i32, pos, &body);
+                            return e.goto_pos((start + caret) as i32);
+                        }
+                    }
                     WXK_F9 if !cmd && !alt && !shift => return w.run_statement(),
                     WXK_UP | WXK_DOWN if cmd && !alt => return w.history_step(code == WXK_UP, shift),
                     c if c == '\'' as i32 && alt && !cmd => return w.toggle_case(),

@@ -30,6 +30,10 @@ pub fn show(parent: &Frame) {
     reopen.set_value(p.reopen_worksheets);
     let binds = CheckBox::builder(&dlg).with_label("Save bind values between sessions").build();
     binds.set_value(p.save_binds);
+    let templates = Button::builder(&dlg).with_label("Code Templates…").build();
+    let tpl = std::rc::Rc::new(std::cell::RefCell::new(p.code_templates.clone()));
+    let t2 = tpl.clone();
+    templates.on_click(move |_| templates_dialog(&dlg, &mut t2.borrow_mut()));
     let storage = CheckBox::builder(&dlg).with_label("Oracle DDL: storage and tablespace clauses").build();
     storage.set_value(p.ddl_storage);
     const THEMES: [(&str, &str); 3] = [("light", "Light (SQL Developer)"), ("dark", "Dark"), ("system", "Follow system")];
@@ -42,6 +46,7 @@ pub fn show(parent: &Frame) {
     crate::ui::row(&dlg, &g, "", &post);
     crate::ui::row(&dlg, &g, "", &upd);
     crate::ui::row(&dlg, &g, "", &lines);
+    crate::ui::row(&dlg, &g, "", &templates);
     crate::ui::row(&dlg, &g, "", &on_connect);
     crate::ui::row(&dlg, &g, "", &reopen);
     crate::ui::row(&dlg, &g, "", &binds);
@@ -79,6 +84,7 @@ pub fn show(parent: &Frame) {
         p.history_limit = hist.value().max(10) as usize;
         p.ddl_storage = storage.get_value();
         p.save_binds = binds.get_value();
+        p.code_templates = tpl.borrow().clone();
         p.reopen_worksheets = reopen.get_value();
         if !p.save_binds {
             let _ = std::fs::remove_file(rsqldev_core::config::config_root().join("binds.toml"));
@@ -90,6 +96,119 @@ pub fn show(parent: &Frame) {
         if changed {
             app.offer_restart();
         }
+    }
+    dlg.destroy();
+}
+
+/// Preferences ▸ Code Templates…: abbreviation → text (`|` marks the caret).
+fn templates_dialog(parent: &Dialog, map: &mut std::collections::BTreeMap<String, String>) {
+    let dlg = Dialog::builder(parent, "Code Templates").with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(640, 460).build();
+    let list = ListCtrl::builder(&dlg).with_style(ListCtrlStyle::Report | ListCtrlStyle::SingleSel).build();
+    list.insert_column(0, "Abbreviation", ListColumnFormat::Left, 110);
+    list.insert_column(1, "Template (Tab after the abbreviation; | = caret)", ListColumnFormat::Left, 480);
+    let m = std::rc::Rc::new(std::cell::RefCell::new(map.clone()));
+    let fill = {
+        let m = m.clone();
+        move || {
+            list.delete_all_items();
+            for (i, (k, v)) in m.borrow().iter().enumerate() {
+                list.insert_item(i as i64, k, None);
+                list.set_item_text_by_column(i as i64, 1, &v.replace('\n', " ⏎ "));
+            }
+        }
+    };
+    fill();
+    let edit = {
+        let (m, fill) = (m.clone(), fill.clone());
+        move |key: Option<String>| {
+            let cur = key.as_ref().and_then(|k| m.borrow().get(k).cloned()).unwrap_or_default();
+            let d = Dialog::builder(&dlg, "Code Template").with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(480, 320).build();
+            let k = TextCtrl::builder(&d).with_value(key.as_deref().unwrap_or("")).build();
+            let v = TextCtrl::builder(&d).with_style(TextCtrlStyle::MultiLine).with_value(&cur).build();
+            let s = BoxSizer::builder(Orientation::Vertical).build();
+            s.add(&StaticText::builder(&d).with_label("Abbreviation:").build(), 0, SizerFlag::Left | SizerFlag::Top, 8);
+            s.add(&k, 0, SizerFlag::Expand | SizerFlag::All, 8);
+            s.add(&StaticText::builder(&d).with_label("Template (| marks the caret):").build(), 0, SizerFlag::Left, 8);
+            s.add(&v, 1, SizerFlag::Expand | SizerFlag::All, 8);
+            let bs = BoxSizer::builder(Orientation::Horizontal).build();
+            bs.add_stretch_spacer(1);
+            for (l, id) in [("Cancel", ID_CANCEL), ("OK", ID_OK)] {
+                let b = Button::builder(&d).with_label(l).with_id(id).build();
+                b.on_click(move |_| d.end_modal(id));
+                bs.add(&b, 0, SizerFlag::All, 4);
+            }
+            s.add_sizer(&bs, 0, SizerFlag::Expand | SizerFlag::All, 4);
+            d.set_sizer(s, true);
+            let ok = d.show_modal() == ID_OK;
+            let (nk, nv) = (k.get_value().trim().to_string(), v.get_value());
+            d.destroy();
+            let valid = !nk.is_empty() && nk.chars().all(|c| c.is_alphanumeric() || c == '_');
+            if ok && valid && !nv.is_empty() {
+                let mut mm = m.borrow_mut();
+                if let Some(old) = key.filter(|o| *o != nk) {
+                    mm.remove(&old);
+                }
+                mm.insert(nk, nv);
+                drop(mm);
+                fill();
+            } else if ok && !valid {
+                crate::ui::info(&dlg, "An abbreviation is one word: letters, digits and _.");
+            }
+        }
+    };
+    let selected = {
+        let m = m.clone();
+        move || {
+            let i = list.get_first_selected_item();
+            (i >= 0).then(|| m.borrow().keys().nth(i as usize).cloned()).flatten()
+        }
+    };
+    let bs = BoxSizer::builder(Orientation::Horizontal).build();
+    let b_add = Button::builder(&dlg).with_label("Add…").build();
+    let b_edit = Button::builder(&dlg).with_label("Edit…").build();
+    let b_del = Button::builder(&dlg).with_label("Remove").build();
+    let b_reset = Button::builder(&dlg).with_label("Defaults").build();
+    let (e1, e2, s1, s2) = (edit.clone(), edit.clone(), selected.clone(), selected.clone());
+    b_add.on_click(move |_| e1(None));
+    b_edit.on_click(move |_| {
+        if let Some(k) = s1() {
+            e2(Some(k))
+        }
+    });
+    let (m1, f1) = (m.clone(), fill.clone());
+    b_del.on_click(move |_| {
+        if let Some(k) = s2() {
+            m1.borrow_mut().remove(&k);
+            f1();
+        }
+    });
+    let (m2, f2) = (m.clone(), fill.clone());
+    b_reset.on_click(move |_| {
+        *m2.borrow_mut() = rsqldev_core::config::default_templates();
+        f2();
+    });
+    let e3 = edit.clone();
+    let s3 = selected.clone();
+    list.on_item_activated(move |_| {
+        if let Some(k) = s3() {
+            e3(Some(k))
+        }
+    });
+    for b in [&b_add, &b_edit, &b_del, &b_reset] {
+        bs.add(b, 0, SizerFlag::All, 4);
+    }
+    bs.add_stretch_spacer(1);
+    for (l, id) in [("Cancel", ID_CANCEL), ("OK", ID_OK)] {
+        let b = Button::builder(&dlg).with_label(l).with_id(id).build();
+        b.on_click(move |_| dlg.end_modal(id));
+        bs.add(&b, 0, SizerFlag::All, 4);
+    }
+    let s = BoxSizer::builder(Orientation::Vertical).build();
+    s.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    s.add_sizer(&bs, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    dlg.set_sizer(s, true);
+    if dlg.show_modal() == ID_OK {
+        *map = m.borrow().clone();
     }
     dlg.destroy();
 }

@@ -104,6 +104,45 @@ pub struct Prefs {
     pub save_binds: bool,
     /// Reopen the worksheets left open at quit (connections with a saved password).
     pub reopen_worksheets: bool,
+    /// Code templates: abbreviation + Tab in the editor expands to the text (`|` = caret).
+    pub code_templates: BTreeMap<String, String>,
+}
+
+/// Default code templates (SQL Developer ships similar ones).
+pub fn default_templates() -> BTreeMap<String, String> {
+    [
+        ("ssf", "SELECT * FROM |"),
+        ("sf", "SELECT | FROM "),
+        ("scf", "SELECT COUNT(*) FROM |"),
+        ("ii", "INSERT INTO | () VALUES ();"),
+        ("uu", "UPDATE | SET  WHERE ;"),
+        ("df", "DELETE FROM | WHERE ;"),
+        ("ob", "ORDER BY |"),
+        ("gb", "GROUP BY |"),
+        ("lj", "LEFT JOIN | ON "),
+        ("ij", "INNER JOIN | ON "),
+        ("beg", "BEGIN\n  |\nEND;\n/"),
+        ("dec", "DECLARE\n  |\nBEGIN\n  NULL;\nEND;\n/"),
+        ("fl", "FOR r IN (SELECT |) LOOP\n  NULL;\nEND LOOP;"),
+        ("dbo", "DBMS_OUTPUT.PUT_LINE(|);"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+/// Expand the abbreviation ending at byte `pos` of `text`: (start of the word, replacement
+/// without the caret mark, caret offset in the replacement).
+pub fn expand_template(t: &BTreeMap<String, String>, text: &str, pos: usize) -> Option<(usize, String, usize)> {
+    let before = text.get(..pos)?;
+    let start = before.rfind(|c: char| !(c.is_alphanumeric() || c == '_')).map_or(0, |i| i + before[i..].chars().next().map_or(1, char::len_utf8));
+    let word = &before[start..];
+    if word.is_empty() {
+        return None;
+    }
+    let body = t.iter().find(|(k, _)| k.eq_ignore_ascii_case(word))?.1;
+    let caret = body.find('|').unwrap_or(body.len());
+    Some((start, body.replacen('|', "", 1), caret))
 }
 
 impl Default for Prefs {
@@ -126,6 +165,7 @@ impl Default for Prefs {
             ddl_storage: true,
             save_binds: true,
             reopen_worksheets: true,
+            code_templates: default_templates(),
         }
     }
 }
@@ -183,6 +223,17 @@ pub fn delete_password(conn_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::name_matches;
+
+    #[test]
+    fn templates_expand() {
+        let t = super::default_templates();
+        assert_eq!(super::expand_template(&t, "x ssf", 5), Some((2, "SELECT * FROM ".into(), 14)));
+        assert_eq!(super::expand_template(&t, "SSF", 3).map(|e| e.0), Some(0));
+        assert_eq!(super::expand_template(&t, "ssfx", 4), None);
+        assert_eq!(super::expand_template(&t, "a.ssf", 5).map(|e| e.0), Some(2));
+        assert_eq!(super::expand_template(&t, "é ssf", 6).map(|e| e.0), Some(3));
+        assert_eq!(super::expand_template(&t, "x ", 2), None);
+    }
 
     #[test]
     fn filter_patterns() {
