@@ -534,6 +534,11 @@ impl App {
     }
 
     fn connect_with(&self, name: &str, pw: Option<String>, f: impl FnOnce(ConnRef) + 'static) {
+        self.connect_full(name, pw, None, f)
+    }
+
+    /// `new_pw`: Oracle password change on login (expired password).
+    fn connect_full(&self, name: &str, pw: Option<String>, new_pw: Option<String>, f: impl FnOnce(ConnRef) + 'static) {
         let existing = self.open.borrow().get(name).cloned();
         if let Some(c) = existing.filter(|c| !c.borrow().failed()) {
             let c2 = c.clone();
@@ -543,7 +548,7 @@ impl App {
                 }
             });
         }
-        let Some(cfg) = self.conns.borrow().iter().find(|c| c.name == name).cloned() else { return };
+        let Some(mut cfg) = self.conns.borrow().iter().find(|c| c.name == name).cloned() else { return };
         let file = registry::find(&cfg.driver).is_some_and(|d| d.backend.is_file());
         let pw = match pw.or_else(|| cfg.save_password.then(|| config::get_password(name)).flatten()) {
             Some(p) => p,
@@ -554,6 +559,10 @@ impl App {
             },
         };
         self.frame.set_status_text(&format!("Connecting to {name}…"), 0);
+        let startup = self.conns.borrow().iter().find(|c| c.name == name).map(|c| c.startup_sql.clone()).unwrap_or_default();
+        if let Some(np) = &new_pw {
+            cfg.options.insert("new_password".into(), np.clone());
+        }
         let c = Conn::open(cfg, pw.clone(), self.prefs());
         self.open.borrow_mut().insert(name.to_string(), c.clone());
         let name = name.to_string();
@@ -563,6 +572,15 @@ impl App {
             match r {
                 Ok(()) => {
                     app.frame.set_status_text(&format!("Connected: {name}"), 0);
+                    if let Some(np) = new_pw {
+                        // Later sessions (unshared worksheets) log in with the new password.
+                        c2.borrow_mut().cfg.options.remove("new_password");
+                        if c2.borrow().cfg.save_password {
+                            let _ = config::set_password(&name, &np);
+                        }
+                        app.status(0, &format!("Password of {name} changed"));
+                    }
+                    run_startup(&c2, &startup);
                     f(c2)
                 }
                 Err(fail) => {
@@ -574,6 +592,14 @@ impl App {
                                 crate::app().connect_with(&name, Some(pw), f);
                             }
                         }),
+                        // Oracle expired password: ask for a new one and log in with it.
+                        None if fail.error.contains("ORA-28001") => {
+                            let Some(np) = ui::ask_password(&app.frame, &format!("The password of {name} has expired.\n\nNew password:")) else { return };
+                            if ui::ask_password(&app.frame, "Confirm the new password:").as_deref() != Some(np.as_str()) {
+                                return ui::error(&app.frame, "The passwords differ; the password was not changed.");
+                            }
+                            crate::app().connect_full(&name, Some(pw), Some(np), f);
+                        }
                         None => ui::error(&app.frame, &format!("Connection \"{name}\" failed:\n\n{}", fail.error)),
                     }
                 }
@@ -1200,10 +1226,14 @@ impl App {
                     let (cfg, prefs) = (s.conn().borrow().cfg.clone(), self.prefs());
                     let pw = config::get_password(&cfg.name).or_else(|| ui::ask_password(&self.frame, "Password:"));
                     if let Some(pw) = pw {
+                        let startup = cfg.startup_sql.clone();
                         let c = Conn::open(cfg, pw, prefs);
                         let c2 = c.clone();
                         Conn::when_ready(&c, move |r| match r {
-                            Ok(()) => app().open_worksheet(c2),
+                            Ok(()) => {
+                                run_startup(&c2, &startup);
+                                app().open_worksheet(c2)
+                            }
                             Err(f) => ui::error(&app().frame, &f.error),
                         });
                     }
@@ -1794,6 +1824,23 @@ fn start(prefs0: config::Prefs) {
             if a.prefs().check_updates {
                 check_updates(false);
             }
+        }
+    }
+}
+
+/// A connection's startup SQL, queued on both of its sessions before anything else runs
+/// there; failures go to the status bar and the log.
+fn run_startup(c: &ConnRef, sql: &str) {
+    let (name, kind) = (c.borrow().cfg.name.clone(), c.borrow().kind);
+    for item in rsqldev_core::script::split(sql, kind).into_iter().filter(|i| i.kind != rsqldev_core::script::Kind::Command) {
+        let n = name.clone();
+        Conn::work_query(c, &item.text, move |r| {
+            if let Err(e) = r {
+                app().status(0, &format!("{n}: startup SQL failed: {e}"));
+            }
+        });
+        if c.borrow().has_meta() {
+            Conn::meta_query(c, &item.text, |_| {});
         }
     }
 }

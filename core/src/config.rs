@@ -29,6 +29,10 @@ pub struct ConnConfig {
     pub role: String,
     /// Driver-specific options (sslmode, encrypt, trust_cert, ...).
     pub options: BTreeMap<String, String>,
+    /// Statements run on every new session of this connection (`;` separated), e.g.
+    /// ALTER SESSION SET ... (SQL Developer's connection startup script).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub startup_sql: String,
     /// Connections-tree name filters, keyed by [`filter_key`] (owner + object kind).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub filters: BTreeMap<String, String>,

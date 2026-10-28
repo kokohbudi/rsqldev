@@ -148,6 +148,10 @@ impl Oracle {
     pub fn connect(cfg: &ConnConfig, pw: &str, dir: &Path, prefs: &Prefs) -> Result<Self> {
         init(dir, cfg.options.get("tns_admin").or(Some(&prefs.tns_dir)).map(String::as_str).filter(|s| !s.trim().is_empty()))?;
         let mut k = Connector::new(&cfg.user, pw, connect_string(cfg));
+        // Expired password (ORA-28001): the app asks for a new one and passes it here once.
+        if let Some(np) = cfg.options.get("new_password").filter(|s| !s.is_empty()) {
+            k.new_password(np.as_str());
+        }
         match cfg.role.to_uppercase().as_str() {
             "SYSDBA" => k.privilege(Privilege::Sysdba),
             "SYSOPER" => k.privilege(Privilege::Sysoper),

@@ -914,6 +914,8 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let tns_admin = existing.and_then(|c| c.options.get("tns_admin").cloned());
     let tns = ComboBox::builder(&dlg).with_choices(rsqldev_core::backend::tns_aliases(tns_admin.as_deref(), &crate::app().prefs())).build();
     let opts = text();
+    let startup = text();
+    startup.set_tooltip("Run on every new session, ; separated, e.g. ALTER SESSION SET CURRENT_SCHEMA = HR");
     opts.set_tooltip("Driver options, e.g. ssh=user@bastion[:22]; ssh_key=~/.ssh/id_ed25519 (SSH tunnel); sslmode=verify-full; trust_cert=true (SQL Server self-signed); ssl=true; verify=false (MySQL); https=true; allow_http=true (ClickHouse); tns_admin=/path");
     let status = StaticText::builder(&dlg).with_label("Status :").build();
 
@@ -941,6 +943,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
         put(&dg, &dlg, "", browse),
         put(&dg, &dlg, "TNS alias / Descriptor", tns),
         put(&dg, &dlg, "Options", opts),
+        put(&dg, &dlg, "Startup SQL", startup),
     ];
     dbx.add_sizer(&dg, 1, SizerFlag::Expand | SizerFlag::All, 6);
     let _ = r_name;
@@ -968,6 +971,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
         file.set_value(&c.database);
         tns.set_value(&c.tns);
         opts.set_value(&c.options.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; "));
+        startup.set_value(&c.startup_sql);
     };
     let rows_user = std::rc::Rc::new(rows_user);
     let rows_det = std::rc::Rc::new(rows_det);
@@ -983,7 +987,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
                 l.show(show);
                 c.show(show);
             }
-            let det = [ora, !file_db && basic, !file_db && basic, ora && ct == 0, ora && ct == 0, !ora && !file_db, file_db, file_db, ora && ct > 0, !file_db];
+            let det = [ora, !file_db && basic, !file_db && basic, ora && ct == 0, ora && ct == 0, !ora && !file_db, file_db, file_db, ora && ct > 0, !file_db, true];
             for ((l, c), show) in rd.iter().zip(det) {
                 l.show(show);
                 c.show(show);
@@ -1044,6 +1048,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
             sid: d.backend == Kind::Oracle && r_sid.get_value(),
             tns: tns.get_value().trim().to_string(),
             options: opts.get_value().split(';').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect(),
+            startup_sql: startup.get_value().trim().to_string(),
             ..Default::default()
         };
         c.database = match d.backend {
