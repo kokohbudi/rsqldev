@@ -39,6 +39,13 @@ const M_NEW_TABLE: i32 = 7114;
 const M_EDIT_TABLE: i32 = 7115;
 const M_NEW_INDEX: i32 = 7116;
 const M_REBUILD: i32 = 7117;
+const M_FILTER: i32 = 7118;
+const M_CLEAR_FILTER: i32 = 7119;
+
+/// Saved name filter of a tree folder (Apply Filter…).
+fn filter_of(conn: &str, owner: &str, kind: &str) -> Option<String> {
+    crate::app().conns.borrow().iter().find(|c| c.name == conn)?.filters.get(&config::filter_key(owner, kind)).cloned()
+}
 
 impl Navigator {
     pub fn new(parent: &dyn WxWidget) -> Navigator {
@@ -46,9 +53,11 @@ impl Navigator {
         let bar = BoxSizer::builder(Orientation::Horizontal).build();
         let add = crate::icons::tool(&panel, "new", "New Connection…");
         let refresh = crate::icons::tool(&panel, "refresh", "Refresh");
+        let filter = crate::icons::tool(&panel, "filter", "Apply Filter… (on Tables, Views, …)");
         let collapse = crate::icons::tool(&panel, "collapse", "Collapse All");
         bar.add(&add, 0, SizerFlag::All, 3);
         bar.add(&refresh, 0, SizerFlag::All, 3);
+        bar.add(&filter, 0, SizerFlag::All, 3);
         bar.add(&collapse, 0, SizerFlag::All, 3);
         let tree = TreeCtrl::builder(&panel).with_style(TreeCtrlStyle::Default | TreeCtrlStyle::HideRoot).build();
         tree.set_image_list(crate::icons::tree_images());
@@ -59,6 +68,10 @@ impl Navigator {
         let nav = Navigator { panel, tree };
         add.on_click(move |_| crate::app().new_connection());
         collapse.on_click(move |_| tree.collapse_all());
+        filter.on_click(move |_| match tree.get_selection().map(|i| (nav.node(&i), i)) {
+            Some((Node::Kind { conn, owner, kind }, i)) => nav.set_filter(&i, &conn, &owner, kind, true),
+            _ => crate::ui::info(&tree, "Select a folder (Tables, Views, …) under a connection to filter it."),
+        });
         refresh.on_click(move |_| {
             if let Some(i) = tree.get_selection() {
                 nav.refresh(&i);
@@ -275,11 +288,17 @@ impl Navigator {
                 let c = crate::app().open_conn(&conn);
                 let db = c.map(|c| c.borrow().kind).unwrap_or(Kind::Sqlite);
                 let sql = dialect::list_sql(db, kind, &owner);
+                let pat = filter_of(&conn, &owner, kind);
                 self.load(i, &conn.clone(), sql, move |nav, item, db, rows| {
                     let expandable = dialect::children_sql(db, kind).is_some();
                     let red = crate::theme::c(crate::theme::p().invalid);
                     for r in rows {
                         let Some(name) = r.first().cloned().flatten() else { continue };
+                        // ponytail: filtered client side (the full list is fetched, only matches go
+                        // into the tree); push the pattern into list_sql if huge schemas need it.
+                        if pat.as_deref().is_some_and(|p| !config::name_matches(p, &name)) {
+                            continue;
+                        }
                         let n = Node::Obj { conn: conn.clone(), owner: owner.clone(), kind, name: name.clone() };
                         if let Some(ni) = nav.add(item, &name, n, expandable) {
                             if r.get(1).and_then(|s| s.as_deref()) == Some("INVALID") {
@@ -307,7 +326,8 @@ impl Navigator {
 
     fn add_folders(&self, parent: &TreeItemId, conn: &str, owner: &str, kind: Kind) {
         for (label, k) in dialect::folders(kind) {
-            self.add(parent, label, Node::Kind { conn: conn.into(), owner: owner.into(), kind: k }, true);
+            let text = if filter_of(conn, owner, k).is_some() { format!("{label} (Filtered)") } else { label.to_string() };
+            self.add(parent, &text, Node::Kind { conn: conn.into(), owner: owner.into(), kind: k }, true);
         }
     }
 
@@ -341,6 +361,38 @@ impl Navigator {
             }
             _ => {}
         }
+    }
+
+    /// Apply Filter… (`ask`) or Clear Filter on a folder: saved with the connection, the folder
+    /// reloads with only the matching names and is labelled "(Filtered)".
+    fn set_filter(&self, i: &TreeItemId, conn: &str, owner: &str, kind: &'static str, ask: bool) {
+        let pat = if ask {
+            let cur = filter_of(conn, owner, kind).unwrap_or_default();
+            match crate::ui::ask(&self.tree, "Name filter (% or * = any characters, _ = one character, plain text = contains):", "Apply Filter", &cur) {
+                Some(p) => p.trim().to_string(),
+                None => return,
+            }
+        } else {
+            String::new()
+        };
+        let app = crate::app();
+        {
+            let mut cs = app.conns.borrow_mut();
+            let Some(c) = cs.iter_mut().find(|c| c.name == conn) else { return };
+            let key = config::filter_key(owner, kind);
+            if pat.is_empty() {
+                c.filters.remove(&key);
+            } else {
+                c.filters.insert(key, pat.clone());
+            }
+        }
+        // Saved directly: App::save_conns would rebuild (and collapse) the whole tree.
+        if let Err(e) = config::save_connections(&app.conns.borrow()) {
+            crate::ui::error(&self.tree, &format!("Saving the filter failed: {e}"));
+        }
+        let base = self.tree.get_item_text(i).unwrap_or_default().trim_end_matches(" (Filtered)").to_string();
+        self.tree.set_item_text(i, &if pat.is_empty() { base } else { format!("{base} (Filtered)") });
+        self.refresh(i);
     }
 
     fn activated(&self, i: &TreeItemId) {
@@ -385,8 +437,17 @@ impl Navigator {
                     b = b.append_item(M_DROP, "Drop…", "");
                 }
             }
-            Node::Kind { kind, .. } if *kind == dialect::TABLE => b = b.append_item(M_NEW_TABLE, "New Table…", "").append_separator().append_item(M_REFRESH, "Refresh", ""),
-            Node::Kind { .. } | Node::Schemas { .. } | Node::Schema { .. } => b = b.append_item(M_REFRESH, "Refresh", ""),
+            Node::Kind { conn, owner, kind } => {
+                if *kind == dialect::TABLE {
+                    b = b.append_item(M_NEW_TABLE, "New Table…", "").append_separator();
+                }
+                b = b.append_item(M_FILTER, "Apply Filter…", "Show only the names matching a pattern");
+                if filter_of(conn, owner, kind).is_some() {
+                    b = b.append_item(M_CLEAR_FILTER, "Clear Filter", "");
+                }
+                b = b.append_separator().append_item(M_REFRESH, "Refresh", "");
+            }
+            Node::Schemas { .. } | Node::Schema { .. } => b = b.append_item(M_REFRESH, "Refresh", ""),
             _ => return,
         }
         let mut m = b.build();
@@ -406,6 +467,7 @@ impl Navigator {
         let app = crate::app();
         match (id, node) {
             (M_REFRESH, _) => self.refresh(i),
+            (M_FILTER | M_CLEAR_FILTER, Node::Kind { conn, owner, kind }) => self.set_filter(i, &conn, &owner, kind, id == M_FILTER),
             (M_CONNECT, Node::Conn(_)) => self.tree.expand(i),
             (M_DISCONNECT, Node::Conn(name)) => {
                 app.disconnect(&name);

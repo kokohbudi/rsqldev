@@ -318,7 +318,10 @@ impl App {
     pub fn edit_connection(&self, name: &str) {
         let saved = self.conns.borrow().clone();
         let cfg = saved.iter().find(|c| c.name == name).cloned();
-        if let Some(r) = cfg.and_then(|c| connections::edit_dialog(&self.frame, Some(&c), &saved)) {
+        if let Some(c) = cfg {
+            let Some(mut r) = connections::edit_dialog(&self.frame, Some(&c), &saved) else { return };
+            // The dialog has no field for the tree's name filters: keep them.
+            r.1.filters = c.filters;
             self.store(r);
         }
     }
