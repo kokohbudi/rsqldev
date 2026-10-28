@@ -40,6 +40,94 @@ pub fn show(frame: &Frame) {
 }
 
 /// The typed schema, folded the way the engine stores names, or the current one.
+/// Tools ▸ Data Compare: one table's rows on a source and a target (connection + schema),
+/// matched by the source's primary key; the INSERT / UPDATE / DELETE script that brings the
+/// target in line opens in a worksheet on the target. Nothing is run.
+// ponytail: both sides are read whole into memory; chunk by key ranges for very large tables.
+pub fn show_data(frame: &Frame) {
+    let names = crate::app().connection_names();
+    if names.is_empty() {
+        return crate::ui::info(frame, "Create a connection first.");
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let pick = |title: &str| {
+        let d = SingleChoiceDialog::builder(frame, &format!("{title} connection:"), "Data Compare", &refs).build();
+        (d.show_modal() == ID_OK && d.get_selection() >= 0).then(|| names[d.get_selection() as usize].clone())
+    };
+    let Some(src) = pick("Source (the reference)") else { return };
+    let Some(src_schema) = crate::ui::ask(frame, "Source schema (empty = the connection's current schema):", "Data Compare", "") else { return };
+    let Some(table) = crate::ui::ask(frame, "Table:", "Data Compare", "").filter(|t| !t.trim().is_empty()) else { return };
+    let Some(tgt) = pick("Target (to bring in line)") else { return };
+    let Some(tgt_schema) = crate::ui::ask(frame, "Target schema (empty = the connection's current schema):", "Data Compare", "") else { return };
+    crate::app().connect(&src, move |s| {
+        crate::app().connect(&tgt, move |t| {
+            if s.borrow().kind != t.borrow().kind {
+                return crate::ui::error(&crate::app().frame, "Data Compare needs two connections to the same kind of database.");
+            }
+            let db = s.borrow().kind;
+            let name = rsqldev_core::ddl::ident(db, &table);
+            let (s1, t1) = (s.clone(), t.clone());
+            schema_of(&s1, src_schema, move |so| {
+                schema_of(&t1, tgt_schema, move |to| {
+                    let Some(pk_sql) = dialect::pk_sql(db, &so, &name) else {
+                        return crate::ui::info(&crate::app().frame, "Data Compare needs primary keys, which this database does not have.");
+                    };
+                    let (src_t, tgt_t) = (dialect::qualified(db, &so, &name), dialect::qualified(db, &to, &name));
+                    crate::app().status(0, &format!("Data Compare: reading {src_t} and {tgt_t}…"));
+                    let s2 = s.clone();
+                    Conn::meta_query(&s, &pk_sql, move |r| {
+                        let pk: Vec<String> = match r {
+                            Ok(r) => r.rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect(),
+                            Err(e) => return crate::ui::error(&crate::app().frame, &e),
+                        };
+                        let order = pk.iter().map(|c| dialect::quote(db, c)).collect::<Vec<_>>().join(", ");
+                        let q = |t: &str| if order.is_empty() { format!("SELECT * FROM {t}") } else { format!("SELECT * FROM {t} ORDER BY {order}") };
+                        let (qs, qt) = (q(&src_t), q(&tgt_t));
+                        Conn::meta_query(&s2, &qs, move |rs| {
+                            let rs = match rs {
+                                Ok(r) => r,
+                                Err(e) => return crate::ui::error(&crate::app().frame, &format!("{src_t}: {e}")),
+                            };
+                            let t2 = t.clone();
+                            Conn::meta_query(&t, &qt, move |rt| {
+                                let app = crate::app();
+                                let rt = match rt {
+                                    Ok(r) => r,
+                                    Err(e) => return crate::ui::error(&app.frame, &format!("{tgt_t}: {e}")),
+                                };
+                                match compare::data_diff(db, &tgt_t, &rs.cols, &rt.cols, &pk, &rs.rows, &rt.rows) {
+                                    Ok(d) if d.inserts.is_empty() && d.updates.is_empty() && d.deletes.is_empty() => {
+                                        crate::ui::info(&app.frame, &format!("{src_t} and {tgt_t} hold the same {} rows.", d.same))
+                                    }
+                                    Ok(d) => {
+                                        let mut text = format!(
+                                            "-- Data Compare: {src_t} (source) -> {tgt_t} (target)\n-- {} to insert, {} to update, {} to delete, {} the same. Review, then Run Script (F5) and Commit.\n\n",
+                                            d.inserts.len(),
+                                            d.updates.len(),
+                                            d.deletes.len(),
+                                            d.same
+                                        );
+                                        for s in d.deletes.iter().chain(&d.updates).chain(&d.inserts) {
+                                            text.push_str(s);
+                                            text.push_str(";\n");
+                                        }
+                                        app.open_worksheet(t2);
+                                        if let Some(ws) = app.current_sheet() {
+                                            ws.editor.set_text(&text);
+                                        }
+                                        app.status(0, "Data Compare done");
+                                    }
+                                    Err(e) => crate::ui::error(&app.frame, &e),
+                                }
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+}
+
 fn schema_of(c: &ConnRef, typed: String, cb: impl FnOnce(String) + 'static) {
     let db = c.borrow().kind;
     if !typed.trim().is_empty() {
