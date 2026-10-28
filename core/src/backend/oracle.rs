@@ -148,6 +148,11 @@ impl Oracle {
     pub fn connect(cfg: &ConnConfig, pw: &str, dir: &Path, prefs: &Prefs) -> Result<Self> {
         init(dir, cfg.options.get("tns_admin").or(Some(&prefs.tns_dir)).map(String::as_str).filter(|s| !s.trim().is_empty()))?;
         let mut k = Connector::new(&cfg.user, pw, connect_string(cfg));
+        // auth=external: OS authentication, Kerberos or a wallet's secure external password
+        // store (user and password empty, the TNS alias names the wallet entry).
+        if cfg.options.get("auth").is_some_and(|a| a.eq_ignore_ascii_case("external")) {
+            k.external_auth(true);
+        }
         // Expired password (ORA-28001): the app asks for a new one and passes it here once.
         if let Some(np) = cfg.options.get("new_password").filter(|s| !s.is_empty()) {
             k.new_password(np.as_str());

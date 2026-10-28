@@ -130,7 +130,7 @@ impl Worksheet {
         let bottom = AuiNotebook::builder(&split).with_style(AuiNotebookStyle::from_bits_retain(0x1 | 0x20 | 0x100)).build();
         // Output panes: read-only, highlighted like the editor.
         let mono = |p: &Panel| editor::sql_view(p, "");
-        let (qp, qs, qb, status) = pane(&bottom, &[("refresh", "Refresh (re-run)"), ("export", "Export…"), ("edit", "View / Edit Value… (Alt+Enter)")]);
+        let (qp, qs, qb, status) = pane(&bottom, &[("refresh", "Refresh (re-run)"), ("export", "Export…"), ("edit", "View / Edit Value… (Alt+Enter)"), ("pin", "Pin: keep this result in a tab of its own"), ("actions", "Show SQL: the statement of this result")]);
         let results = ResultGrid::new(&qp);
         results.st.borrow_mut().db = Some(conn.borrow().kind);
         qs.add(&results.grid, 1, SizerFlag::Expand, 0);
@@ -217,6 +217,8 @@ impl Worksheet {
             (qb[0], Worksheet::rerun),
             (qb[1], |w| w.results.export_dialog()),
             (qb[2], |w| w.results.edit_value()),
+            (qb[3], Worksheet::pin_result),
+            (qb[4], Worksheet::show_sql),
             (sb[0], |w| editor::show(&w.script_out, "")),
             (sb[1], |w| save_text(&w.panel, &w.script_out.get_text())),
             (db[0], |w| w.set_output(true)),
@@ -1148,6 +1150,49 @@ impl Worksheet {
     pub fn probe(&self) -> (usize, bool, String) {
         let st = self.results.st.borrow();
         (st.rows.len(), st.done, self.script_out.get_text())
+    }
+
+    /// Pin: the fetched rows of the Query Result copied into a tab of their own (closable), so
+    /// the next run does not replace them.
+    fn pin_result(&self) {
+        let (cols, rows) = {
+            let st = self.results.st.borrow();
+            if st.cols.is_empty() {
+                return;
+            }
+            let h = st.hidden;
+            (st.cols[h..].to_vec(), st.rows.iter().filter(|r| !r.deleted).map(|r| r.cur[h..].to_vec()).collect::<Vec<_>>())
+        };
+        let label: String = self.last.borrow().as_deref().unwrap_or("").trim_start_matches('\u{1}').split_whitespace().collect::<Vec<_>>().join(" ").chars().take(28).collect();
+        let (p, s, btns, note) = pane(&self.bottom, &[("clear", "Close this pinned result"), ("export", "Export…")]);
+        let g = ResultGrid::new(&p);
+        g.st.borrow_mut().db = Some(self.kind());
+        s.add(&g.grid, 1, SizerFlag::Expand, 0);
+        p.set_sizer(s, true);
+        note.set_label(&format!("{} rows, pinned {}", rows.len(), chrono::Local::now().format("%H:%M:%S")));
+        g.set(cols, rows);
+        self.bottom.add_page(&p, &format!("Pinned: {label}"), true);
+        let bottom = self.bottom;
+        btns[0].on_click(move |_| {
+            let i = bottom.get_page_index(&p);
+            if i >= 0 {
+                bottom.delete_page(i as usize);
+            }
+        });
+        let g2 = g.clone();
+        btns[1].on_click(move |_| g2.export_dialog());
+    }
+
+    /// Show SQL: the statement whose result the Query Result holds.
+    fn show_sql(&self) {
+        let Some(sql) = self.last.borrow().clone() else { return };
+        let dlg = Dialog::builder(&self.panel, "SQL").with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(640, 320).build();
+        let view = editor::sql_view(&dlg, sql.trim_start_matches('\u{1}'));
+        let s = BoxSizer::builder(Orientation::Vertical).build();
+        s.add(&view, 1, SizerFlag::Expand | SizerFlag::All, 6);
+        dlg.set_sizer(s, true);
+        dlg.show_modal();
+        dlg.destroy();
     }
 
     /// The connection's colour above the toolbar, or nothing.

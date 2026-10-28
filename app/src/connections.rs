@@ -923,7 +923,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let colour = Choice::builder(&dlg).with_choices(std::iter::once("None".to_string()).chain(config::CONN_COLOURS.iter().map(|c| c.0.to_string())).collect()).build();
     colour.set_tooltip("Marks this connection's worksheets and tree node (e.g. red for production)");
     startup.set_tooltip("Run on every new session, ; separated, e.g. ALTER SESSION SET CURRENT_SCHEMA = HR");
-    opts.set_tooltip("Driver options, e.g. ssh=user@bastion[:22]; ssh_key=~/.ssh/id_ed25519 (SSH tunnel); sslmode=verify-full; trust_cert=true (SQL Server self-signed); ssl=true; verify=false (MySQL); https=true; allow_http=true (ClickHouse); tns_admin=/path");
+    opts.set_tooltip("Driver options, e.g. ssh=user@bastion[:22]; ssh_key=~/.ssh/id_ed25519 (SSH tunnel); sslmode=verify-full; trust_cert=true (SQL Server self-signed); ssl=true; verify=false (MySQL); https=true; allow_http=true (ClickHouse); tns_admin=/path; auth=external (Oracle OS / Kerberos / wallet login, no password)");
     let status = StaticText::builder(&dlg).with_label("Status :").build();
 
     let top = FlexGridSizer::builder(0, 2).with_vgap(6).with_hgap(8).build();
