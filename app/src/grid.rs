@@ -145,6 +145,8 @@ pub struct State {
     pub db: Option<Kind>,
     /// Column filters: rows a filter rejects are hidden.
     filters: Vec<(usize, ColFilter)>,
+    /// The export streaming the rest of the cursor to a file: 0 running, 1 cancel asked, 2 done.
+    export_cancel: Option<Rc<std::cell::Cell<u8>>>,
     /// Last "Find in Results" text, for Find Next.
     find: String,
     /// Count every row of the result on the server (set by the worksheet / data tab).
@@ -1340,7 +1342,17 @@ impl ResultGrid {
         };
         let Some(rx) = rx else { return done(ex, &path) };
         let mut ex = Some(ex);
+        let cancel = Rc::new(std::cell::Cell::new(0u8));
+        self.st.borrow_mut().export_cancel = Some(cancel.clone());
         crate::hub::every_tick(move || {
+            if cancel.get() == 1 {
+                // Dropping the receiver stops the fetch; the partial file goes.
+                rx.borrow_mut().take();
+                drop(ex.take());
+                let _ = std::fs::remove_file(&path);
+                crate::app().status(0, "Export cancelled");
+                return false;
+            }
             let r = rx.borrow();
             // Bounded per tick so the UI stays responsive while a big result drains.
             for _ in 0..20 {
@@ -1356,14 +1368,16 @@ impl ResultGrid {
                         // Streamed rows never reach the grid: free their spilled LOB files now.
                         b.iter().flatten().flatten().for_each(|v| rsqldev_core::lob::release(v));
                         if let Err(e) = res {
+                            cancel.set(2);
                             fail(&grid, &path, e);
                             return false;
                         }
-                        crate::app().status(0, &format!("Exporting… {} rows", x.count()));
+                        crate::app().status(0, &format!("Exporting… {} rows (Run ▸ Cancel stops)", x.count()));
                     }
                     Ok(Event::Columns(_)) => {}
                     Err(TryRecvError::Empty) => return true,
                     Ok(Event::Rows(_)) | Err(TryRecvError::Disconnected) => {
+                        cancel.set(2);
                         done(ex.take().unwrap(), &path);
                         return false;
                     }
@@ -1371,6 +1385,17 @@ impl ResultGrid {
             }
             true
         });
+    }
+
+    /// Stop a running export (Run ▸ Cancel). True when one was running.
+    pub fn cancel_export(&self) -> bool {
+        match self.st.borrow_mut().export_cancel.take() {
+            Some(c) if c.get() == 0 => {
+                c.set(1);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Export… button: pick a format, then save.

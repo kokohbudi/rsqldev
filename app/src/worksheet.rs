@@ -1033,6 +1033,9 @@ impl Worksheet {
     }
 
     pub fn cancel(&self) {
+        if self.results.cancel_export() {
+            return self.status.set_label("Export cancelled");
+        }
         self.running.set(false);
         self.set_busy(false);
         self.conn().borrow().cancel();
