@@ -109,6 +109,11 @@ const ID_DP_IMPORT: i32 = ID_HIGHEST + 48;
 const ID_DP_JOBS: i32 = ID_HIGHEST + 49;
 const ID_INSERT_ROW: i32 = ID_HIGHEST + 50;
 const ID_EDIT_VALUE: i32 = ID_HIGHEST + 51;
+const ID_COMMENT: i32 = ID_HIGHEST + 52;
+const ID_GOTO_LINE: i32 = ID_HIGHEST + 53;
+const ID_CLOSE_ALL: i32 = ID_HIGHEST + 54;
+const ID_NEXT_TAB: i32 = ID_HIGHEST + 55;
+const ID_PREV_TAB: i32 = ID_HIGHEST + 56;
 
 enum Page {
     Sheet(SheetRef),
@@ -794,10 +799,32 @@ impl App {
                     s.save(false);
                 }
             }
-            ID_BACK | ID_FORWARD => {
+            ID_BACK | ID_FORWARD | ID_PREV_TAB | ID_NEXT_TAB => {
                 let (n, i) = (self.nb.page_count() as i32, self.nb.get_selection());
                 if n > 1 && i >= 0 {
-                    self.nb.set_selection(((i + if id == ID_BACK { n - 1 } else { 1 }) % n) as usize);
+                    self.nb.set_selection(((i + if matches!(id, ID_BACK | ID_PREV_TAB) { n - 1 } else { 1 }) % n) as usize);
+                }
+            }
+            ID_CLOSE_ALL => {
+                // Last tab first; stop when the user cancels one.
+                loop {
+                    let n = self.pages.borrow().len();
+                    let Some(i) = n.checked_sub(1) else { break };
+                    let panel = self.pages.borrow()[i].panel();
+                    let idx = self.nb.get_page_index(&panel);
+                    if idx >= 0 {
+                        self.nb.set_selection(idx as usize);
+                    }
+                    self.close_current();
+                    if self.pages.borrow().len() == n {
+                        break;
+                    }
+                }
+                if self.start.get().is_valid() {
+                    let idx = self.nb.get_page_index(&self.start.get());
+                    if idx >= 0 {
+                        self.nb.delete_page(idx as usize);
+                    }
                 }
             }
             ID_EXIT => self.frame.close(false),
@@ -842,9 +869,11 @@ impl App {
                     complete::show(s.editor, &s.conn(), true);
                 }
             }
-            ID_DUP_LINES | ID_LINES_UP | ID_LINES_DOWN | ID_BRACE | ID_BOOKMARK | ID_BOOKMARK_NEXT | ID_BOOKMARK_PREV => {
+            ID_DUP_LINES | ID_LINES_UP | ID_LINES_DOWN | ID_BRACE | ID_BOOKMARK | ID_BOOKMARK_NEXT | ID_BOOKMARK_PREV | ID_COMMENT | ID_GOTO_LINE => {
                 let Some(e) = sheet.map(|s| s.editor) else { return true };
                 match id {
+                    ID_COMMENT => editor::toggle_comment(e),
+                    ID_GOTO_LINE => editor::goto_line(e, &self.frame),
                     ID_DUP_LINES => editor::duplicate_lines(e),
                     ID_LINES_UP | ID_LINES_DOWN => editor::move_lines(e, id == ID_LINES_UP),
                     ID_BRACE => editor::goto_brace(e),
@@ -1026,6 +1055,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_SAVEAS, "Save &As…", "")
         .append_item(ID_SAVEALL, "Save A&ll\tCtrl+Shift+S", "")
         .append_item(ID_CLOSE_TAB, "&Close\tCtrl+W", "Close the current tab")
+        .append_item(ID_CLOSE_ALL, "Close A&ll\tCtrl+Shift+W", "Close every tab (asks for unsaved worksheets)")
         .append_item(ID_RECOVER, "&Recover Unsaved Worksheet…\tCtrl+Shift+T", "Reopen a worksheet closed without saving")
         .append_separator()
         .append_item(ID_EXIT, "E&xit\tCtrl+Q", "")
@@ -1046,10 +1076,12 @@ fn menus(frame: &Frame) {
         .append_item(ID_SNIPPET, "Insert S&nippet…\tCtrl+Shift+J", "Insert a SQL template at the caret")
         .append_item(ID_SNIPPET_SAVE, "Save Selection as Snippet…", "Keep the selected SQL as one of your snippets")
         .append_separator()
+        .append_item(ID_COMMENT, "Toggle Line Co&mment\tCtrl+/", "-- on every selected line, or off when all have one (Alt+Shift+C: block comment)")
         .append_item(ID_DUP_LINES, "&Duplicate Lines\tCtrl+Shift+D", "")
         .append_item(ID_LINES_UP, "Move Lines &Up\tAlt+Up", "")
         .append_item(ID_LINES_DOWN, "Move Lines Do&wn\tAlt+Down", "")
         .append_item(ID_BRACE, "Go to &Matching Bracket\tCtrl+]", "")
+        .append_item(ID_GOTO_LINE, "&Go to Line…\tCtrl+G", "")
         .append_separator()
         .append_item(ID_BOOKMARK, "Toggle &Bookmark\tCtrl+K", "")
         .append_item(ID_BOOKMARK_NEXT, "Ne&xt Bookmark\tF2", "")
@@ -1064,12 +1096,15 @@ fn menus(frame: &Frame) {
         .append_item(ID_TOGGLE_NAV, "&Connections\tCtrl+Shift+L", "Show or hide the Connections navigator")
         .append_item(ID_FIND_OBJECT, "Find DB &Object…\tCtrl+Shift+O", "Find tables, views, packages… by name in every schema")
         .append_separator()
+        .append_item(ID_NEXT_TAB, "&Next Tab\tAlt+PgDn", "")
+        .append_item(ID_PREV_TAB, "&Previous Tab\tAlt+PgUp", "")
+        .append_separator()
         .append_radio_item(ID_THEME_LIGHT, "&Light Appearance", "SQL Developer's default look")
         .append_radio_item(ID_THEME_DARK, "&Dark Appearance", "")
         .append_radio_item(ID_THEME_SYSTEM, "&Follow System Appearance", "")
         .build();
     let run = Menu::builder()
-        .append_item(ID_RUN, "Run &Statement\tCtrl+Enter", "")
+        .append_item(ID_RUN, "Run &Statement\tCtrl+Enter", "Also F9")
         .append_item(ID_SCRIPT, "Run S&cript\tF5", "")
         .append_item(ID_EXPLAIN, "&Explain Plan\tF10", "")
         .append_item(ID_AUTOTRACE, "&Autotrace\tF6", "Run the query and show its plan with actual rows and time")
@@ -1142,7 +1177,7 @@ fn toolbar(frame: &Frame) {
 }
 
 const SHORTCUTS: &str = "Worksheet
-  Run Statement            Ctrl/Cmd+Enter
+  Run Statement            Ctrl/Cmd+Enter or F9
   Run Script               F5
   Explain Plan             F10
   Autotrace                F6
@@ -1150,6 +1185,7 @@ const SHORTCUTS: &str = "Worksheet
   Commit / Rollback        F11 / F12 (also in a table's Data tab)
   Cancel                   Ctrl/Cmd+.
   SQL History              F8
+  History previous / next  Ctrl/Cmd+Up / Down (with Shift: append)
   Clear                    Ctrl/Cmd+D
 
 Data tab (table editor)
@@ -1164,6 +1200,10 @@ Editor
   Completion Insight       Ctrl+Space (also after typing alias.)
   Format SQL               Ctrl/Cmd+Shift+F (or Ctrl/Cmd+F7)
   Insert Snippet           Ctrl/Cmd+Shift+J
+  Toggle Line Comment      Ctrl/Cmd+/
+  Toggle Block Comment     Alt+Shift+C
+  Upper / Lower / InitCap  Alt+'
+  Go to Line               Ctrl/Cmd+G
   Duplicate Lines          Ctrl/Cmd+Shift+D
   Move Lines Up / Down     Alt+Up / Alt+Down
   Matching Bracket         Ctrl/Cmd+]
@@ -1176,7 +1216,8 @@ Editor
 Files and tabs
   New Connection           Ctrl/Cmd+Shift+C
   Open / Save / Save All   Ctrl/Cmd+O / S / Shift+S
-  Close Tab                Ctrl/Cmd+W
+  Close Tab / Close All    Ctrl/Cmd+W / Ctrl/Cmd+Shift+W
+  Next / Previous Tab      Alt+PgDn / Alt+PgUp
   Recover Worksheet        Ctrl/Cmd+Shift+T
   New SQL Worksheet        Ctrl/Cmd+N (also Alt+F10)
   Find DB Object           Ctrl/Cmd+Shift+O

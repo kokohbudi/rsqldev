@@ -192,7 +192,7 @@ fn line_block(stc: &StyledTextCtrl) -> (i32, i32) {
     (stc.position_from_line(l0), end)
 }
 
-fn replace(stc: &StyledTextCtrl, a: i32, b: i32, text: &str) {
+pub fn replace(stc: &StyledTextCtrl, a: i32, b: i32, text: &str) {
     stc.set_target_start(a);
     stc.set_target_end(b);
     stc.replace_target(text);
@@ -206,6 +206,35 @@ pub fn duplicate_lines(stc: StyledTextCtrl) {
     let block = if block.ends_with('\n') { block.to_string() } else { format!("{block}\n") };
     replace(&stc, a, b, &format!("{block}{}", &text[a as usize..b as usize]));
     stc.set_selection(a + block.len() as i32, a + 2 * block.len() as i32 - 1);
+}
+
+/// Edit ▸ Toggle Line Comment: `-- ` on every touched line, or off when all have one.
+pub fn toggle_comment(stc: StyledTextCtrl) {
+    let (a, b) = line_block(&stc);
+    let text = stc.get_text();
+    let Some(block) = text.get(a as usize..b as usize) else { return };
+    let out = rsqldev_core::format::toggle_line_comments(block);
+    replace(&stc, a, b, &out);
+    stc.set_selection(a, a + out.trim_end_matches(['\r', '\n']).len() as i32);
+}
+
+/// Edit ▸ Toggle Block Comment: wrap the selection in `/* */`, or unwrap it.
+pub fn toggle_block_comment(stc: StyledTextCtrl) {
+    let (a, b) = (stc.get_selection_start(), stc.get_selection_end());
+    let text = stc.get_text();
+    let Some(sel) = text.get(a as usize..b as usize).filter(|s| !s.is_empty()) else { return };
+    let out = rsqldev_core::format::toggle_block_comment(sel);
+    replace(&stc, a, b, &out);
+    stc.set_selection(a, a + out.len() as i32);
+}
+
+/// Navigate ▸ Go to Line…
+pub fn goto_line(stc: StyledTextCtrl, parent: &dyn WxWidget) {
+    let (cur, n) = (stc.line_from_position(stc.get_current_pos()) + 1, stc.get_line_count());
+    let Some(s) = crate::ui::ask(parent, &format!("Line number (1 - {n}):"), "Go to Line", &cur.to_string()) else { return };
+    let Ok(line) = s.trim().parse::<i32>() else { return };
+    stc.goto_line((line - 1).clamp(0, n - 1));
+    stc.set_focus();
 }
 
 /// Edit ▸ Move Lines Up / Down: swap the touched lines with the line above / below.

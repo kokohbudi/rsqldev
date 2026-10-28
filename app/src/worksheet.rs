@@ -52,6 +52,8 @@ pub struct Worksheet {
     /// Bumped per Run Statement: a late editability check of an older run is dropped.
     run_gen: Cell<u64>,
     last_line: Cell<i32>,
+    /// Ctrl/Cmd+Up / Down position in SQL History, counted back from the newest entry.
+    hist_at: Cell<Option<usize>>,
 }
 
 const P_RESULT: usize = 0;
@@ -188,6 +190,7 @@ impl Worksheet {
             last_line: Cell::new(1),
             b_cancel,
             busy: Cell::new(false),
+            hist_at: Cell::new(None),
             autosave_id: crate::autosave::next_id(),
             unsaved: Cell::new(false),
         });
@@ -266,12 +269,21 @@ impl Worksheet {
                 w.unsaved.set(true);
             }
         });
-        // Ctrl/Cmd+F7 formats too (SQL Developer's key; the menu shows Ctrl/Cmd+Shift+F).
+        // SQL Developer's editor keys without a menu item: Ctrl/Cmd+F7 formats (the menu shows
+        // Ctrl/Cmd+Shift+F), F9 runs the statement, Ctrl/Cmd+Up / Down step through SQL History
+        // (with Shift: append), Alt+' cycles the case, Alt+Shift+C toggles a block comment.
         let w = Rc::downgrade(&ws);
         ws.editor.on_key_down(move |e| {
             if let (WindowEventData::Keyboard(k), Some(w)) = (&e, w.upgrade()) {
-                if k.cmd_down() && k.get_key_code() == Some(wxdragon::keycode::WXK_F7) {
-                    return w.format_sql();
+                use wxdragon::keycode::{WXK_DOWN, WXK_F7, WXK_F9, WXK_UP};
+                let (code, cmd, alt, shift) = (k.get_key_code().unwrap_or(0), k.cmd_down(), k.alt_down(), k.shift_down());
+                match code {
+                    WXK_F7 if cmd => return w.format_sql(),
+                    WXK_F9 if !cmd && !alt && !shift => return w.run_statement(),
+                    WXK_UP | WXK_DOWN if cmd && !alt => return w.history_step(code == WXK_UP, shift),
+                    c if c == '\'' as i32 && alt && !cmd => return w.toggle_case(),
+                    c if c == 'C' as i32 && alt && shift && !cmd => return crate::editor::toggle_block_comment(w.editor),
+                    _ => {}
                 }
             }
             e.skip(true);
@@ -911,6 +923,32 @@ impl Worksheet {
                 self.editor.insert_text(self.editor.get_current_pos(), &format!("{sql}\n"));
             }
         }
+    }
+
+    /// Ctrl/Cmd+Up / Down: replace the worksheet text with the previous (older) / next statement
+    /// of SQL History; with `append` it goes below the text instead. One undo step each.
+    fn history_step(&self, older: bool, append: bool) {
+        let h = crate::app().history();
+        if h.is_empty() {
+            return;
+        }
+        let at = match (self.hist_at.get(), older) {
+            (None, true) => 0,
+            (None, false) => return,
+            (Some(i), true) => (i + 1).min(h.len() - 1),
+            (Some(i), false) => i.saturating_sub(1),
+        };
+        self.hist_at.set(Some(at));
+        let sql = h[h.len() - 1 - at].trim_end();
+        let e = self.editor;
+        let len = e.get_length();
+        if append {
+            let sep = if len == 0 || e.get_text().ends_with('\n') { "" } else { "\n" };
+            crate::editor::replace(&e, len, len, &format!("{sep}{sql}\n"));
+        } else {
+            crate::editor::replace(&e, 0, len, sql);
+        }
+        e.goto_pos(e.get_length());
     }
 
     /// (fetched rows, all fetched, script output) for the self-test.

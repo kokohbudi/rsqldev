@@ -239,9 +239,58 @@ pub fn script(text: &str, db: Db) -> String {
     out
 }
 
+/// Edit ▸ Toggle Line Comment on whole lines: when every non-blank line is a `--` comment the
+/// markers come off (with one following space), otherwise every non-blank line gets `-- `.
+pub fn toggle_line_comments(block: &str) -> String {
+    let lines: Vec<&str> = block.split_inclusive('\n').collect();
+    let commented = lines.iter().filter(|l| !l.trim().is_empty()).all(|l| l.trim_start().starts_with("--"));
+    lines
+        .iter()
+        .map(|l| {
+            if l.trim().is_empty() {
+                l.to_string()
+            } else if commented {
+                let at = l.len() - l.trim_start().len();
+                let rest = &l[at + 2..];
+                format!("{}{}", &l[..at], rest.strip_prefix(' ').unwrap_or(rest))
+            } else {
+                format!("-- {l}")
+            }
+        })
+        .collect()
+}
+
+/// Toggle Block Comment: unwrap `/* … */` around the selection, or wrap it in one.
+pub fn toggle_block_comment(sel: &str) -> String {
+    let t = sel.trim();
+    match t.strip_prefix("/*").and_then(|r| r.strip_suffix("*/")) {
+        Some(inner) if t.len() >= 4 => {
+            let lead = &sel[..sel.len() - sel.trim_start().len()];
+            let tail = &sel[sel.trim_end().len()..];
+            format!("{lead}{}{tail}", inner.strip_prefix(' ').and_then(|i| i.strip_suffix(' ')).unwrap_or(inner))
+        }
+        _ => format!("/* {sel} */"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comment_toggles() {
+        let src = "select 1\n\n  from dual\n";
+        let on = toggle_line_comments(src);
+        assert_eq!(on, "-- select 1\n\n--   from dual\n");
+        assert_eq!(toggle_line_comments(&on), src);
+        // Mixed block: comment all; existing comments get a second marker.
+        assert_eq!(toggle_line_comments("--a\nb"), "-- --a\n-- b");
+        assert_eq!(toggle_line_comments("  --x\n--y"), "  x\ny");
+        let b = toggle_block_comment("a + b");
+        assert_eq!(b, "/* a + b */");
+        assert_eq!(toggle_block_comment(&b), "a + b");
+        assert_eq!(toggle_block_comment("/**/"), "");
+    }
 
     /// Formatting only changes whitespace and keyword case.
     #[test]
