@@ -124,6 +124,7 @@ const ID_XPLAN: i32 = ID_HIGHEST + 63;
 const ID_EXT_PASTE: i32 = ID_HIGHEST + 64;
 const ID_EXPORT_CONNS: i32 = ID_HIGHEST + 65;
 const ID_IMPORT_FILE: i32 = ID_HIGHEST + 66;
+const ID_RECENT: i32 = ID_HIGHEST + 67;
 const ID_DESCRIBE: i32 = ID_HIGHEST + 61;
 
 enum Page {
@@ -635,6 +636,7 @@ impl App {
         let title = c.borrow().cfg.name.clone();
         let ws = Worksheet::new(&self.nb, c);
         self.add_page(Page::Sheet(ws.clone()), &title);
+        ws.paint_strip();
         ws.editor.set_focus();
     }
 
@@ -847,6 +849,16 @@ impl App {
         }
     }
 
+    /// File ▸ Recent Files: `p` first, ten kept.
+    pub fn note_recent(&self, p: &std::path::Path) {
+        let s = p.display().to_string();
+        let mut prefs = self.prefs();
+        prefs.recent_files.retain(|x| *x != s);
+        prefs.recent_files.insert(0, s);
+        prefs.recent_files.truncate(10);
+        self.set_prefs(prefs);
+    }
+
     pub fn remember_clip(&self, text: &str) {
         if text.trim().is_empty() {
             return;
@@ -1029,10 +1041,24 @@ impl App {
                 a.add_page(Page::TopSql(s), &title);
             }),
             ID_UPDATES => check_updates(true),
-            ID_OPEN => {
-                let d = FileDialog::builder(&self.frame).with_message("Open SQL file").with_style(FileDialogStyle::Open).with_wildcard("SQL files (*.sql)|*.sql|All files (*)|*").build();
-                if d.show_modal() == ID_OK {
-                    if let Some(p) = d.get_path() {
+            ID_OPEN | ID_RECENT => {
+                let picked = if id == ID_RECENT {
+                    let recent = self.prefs().recent_files;
+                    if recent.is_empty() {
+                        return {
+                            ui::info(&self.frame, "No recent files yet.");
+                            true
+                        };
+                    }
+                    let refs: Vec<&str> = recent.iter().map(String::as_str).collect();
+                    let d = SingleChoiceDialog::builder(&self.frame, "Open:", "Recent Files", &refs).build();
+                    (d.show_modal() == ID_OK && d.get_selection() >= 0).then(|| recent[d.get_selection() as usize].clone())
+                } else {
+                    let d = FileDialog::builder(&self.frame).with_message("Open SQL file").with_style(FileDialogStyle::Open).with_wildcard("SQL files (*.sql)|*.sql|All files (*)|*").build();
+                    (d.show_modal() == ID_OK).then(|| d.get_path()).flatten()
+                };
+                {
+                    if let Some(p) = picked {
                         self.pick_conn(move |c| {
                             let app = app();
                             app.open_worksheet(c);
@@ -1397,6 +1423,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_EXPORT_CONNS, "E&xport Connections…", "Save the connections (without passwords) to a file to import elsewhere")
         .append_item(ID_NEW_SHEET, "New SQL &Worksheet\tCtrl+N", "Open a SQL worksheet on a connection")
         .append_item(ID_OPEN, "&Open…\tCtrl+O", "Open a SQL file in a worksheet")
+        .append_item(ID_RECENT, "Recent &Files…", "Reopen one of the last SQL files opened or saved")
         .append_item(ID_SAVE, "&Save\tCtrl+S", "")
         .append_item(ID_SAVEAS, "Save &As…", "")
         .append_item(ID_SAVEALL, "Save A&ll\tCtrl+Shift+S", "")

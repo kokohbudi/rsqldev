@@ -351,7 +351,12 @@ impl Navigator {
             } else {
                 folders.entry(&c.folder).or_insert_with(|| self.add(&root, &c.folder, Node::Folder, false).unwrap()).clone()
             };
-            self.add(&parent, &c.name, Node::Conn(c.name.clone()), true);
+            if let Some(i) = self.add(&parent, &c.name, Node::Conn(c.name.clone()), true) {
+                if let Some(rgb) = config::conn_colour(&c.color) {
+                    self.tree.set_item_text_colour(&i, crate::theme::c(rgb));
+                    self.tree.set_item_bold(&i, true);
+                }
+            }
         }
     }
 
@@ -915,6 +920,8 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let tns = ComboBox::builder(&dlg).with_choices(rsqldev_core::backend::tns_aliases(tns_admin.as_deref(), &crate::app().prefs())).build();
     let opts = text();
     let startup = text();
+    let colour = Choice::builder(&dlg).with_choices(std::iter::once("None".to_string()).chain(config::CONN_COLOURS.iter().map(|c| c.0.to_string())).collect()).build();
+    colour.set_tooltip("Marks this connection's worksheets and tree node (e.g. red for production)");
     startup.set_tooltip("Run on every new session, ; separated, e.g. ALTER SESSION SET CURRENT_SCHEMA = HR");
     opts.set_tooltip("Driver options, e.g. ssh=user@bastion[:22]; ssh_key=~/.ssh/id_ed25519 (SSH tunnel); sslmode=verify-full; trust_cert=true (SQL Server self-signed); ssl=true; verify=false (MySQL); https=true; allow_http=true (ClickHouse); tns_admin=/path");
     let status = StaticText::builder(&dlg).with_label("Status :").build();
@@ -924,6 +931,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let r_name = put(&top, &dlg, "Name", name);
     let _ = put(&top, &dlg, "Database Type", dbtype);
     let _ = put(&top, &dlg, "Folder", folder);
+    let _ = put(&top, &dlg, "Color", colour);
     let ub = StaticBoxSizerBuilder::new_with_label(Orientation::Vertical, &dlg, "User Info").build();
     let ug = FlexGridSizer::builder(0, 2).with_vgap(6).with_hgap(8).build();
     ug.add_growable_col(1, 1);
@@ -972,6 +980,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
         tns.set_value(&c.tns);
         opts.set_value(&c.options.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; "));
         startup.set_value(&c.startup_sql);
+        colour.set_selection(config::CONN_COLOURS.iter().position(|x| x.0 == c.color).map_or(0, |i| i + 1) as u32);
     };
     let rows_user = std::rc::Rc::new(rows_user);
     let rows_det = std::rc::Rc::new(rows_det);
@@ -1049,6 +1058,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
             tns: tns.get_value().trim().to_string(),
             options: opts.get_value().split(';').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect(),
             startup_sql: startup.get_value().trim().to_string(),
+            color: colour.get_string_selection().filter(|c| c != "None").unwrap_or_default(),
             ..Default::default()
         };
         c.database = match d.backend {

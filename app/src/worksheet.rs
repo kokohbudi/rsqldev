@@ -50,6 +50,7 @@ pub struct Worksheet {
     /// Bumped per Run Statement: a late editability check of an older run is dropped.
     run_gen: Cell<u64>,
     last_line: Cell<i32>,
+    strip: Panel,
     /// Ctrl/Cmd+Up / Down position in SQL History, counted back from the newest entry.
     hist_at: Cell<Option<usize>>,
 }
@@ -154,7 +155,11 @@ impl Worksheet {
         split.set_minimum_pane_size(60);
 
         let find = crate::find::FindBar::new(&panel, editor);
+        // Connection colour strip (production warning), shown when the connection has one.
+        let strip = Panel::builder(&panel).build();
+        strip.set_min_size(Size::new(-1, 4));
         let s = BoxSizer::builder(Orientation::Vertical).build();
+        s.add(&strip, 0, SizerFlag::Expand, 0);
         s.add_sizer(&bar, 0, SizerFlag::Expand, 0);
         s.add(&find.panel, 0, SizerFlag::Expand, 0);
         s.add(&split, 1, SizerFlag::Expand, 0);
@@ -191,6 +196,7 @@ impl Worksheet {
             b_cancel,
             busy: Cell::new(false),
             hist_at: Cell::new(None),
+            strip,
             autosave_id: crate::autosave::next_id(),
             unsaved: Cell::new(false),
         });
@@ -235,6 +241,7 @@ impl Worksheet {
                     ws.results.st.borrow_mut().db = Some(c.borrow().kind);
                     *ws.conn.borrow_mut() = c;
                     crate::app().retitle(&ws.panel, &name);
+                    ws.paint_strip();
                 }
             });
         });
@@ -1143,10 +1150,21 @@ impl Worksheet {
         (st.rows.len(), st.done, self.script_out.get_text())
     }
 
+    /// The connection's colour above the toolbar, or nothing.
+    pub fn paint_strip(&self) {
+        let rgb = rsqldev_core::config::conn_colour(&self.conn().borrow().cfg.color);
+        if let Some(rgb) = rgb {
+            self.strip.set_background_color(crate::theme::c(rgb));
+        }
+        self.strip.show(rgb.is_some());
+        self.panel.layout();
+    }
+
     pub fn open_file(&self, p: PathBuf) -> std::io::Result<()> {
         let s = std::fs::read_to_string(&p)?;
         self.editor.set_text(&s);
         self.editor.empty_undo_buffer();
+        crate::app().note_recent(&p);
         *self.path.borrow_mut() = Some(p);
         Ok(())
     }
@@ -1173,6 +1191,7 @@ impl Worksheet {
         match std::fs::write(&path, self.editor.get_text()) {
             Ok(()) => {
                 self.editor.set_save_point();
+                crate::app().note_recent(&path);
                 self.status.set_label(&format!("Saved {}", path.display()));
                 *self.path.borrow_mut() = Some(path);
             }

@@ -33,6 +33,9 @@ pub struct ConnConfig {
     /// ALTER SESSION SET ... (SQL Developer's connection startup script).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub startup_sql: String,
+    /// Connection colour (e.g. red for production): one of [`CONN_COLOURS`], "" = none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub color: String,
     /// Connections-tree name filters, keyed by [`filter_key`] (owner + object kind).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub filters: BTreeMap<String, String>,
@@ -110,6 +113,15 @@ pub struct Prefs {
     pub reopen_worksheets: bool,
     /// Code templates: abbreviation + Tab in the editor expands to the text (`|` = caret).
     pub code_templates: BTreeMap<String, String>,
+    /// File ▸ Recent Files, newest first.
+    pub recent_files: Vec<String>,
+}
+
+/// Connection colours offered in the dialog: (name, RGB).
+pub const CONN_COLOURS: [(&str, u32); 6] = [("Red", 0xd62828), ("Orange", 0xf77f00), ("Yellow", 0xe9c46a), ("Green", 0x2a9d8f), ("Blue", 0x277da1), ("Purple", 0x7b2cbf)];
+
+pub fn conn_colour(name: &str) -> Option<u32> {
+    CONN_COLOURS.iter().find(|c| c.0.eq_ignore_ascii_case(name)).map(|c| c.1)
 }
 
 /// Default code templates (SQL Developer ships similar ones).
@@ -170,6 +182,7 @@ impl Default for Prefs {
             save_binds: true,
             reopen_worksheets: true,
             code_templates: default_templates(),
+            recent_files: vec![],
         }
     }
 }
