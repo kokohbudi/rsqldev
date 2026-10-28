@@ -8,14 +8,38 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Format {
+    /// Delimited text (comma by default, see [`Options::delimiter`]).
     Csv,
     Xlsx,
     Json,
     Inserts,
+    Html,
+    Xml,
 }
 
-fn csv_field(s: &str) -> String {
-    if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() }
+/// Export wizard options.
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// Column names first (CSV, HTML).
+    pub header: bool,
+    /// CSV / delimited separator.
+    pub delimiter: char,
+    /// Table named in INSERT statements.
+    pub table: String,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { header: true, delimiter: ',', table: "EXPORT_TABLE".into() }
+    }
+}
+
+fn csv_field(s: &str, delim: char) -> String {
+    if s.contains([delim, '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() }
+}
+
+fn xml_esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 /// Tab separated, for the clipboard (pastes into spreadsheets). Spilled LOBs copy as their label.
@@ -73,9 +97,19 @@ fn full(row: &[Cell]) -> Vec<Cell> {
 }
 
 /// Text formats, written piece by piece.
-fn begin(w: &mut dyn Write, fmt: Format, cols: &[Column]) -> std::io::Result<()> {
+fn begin(w: &mut dyn Write, fmt: Format, cols: &[Column], o: &Options) -> std::io::Result<()> {
+    let d = o.delimiter.to_string();
     match fmt {
-        Format::Csv => writeln!(w, "{}", cols.iter().map(|c| csv_field(&c.name)).collect::<Vec<_>>().join(",")),
+        Format::Csv if !o.header => Ok(()),
+        Format::Csv => writeln!(w, "{}", cols.iter().map(|c| csv_field(&c.name, o.delimiter)).collect::<Vec<_>>().join(&d)),
+        Format::Html => {
+            write!(w, "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"><title>Export</title></head><body>\n<table border=\"1\">\n")?;
+            if o.header {
+                writeln!(w, "<tr>{}</tr>", cols.iter().map(|c| format!("<th>{}</th>", xml_esc(&c.name))).collect::<String>())?;
+            }
+            Ok(())
+        }
+        Format::Xml => write!(w, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<RESULTS>\n"),
         Format::Json => write!(
             w,
             "{{\"results\":[{{\"columns\":[{}],\"items\":[\n",
@@ -85,10 +119,17 @@ fn begin(w: &mut dyn Write, fmt: Format, cols: &[Column]) -> std::io::Result<()>
     }
 }
 
-fn row(w: &mut dyn Write, fmt: Format, cols: &[Column], db: Db, table: &str, n: u64, r: &[Cell]) -> std::io::Result<()> {
+fn row(w: &mut dyn Write, fmt: Format, cols: &[Column], db: Db, o: &Options, n: u64, r: &[Cell]) -> std::io::Result<()> {
     let r = full(r);
+    let table = o.table.as_str();
     match fmt {
-        Format::Csv => writeln!(w, "{}", r.iter().map(|v| v.as_deref().map(csv_field).unwrap_or_default()).collect::<Vec<_>>().join(",")),
+        Format::Csv => writeln!(w, "{}", r.iter().map(|v| v.as_deref().map(|s| csv_field(s, o.delimiter)).unwrap_or_default()).collect::<Vec<_>>().join(&o.delimiter.to_string())),
+        Format::Html => writeln!(w, "<tr>{}</tr>", r.iter().map(|v| format!("<td>{}</td>", v.as_deref().map(xml_esc).unwrap_or_default())).collect::<String>()),
+        Format::Xml => writeln!(
+            w,
+            "  <ROW>\n{}  </ROW>",
+            cols.iter().zip(&r).map(|(c, v)| format!("    <COLUMN NAME=\"{}\">{}</COLUMN>\n", xml_esc(&c.name), v.as_deref().map(xml_esc).unwrap_or_default())).collect::<String>()
+        ),
         Format::Json => {
             let f: Vec<String> = cols
                 .iter()
@@ -112,6 +153,8 @@ fn row(w: &mut dyn Write, fmt: Format, cols: &[Column], db: Db, table: &str, n: 
 fn end(w: &mut dyn Write, fmt: Format) -> std::io::Result<()> {
     match fmt {
         Format::Json => w.write_all(b"\n]}]}\n"),
+        Format::Html => w.write_all(b"</table>\n</body></html>\n"),
+        Format::Xml => w.write_all(b"</RESULTS>\n"),
         _ => Ok(()),
     }
 }
@@ -128,12 +171,16 @@ pub struct Export {
     fmt: Format,
     cols: Vec<Column>,
     db: Db,
-    table: String,
+    opts: Options,
     n: u64,
 }
 
 impl Export {
     pub fn create(path: &Path, fmt: Format, cols: &[Column], db: Db, table: &str) -> Result<Export> {
+        Export::create_with(path, fmt, cols, db, &Options { table: table.into(), ..Options::default() })
+    }
+
+    pub fn create_with(path: &Path, fmt: Format, cols: &[Column], db: Db, opts: &Options) -> Result<Export> {
         let out = if fmt == Format::Xlsx {
             let mut wb = rust_xlsxwriter::Workbook::new();
             let ws = wb.add_worksheet_with_constant_memory()?;
@@ -146,17 +193,17 @@ impl Export {
             Out::Xlsx(Box::new(wb), path.to_path_buf())
         } else {
             let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
-            begin(&mut w, fmt, cols)?;
+            begin(&mut w, fmt, cols, opts)?;
             Out::Text(w)
         };
-        Ok(Export { out, fmt, cols: cols.to_vec(), db, table: table.into(), n: 0 })
+        Ok(Export { out, fmt, cols: cols.to_vec(), db, opts: opts.clone(), n: 0 })
     }
 
     pub fn rows(&mut self, rows: &[Vec<Cell>]) -> Result<()> {
         match &mut self.out {
             Out::Text(w) => {
                 for r in rows {
-                    row(w, self.fmt, &self.cols, self.db, &self.table, self.n, r)?;
+                    row(w, self.fmt, &self.cols, self.db, &self.opts, self.n, r)?;
                     self.n += 1;
                 }
             }
@@ -200,27 +247,27 @@ impl Export {
     }
 }
 
-/// Whole export as a string (tests, small results).
-fn text(fmt: Format, db: Db, table: &str, cols: &[Column], rows: &[Vec<Cell>]) -> String {
+/// Whole export as a string (clipboard, tests). Not for Xlsx.
+pub fn text_with(fmt: Format, db: Db, opts: &Options, cols: &[Column], rows: &[Vec<Cell>]) -> String {
     let mut v = vec![];
-    let _ = begin(&mut v, fmt, cols);
+    let _ = begin(&mut v, fmt, cols, opts);
     for (n, r) in rows.iter().enumerate() {
-        let _ = row(&mut v, fmt, cols, db, table, n as u64, r);
+        let _ = row(&mut v, fmt, cols, db, opts, n as u64, r);
     }
     let _ = end(&mut v, fmt);
     String::from_utf8_lossy(&v).into_owned()
 }
 
 pub fn csv(cols: &[Column], rows: &[Vec<Cell>]) -> String {
-    text(Format::Csv, Db::Sqlite, "", cols, rows)
+    text_with(Format::Csv, Db::Sqlite, &Options::default(), cols, rows)
 }
 
 pub fn json(cols: &[Column], rows: &[Vec<Cell>]) -> String {
-    text(Format::Json, Db::Sqlite, "", cols, rows)
+    text_with(Format::Json, Db::Sqlite, &Options::default(), cols, rows)
 }
 
 pub fn inserts(db: Db, table: &str, cols: &[Column], rows: &[Vec<Cell>]) -> String {
-    text(Format::Inserts, db, table, cols, rows)
+    text_with(Format::Inserts, db, &Options { table: table.into(), ..Options::default() }, cols, rows)
 }
 
 #[cfg(test)]
@@ -245,6 +292,18 @@ mod tests {
         let names = vec![vec![Some("O'Neil".into())], vec![None], vec![Some("x".into())], vec![Some("O'Neil".into())]];
         assert_eq!(in_list(Db::Oracle, &cols[1], &names), "('O''Neil', 'x')");
         assert_eq!(in_list(Db::Oracle, &cols[0], &[vec![Some("1".into())], vec![Some("2".into())]]), "(1, 2)");
+    }
+
+    #[test]
+    fn options_and_markup() {
+        let cols = vec![Column { name: "ID".into(), type_name: "NUMBER".into(), numeric: true }, Column { name: "N".into(), type_name: "".into(), numeric: false }];
+        let rows = vec![vec![Some("1".into()), Some("a;<b>".into())], vec![None, None]];
+        let o = Options { header: false, delimiter: ';', ..Options::default() };
+        assert_eq!(text_with(Format::Csv, Db::Sqlite, &o, &cols, &rows), "1;\"a;<b>\"\n;\n");
+        let h = text_with(Format::Html, Db::Sqlite, &Options::default(), &cols, &rows[..1]);
+        assert!(h.contains("<tr><th>ID</th><th>N</th></tr>\n<tr><td>1</td><td>a;&lt;b&gt;</td></tr>\n</table>"), "{h}");
+        let x = text_with(Format::Xml, Db::Sqlite, &Options::default(), &cols, &rows[..1]);
+        assert!(x.contains("<ROW>\n    <COLUMN NAME=\"ID\">1</COLUMN>\n    <COLUMN NAME=\"N\">a;&lt;b&gt;</COLUMN>\n  </ROW>\n</RESULTS>"), "{x}");
     }
 
     #[test]
