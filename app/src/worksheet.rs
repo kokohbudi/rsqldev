@@ -125,6 +125,9 @@ impl Worksheet {
 
         let split = SplitterWindow::builder(&panel).build();
         let editor = editor::new_editor(&split, &prefs.editor_font, prefs.editor_font_size);
+        if !prefs.line_numbers {
+            editor.set_margin_width(0, 0);
+        }
         let bottom = AuiNotebook::builder(&split).with_style(AuiNotebookStyle::from_bits_retain(0x1 | 0x20 | 0x100)).build();
         // Output panes: read-only, highlighted like the editor.
         let mono = |p: &Panel| editor::sql_view(p, "");

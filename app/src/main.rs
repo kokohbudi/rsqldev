@@ -199,6 +199,7 @@ impl App {
         if let Err(e) = config::save_prefs(&p) {
             ui::error(&self.frame, &format!("Saving preferences failed: {e}"));
         }
+        grid::set_null_text(&p.null_display);
         *self.prefs.borrow_mut() = p;
     }
 
@@ -207,9 +208,9 @@ impl App {
         let mut h = self.history.borrow_mut();
         h.retain(|s| s.sql != sql);
         h.push(HistItem { sql, conn: conn.to_string(), at: chrono::Local::now().timestamp(), script });
-        let n = h.len();
-        if n > 500 {
-            h.drain(..n - 500);
+        let (n, max) = (h.len(), self.prefs.borrow().history_limit.max(1));
+        if n > max {
+            h.drain(..n - max);
         }
         drop(h);
         // Saved at once: a crash or forced quit must not lose the history.
@@ -347,7 +348,14 @@ impl App {
         self.save_conns();
         if go {
             let pw = (!pw.is_empty()).then_some(pw);
-            self.connect_with(&name, pw, |c| app().open_worksheet(c));
+            let n = name.clone();
+            self.connect_with(&name, pw, move |c| {
+                let app = app();
+                app.nav.expand_conn(&n);
+                if app.prefs().open_worksheet_on_connect {
+                    app.open_worksheet(c);
+                }
+            });
         }
     }
 
@@ -1471,6 +1479,7 @@ fn start_page(parent: &AuiNotebook, recover: &[autosave::Slot]) -> Panel {
 fn main() {
     SystemOptions::set_option_by_int("msw.no-manifest-check", 1);
     let prefs0 = config::load_prefs();
+    grid::set_null_text(&prefs0.null_display);
     rsqldev_core::lob::cleanup_stale();
     let _ = wxdragon::main(move |_| {
         if let Some(a) = wxdragon::app::get_app() {

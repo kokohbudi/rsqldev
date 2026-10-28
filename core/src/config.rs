@@ -88,6 +88,18 @@ pub struct Prefs {
     pub theme: String,
     /// Look up the latest release on start (one HTTPS request to GitHub).
     pub check_updates: bool,
+    /// Result grids: text shown for NULL (typing it back sets NULL).
+    pub null_display: String,
+    /// Oracle: folder with tnsnames.ora when a connection sets no tns_admin.
+    pub tns_dir: String,
+    /// Connect from the connection dialog opens a worksheet (else only the tree expands).
+    pub open_worksheet_on_connect: bool,
+    pub history_limit: usize,
+    pub line_numbers: bool,
+    /// Oracle NLS_TIMESTAMP_FORMAT (TIMESTAMP WITH TIME ZONE adds TZH:TZM).
+    pub nls_timestamp_format: String,
+    /// Oracle DDL (DBMS_METADATA): include storage / tablespace / segment clauses.
+    pub ddl_storage: bool,
 }
 
 impl Default for Prefs {
@@ -101,6 +113,13 @@ impl Default for Prefs {
             client_dirs: BTreeMap::new(),
             theme: "light".into(),
             check_updates: true,
+            null_display: "(null)".into(),
+            tns_dir: String::new(),
+            open_worksheet_on_connect: true,
+            history_limit: 500,
+            line_numbers: true,
+            nls_timestamp_format: "DD-MON-RR HH.MI.SSXFF AM".into(),
+            ddl_storage: true,
         }
     }
 }

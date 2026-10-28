@@ -175,6 +175,17 @@ impl Navigator {
         });
     }
 
+    /// Expand and select connection `name`'s node (connections can sit one folder deep).
+    pub fn expand_conn(&self, name: &str) {
+        let Some(root) = self.tree.get_root_item() else { return };
+        let is = |n: &Node| matches!(n, Node::Conn(c) if c == name);
+        let found = self.child_where(&root, &is).or_else(|| self.children(&root).into_iter().filter(|c| matches!(self.node(c), Node::Folder)).find_map(|f| self.child_where(&f, &is)));
+        if let Some(i) = found {
+            self.tree.expand(&i);
+            crate::copy::quietly(|| self.tree.select_item(&i));
+        }
+    }
+
     fn children(&self, i: &TreeItemId) -> Vec<TreeItemId> {
         let mut out = vec![];
         if let Some((mut c, _)) = self.tree.get_first_child(i) {

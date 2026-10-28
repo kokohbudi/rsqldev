@@ -1,7 +1,7 @@
 //! Single Record View (grid context menu): one row as Name / Value with First / Previous /
 //! Next / Last, SQL Developer style. Edited values go into the grid as pending changes.
 
-use crate::grid::{NULL_TEXT, ResultGrid};
+use crate::grid::{null_text, ResultGrid};
 use wxdragon::prelude::*;
 
 pub fn show(g: &ResultGrid, start: usize) {
@@ -34,7 +34,7 @@ pub fn show(g: &ResultGrid, start: usize) {
         let row = &st.rows[r];
         let mut vals = vec![];
         for c in hidden..names.len() {
-            let v = row.cur[c].as_deref().map_or_else(|| NULL_TEXT.to_string(), |s| rsqldev_core::lob::grid_text(&st.cols[c].type_name, s).into_owned());
+            let v = row.cur[c].as_deref().map_or_else(|| null_text(), |s| rsqldev_core::lob::grid_text(&st.cols[c].type_name, s).into_owned());
             let i = (c - hidden) as i32;
             grid.set_cell_value(i, 0, &v);
             let ro = !editable || row.posted || rsqldev_core::lob::is_blob_type(&st.cols[c].type_name);
@@ -53,7 +53,7 @@ pub fn show(g: &ResultGrid, start: usize) {
         for (i, before) in old.iter().enumerate() {
             let v = grid.get_cell_value(i as i32, 0);
             if &v != before {
-                g2.set_cell(r, i + hidden, if v.is_empty() || v == NULL_TEXT { None } else { Some(v) });
+                g2.set_cell(r, i + hidden, if v.is_empty() || *v == null_text() { None } else { Some(v) });
             }
         }
     };

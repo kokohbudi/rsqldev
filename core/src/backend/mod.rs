@@ -36,10 +36,10 @@ pub fn client_dir(driver_id: &str, prefs: &Prefs) -> Option<PathBuf> {
 }
 
 /// tnsnames.ora aliases (sorted, upper case) for the TNS connection type, from `tns_admin`
-/// (the connection's option), $TNS_ADMIN, $ORACLE_HOME/network/admin and the Oracle client
+/// (the connection's option), the Tnsnames Directory preference, $TNS_ADMIN, $ORACLE_HOME/network/admin and the Oracle client
 /// folder's network/admin.
 pub fn tns_aliases(tns_admin: Option<&str>, prefs: &Prefs) -> Vec<String> {
-    let mut dirs: Vec<PathBuf> = tns_admin.filter(|s| !s.trim().is_empty()).map(PathBuf::from).into_iter().collect();
+    let mut dirs: Vec<PathBuf> = [tns_admin, Some(prefs.tns_dir.as_str())].into_iter().flatten().filter(|s| !s.trim().is_empty()).map(PathBuf::from).collect();
     dirs.extend(std::env::var_os("TNS_ADMIN").map(PathBuf::from));
     dirs.extend(std::env::var_os("ORACLE_HOME").map(|h| PathBuf::from(h).join("network").join("admin")));
     dirs.extend(client_dir("oracle", prefs).map(|c| c.join("network").join("admin")));

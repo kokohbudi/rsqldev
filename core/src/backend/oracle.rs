@@ -146,7 +146,7 @@ pub fn connect_string(cfg: &ConnConfig) -> String {
 
 impl Oracle {
     pub fn connect(cfg: &ConnConfig, pw: &str, dir: &Path, prefs: &Prefs) -> Result<Self> {
-        init(dir, cfg.options.get("tns_admin").map(String::as_str))?;
+        init(dir, cfg.options.get("tns_admin").or(Some(&prefs.tns_dir)).map(String::as_str).filter(|s| !s.trim().is_empty()))?;
         let mut k = Connector::new(&cfg.user, pw, connect_string(cfg));
         match cfg.role.to_uppercase().as_str() {
             "SYSDBA" => k.privilege(Privilege::Sysdba),
@@ -160,11 +160,15 @@ impl Oracle {
         let c = k.connect()?;
         c.set_module("rsqldev")?;
         let date_fmt = if prefs.nls_date_format.is_empty() { "DD-MON-RR".to_string() } else { prefs.nls_date_format.clone() };
-        let ts_fmt = "DD-MON-RR HH.MI.SSXFF AM".to_string();
+        let ts_fmt = if prefs.nls_timestamp_format.trim().is_empty() { "DD-MON-RR HH.MI.SSXFF AM".to_string() } else { prefs.nls_timestamp_format.replace('\'', "''") };
         // Same formats server-side, so grid text converts back implicitly in generated DML.
         c.execute(&format!("ALTER SESSION SET NLS_DATE_FORMAT = '{}'", date_fmt.replace('\'', "''")), &[])?;
         c.execute(&format!("ALTER SESSION SET NLS_TIMESTAMP_FORMAT = '{ts_fmt}'"), &[])?;
         c.execute(&format!("ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = '{ts_fmt} TZH:TZM'"), &[])?;
+        if !prefs.ddl_storage {
+            // Best effort: DDL without STORAGE / TABLESPACE / segment clauses for this session.
+            let _ = c.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE); END;", &[]);
+        }
         Ok(Oracle { c: Arc::new(c), autocommit: false, output: false, date_fmt, ts_fmt })
     }
 }

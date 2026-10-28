@@ -10,7 +10,18 @@ use std::rc::Rc;
 use std::sync::mpsc::TryRecvError;
 use wxdragon::prelude::*;
 
-pub const NULL_TEXT: &str = "(null)";
+thread_local! {
+    static NULL_TEXT: std::cell::RefCell<String> = std::cell::RefCell::new("(null)".into());
+}
+
+/// Text shown for NULL in result grids (Preferences ▸ Display NULL as).
+pub fn null_text() -> String {
+    NULL_TEXT.with(|t| t.borrow().clone())
+}
+
+pub fn set_null_text(s: &str) {
+    NULL_TEXT.with(|t| *t.borrow_mut() = s.to_string());
+}
 
 #[derive(Clone, Default)]
 pub struct Row {
@@ -541,6 +552,7 @@ impl ResultGrid {
         // (null) placeholder, ≥ 4.5:1 in both palettes (see theme tests).
         let (grey, text, bg) = (crate::theme::c(p.null), crate::theme::c(p.text), crate::theme::c(p.bg));
         let row = &st.rows[ri];
+        let null = null_text();
         for (ci, v) in row.cur.iter().enumerate() {
             let (r, c) = (ri as i32, ci as i32);
             match v {
@@ -551,7 +563,7 @@ impl ResultGrid {
                     }
                 }
                 None => {
-                    g.set_cell_value(r, c, NULL_TEXT);
+                    g.set_cell_value(r, c, &null);
                     g.set_cell_text_colour(r, c, &grey);
                 }
             }
@@ -609,7 +621,7 @@ impl ResultGrid {
         st.edited = true;
         let Some(row) = st.rows.get_mut(r as usize) else { return };
         row.edit();
-        row.cur[c as usize] = if v.is_empty() || v == NULL_TEXT { None } else { Some(v) };
+        row.cur[c as usize] = if v.is_empty() || *v == null_text() { None } else { Some(v) };
         row.blobs.remove(&(c as usize));
         Self::mark_row(self.grid, &st, r as usize);
         drop(st);
@@ -806,7 +818,7 @@ impl ResultGrid {
                     continue;
                 }
                 self.st.borrow_mut().rows[r].blobs.remove(&c);
-                self.put(r, c, if v.is_empty() || v == NULL_TEXT { None } else { Some(v.clone()) });
+                self.put(r, c, if v.is_empty() || *v == null_text() { None } else { Some(v.clone()) });
                 done += 1;
             }
         }
@@ -1049,7 +1061,7 @@ impl ResultGrid {
         row.edit();
         row.cur[c] = v.clone();
         let p = crate::theme::p();
-        self.grid.set_cell_value(r as i32, c as i32, v.as_deref().unwrap_or(NULL_TEXT));
+        self.grid.set_cell_value(r as i32, c as i32, v.as_deref().unwrap_or(&null_text()));
         self.grid.set_cell_text_colour(r as i32, c as i32, &crate::theme::c(if v.is_some() { p.text } else { p.null }));
         Self::mark_row(self.grid, &st, r);
     }
