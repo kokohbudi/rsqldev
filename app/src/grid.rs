@@ -88,6 +88,10 @@ pub struct State {
     released: bool,
     /// Resumed statement: its column header is already shown.
     resumed: bool,
+    /// Some row was edited since the result loaded (pending counts are worth computing).
+    pub edited: bool,
+    /// Rows the column filters let through (kept up to date as rows arrive).
+    shown: usize,
 }
 
 /// Idle time before a resumable result closes its cursor (PostgreSQL autocommit transaction).
@@ -167,6 +171,22 @@ impl ResultGrid {
         });
         let me = g.clone();
         grid.on_cell_changed(move |e| me.cell_edited(e.get_row(), e.get_col()));
+        // Double-click: cells that cannot be typed into (BLOB, LOB, long or multi-line text,
+        // read-only results) open the value editor; the rest edit in place.
+        let me = g.clone();
+        grid.on_cell_left_dclick(move |e| {
+            let (r, c) = (e.get_row(), e.get_col());
+            if r < 0 || c < 0 {
+                return;
+            }
+            if me.needs_popup(r as usize, c as usize) {
+                me.view_value(r as usize, c as usize);
+            } else {
+                // The handler takes the event (no skip in wxDragon): start the in-place editor.
+                me.grid.set_grid_cursor(r, c);
+                me.grid.enable_cell_edit_control(true);
+            }
+        });
         let me = g.clone();
         grid.on_label_right_click(move |e| {
             if e.get_row() < 0 && e.get_col() >= 0 {
@@ -254,10 +274,41 @@ impl ResultGrid {
         g.enable_editing(on);
         let st = self.st.borrow();
         g.begin_batch();
+        Self::col_formats(g, &st);
+        // Only the cells that differ from a read-only result: numeric alignment, BLOB lock.
         for ri in 0..st.rows.len() {
-            Self::fill_row(g, &st, ri);
+            for ci in 0..st.cols.len() {
+                Self::edit_attrs(g, &st, ri, ci);
+            }
         }
         g.end_batch();
+    }
+
+    /// Read-only results right-align numeric columns with a column format (no per-cell
+    /// attribute); editable ones keep the text editor and align per cell instead.
+    fn col_formats(g: Grid, st: &State) {
+        for (i, _) in st.cols.iter().enumerate().filter(|(_, c)| c.numeric) {
+            if st.editable {
+                g.set_col_format_custom(i as i32, "string");
+            } else {
+                g.set_col_format_number(i as i32);
+            }
+        }
+    }
+
+    /// Per-cell attributes an editable grid needs: right alignment of numbers, read-only
+    /// BLOB cells and posted rows. Read-only grids need none.
+    fn edit_attrs(g: Grid, st: &State, ri: usize, ci: usize) {
+        if !st.editable {
+            return;
+        }
+        let (r, c) = (ri as i32, ci as i32);
+        if st.cols.get(ci).is_some_and(|c| c.numeric) {
+            g.set_cell_alignment(r, c, 0x0200 /* wxALIGN_RIGHT */, 0x0800 /* wxALIGN_CENTER_VERTICAL */);
+        }
+        if !Self::cell_editable(st, ri, ci) {
+            g.set_read_only(r, c, true);
+        }
     }
 
     /// Show a complete result.
@@ -318,13 +369,41 @@ impl ResultGrid {
         if !wants {
             return;
         }
-        let ev = {
+        let recv = || {
             let r = rx.borrow();
             match r.as_ref() {
                 Some(rx) => rx.try_recv(),
                 None => Err(TryRecvError::Disconnected),
             }
         };
+        let mut ev = recv();
+        // Fetch All: take every batch that is ready for up to ~15 ms, then draw them at once
+        // (one batch per 25 ms tick capped it at 4,000 rows a second).
+        if fetch_all {
+            if let Ok(Event::Rows(first)) = ev {
+                let mut batch = first;
+                let t = std::time::Instant::now();
+                let mut tail = Err(TryRecvError::Empty);
+                while !batch.is_empty() && t.elapsed() < std::time::Duration::from_millis(15) && (n + batch.len()) / FETCH_ALL_STEP == n / FETCH_ALL_STEP {
+                    match recv() {
+                        Ok(Event::Rows(more)) if !more.is_empty() => batch.extend(more),
+                        other => {
+                            tail = other;
+                            break;
+                        }
+                    }
+                }
+                // A last (empty) batch or a closed cursor seen while draining ends the fetch.
+                let ended = matches!(tail, Ok(Event::Rows(_)) | Err(TryRecvError::Disconnected));
+                ev = Ok(Event::Rows(batch));
+                if ended {
+                    if let Ok(Event::Rows(b)) = ev {
+                        self.add_rows(n, b);
+                    }
+                    return self.finish();
+                }
+            }
+        }
         match ev {
             Ok(Event::Columns(_)) if self.st.borrow().resumed => {}
             Ok(Event::Columns(c)) => {
@@ -334,12 +413,7 @@ impl ResultGrid {
             Ok(Event::Rows(batch)) => {
                 let start = n;
                 let last = batch.is_empty();
-                {
-                    let mut st = self.st.borrow_mut();
-                    st.rows.extend(batch.into_iter().map(Row::fetched));
-                    st.last_batch = Some(std::time::Instant::now());
-                }
-                self.append_rows(start);
+                self.add_rows(n, batch);
                 if last {
                     self.finish();
                 } else if fetch_all && start / FETCH_ALL_STEP != self.st.borrow().rows.len() / FETCH_ALL_STEP {
@@ -361,6 +435,16 @@ impl ResultGrid {
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => self.finish(),
         }
+    }
+
+    /// Fetched rows into the state and the grid.
+    fn add_rows(&self, start: usize, batch: Vec<Vec<Cell>>) {
+        {
+            let mut st = self.st.borrow_mut();
+            st.rows.extend(batch.into_iter().map(Row::fetched));
+            st.last_batch = Some(std::time::Instant::now());
+        }
+        self.append_rows(start);
     }
 
     fn finish(&self) {
@@ -407,6 +491,7 @@ impl ResultGrid {
         for i in 0..hidden.min(ncols) {
             g.hide_col(i as i32);
         }
+        Self::col_formats(g, &self.st.borrow());
         g.end_batch();
         self.append_rows(0);
         let st = self.st.borrow();
@@ -425,7 +510,7 @@ impl ResultGrid {
         g.begin_batch();
         g.append_rows((n - start) as i32, true);
         for ri in start..n {
-            Self::fill_row(g, &st, ri);
+            Self::fill_row(g, &st, ri, false);
         }
         if start == 0 {
             g.auto_size_columns(false);
@@ -444,13 +529,14 @@ impl ResultGrid {
         drop(st);
         self.changed();
         if !self.st.borrow().filters.is_empty() {
-            self.apply_filters();
+            self.apply_filters(start);
         }
     }
 
-    /// Values, colours and read-only flags of one grid row, from scratch (new, reverted or
-    /// shifted rows too).
-    fn fill_row(g: Grid, st: &State, ri: usize) {
+    /// Values and the few per-cell attributes of one grid row. A row new to the grid has no
+    /// attributes yet: only NULL cells get a colour (a wx attribute per cell costs memory).
+    /// `reset` (reverted / re-posted rows) puts edited colours back to normal first.
+    fn fill_row(g: Grid, st: &State, ri: usize, reset: bool) {
         let p = crate::theme::p();
         // (null) placeholder, ≥ 4.5:1 in both palettes (see theme tests).
         let (grey, text, bg) = (crate::theme::c(p.null), crate::theme::c(p.text), crate::theme::c(p.bg));
@@ -460,19 +546,20 @@ impl ResultGrid {
             match v {
                 Some(s) => {
                     g.set_cell_value(r, c, &rsqldev_core::lob::grid_text(st.cols.get(ci).map_or("", |c| c.type_name.as_str()), s));
-                    g.set_cell_text_colour(r, c, &text);
+                    if reset {
+                        g.set_cell_text_colour(r, c, &text);
+                    }
                 }
                 None => {
                     g.set_cell_value(r, c, NULL_TEXT);
                     g.set_cell_text_colour(r, c, &grey);
                 }
             }
-            g.set_cell_background_colour(r, c, &bg);
-            if st.cols.get(ci).is_some_and(|c| c.numeric) {
-                g.set_cell_alignment(r, c, 0x0200 /* wxALIGN_RIGHT */, 0x0800 /* wxALIGN_CENTER_VERTICAL */);
+            if reset {
+                g.set_cell_background_colour(r, c, &bg);
             }
             // BLOB cells change through Load Value, not by typing over "(BLOB)".
-            g.set_read_only(r, c, !Self::cell_editable(st, ri, ci));
+            Self::edit_attrs(g, st, ri, ci);
         }
         Self::mark_row(g, st, ri);
     }
@@ -483,20 +570,9 @@ impl ResultGrid {
     }
 
     fn mark_row(g: Grid, st: &State, ri: usize) {
+        Self::label_row(g, st, ri);
         let row = &st.rows[ri];
         let r = ri as i32;
-        let label = if row.posted {
-            format!("{} ✓", ri + 1)
-        } else if row.deleted {
-            format!("{} ✕", ri + 1)
-        } else if row.new {
-            format!("{} +", ri + 1)
-        } else if row.dirty() {
-            format!("{} *", ri + 1)
-        } else {
-            (ri + 1).to_string()
-        };
-        g.set_row_label_value(r, &label);
         let edited = crate::theme::c(crate::theme::p().edited_bg);
         let removed = crate::theme::c(crate::theme::p().deleted_bg);
         for ci in 0..row.cur.len() {
@@ -509,9 +585,28 @@ impl ResultGrid {
         }
     }
 
+    /// Row number and marker (✓ posted, ✕ deleted, + new, * changed). wx row labels do not
+    /// move when rows are inserted or deleted: rows after one need relabelling (labels only).
+    fn label_row(g: Grid, st: &State, ri: usize) {
+        let row = &st.rows[ri];
+        let label = if row.posted {
+            format!("{} ✓", ri + 1)
+        } else if row.deleted {
+            format!("{} ✕", ri + 1)
+        } else if row.new {
+            format!("{} +", ri + 1)
+        } else if row.dirty() {
+            format!("{} *", ri + 1)
+        } else {
+            (ri + 1).to_string()
+        };
+        g.set_row_label_value(ri as i32, &label);
+    }
+
     fn cell_edited(&self, r: i32, c: i32) {
         let v = self.grid.get_cell_value(r, c);
         let mut st = self.st.borrow_mut();
+        st.edited = true;
         let Some(row) = st.rows.get_mut(r as usize) else { return };
         row.edit();
         row.cur[c as usize] = if v.is_empty() || v == NULL_TEXT { None } else { Some(v) };
@@ -551,6 +646,7 @@ impl ResultGrid {
         if !self.st.borrow().editable {
             return;
         }
+        self.st.borrow_mut().edited = true;
         let n = self.st.borrow().rows.len();
         if at >= n {
             self.st.borrow_mut().rows.push(row);
@@ -561,9 +657,9 @@ impl ResultGrid {
             g.begin_batch();
             g.insert_rows(at as i32, 1, true);
             let st = self.st.borrow();
-            Self::fill_row(g, &st, at);
+            Self::fill_row(g, &st, at, false);
             for ri in at + 1..st.rows.len() {
-                Self::mark_row(g, &st, ri);
+                Self::label_row(g, &st, ri);
             }
             g.end_batch();
             drop(st);
@@ -586,7 +682,7 @@ impl ResultGrid {
                 row.orig = None;
                 row.blobs.clear();
             }
-            Self::fill_row(g, &st, r);
+            Self::fill_row(g, &st, r, true);
         }
         drop(st);
         g.force_refresh();
@@ -609,8 +705,7 @@ impl ResultGrid {
         let mut out = vec![];
         let blocks = self.grid.get_selected_blocks();
         let cursor = (self.grid.get_grid_cursor_row(), self.grid.get_grid_cursor_col());
-        let stale = blocks.len() == 1 && blocks[0].top_row == blocks[0].bottom_row && blocks[0].left_col == blocks[0].right_col && (blocks[0].top_row, blocks[0].left_col) != cursor;
-        if blocks.is_empty() || stale {
+        if blocks.is_empty() || (blocks.len() == 1 && stale(&blocks[0], cursor)) {
             out.push(cursor);
         } else {
             for b in &blocks {
@@ -627,6 +722,7 @@ impl ResultGrid {
         if !self.st.borrow().editable {
             return;
         }
+        self.grid.begin_batch();
         for (r, c) in self.picked_cells() {
             if self.st.borrow().rows[r].posted {
                 continue;
@@ -634,8 +730,11 @@ impl ResultGrid {
             if let Some(row) = self.st.borrow_mut().rows.get_mut(r) {
                 row.blobs.remove(&c);
             }
-            self.set_cell(r, c, None);
+            self.put(r, c, None);
         }
+        self.grid.end_batch();
+        self.grid.force_refresh();
+        self.changed();
     }
 
     /// Revert Row: forget a row's pending change (new rows go away).
@@ -653,7 +752,7 @@ impl ResultGrid {
                 st.rows.remove(r);
                 g.delete_rows(r as i32, 1, true);
                 for ri in r..st.rows.len() {
-                    Self::mark_row(g, &st, ri);
+                    Self::label_row(g, &st, ri);
                 }
                 continue;
             }
@@ -662,7 +761,7 @@ impl ResultGrid {
             }
             row.blobs.clear();
             row.deleted = false;
-            Self::fill_row(g, &st, r);
+            Self::fill_row(g, &st, r, true);
         }
         g.end_batch();
         g.force_refresh();
@@ -684,14 +783,19 @@ impl ResultGrid {
         };
         let (r0, c0) = (r0.max(0) as usize, (c0.max(0) as usize).max(hidden));
         let (mut done, mut skipped) = (0, vec![]);
+        // Rows past the end, added at once.
+        let n = self.st.borrow().rows.len();
+        let need = (r0 + lines.len()).saturating_sub(n);
+        if need > 0 {
+            let mut st = self.st.borrow_mut();
+            st.edited = true;
+            st.rows.extend((0..need).map(|_| Row { cur: vec![None; w], new: true, ..Row::default() }));
+            drop(st);
+            self.append_rows(n);
+        }
         self.grid.begin_batch();
         for (i, line) in lines.iter().enumerate() {
             let r = r0 + i;
-            if r >= self.st.borrow().rows.len() {
-                let n = self.st.borrow().rows.len();
-                self.st.borrow_mut().rows.push(Row { cur: vec![None; w], new: true, ..Row::default() });
-                self.append_rows(n);
-            }
             for (j, v) in line.iter().enumerate() {
                 let c = c0 + j;
                 let ok = c < w && Self::cell_editable(&self.st.borrow(), r, c);
@@ -702,11 +806,13 @@ impl ResultGrid {
                     continue;
                 }
                 self.st.borrow_mut().rows[r].blobs.remove(&c);
-                self.set_cell(r, c, if v.is_empty() || v == NULL_TEXT { None } else { Some(v.clone()) });
+                self.put(r, c, if v.is_empty() || v == NULL_TEXT { None } else { Some(v.clone()) });
                 done += 1;
             }
         }
         self.grid.end_batch();
+        self.grid.force_refresh();
+        self.changed();
         skipped.dedup();
         let msg = if skipped.is_empty() { format!("Pasted {done} value(s)") } else { format!("Pasted {done} value(s). Cannot paste value for column: {}", skipped.join(", ")) };
         crate::app().status(0, &msg);
@@ -730,6 +836,7 @@ impl ResultGrid {
     pub fn append_new_rows(&self, rows: Vec<Vec<Cell>>) {
         let start = {
             let mut st = self.st.borrow_mut();
+            st.edited = true;
             let start = st.rows.len();
             st.rows.extend(rows.into_iter().map(|cur| Row { cur, new: true, ..Row::default() }));
             start
@@ -747,6 +854,7 @@ impl ResultGrid {
         }
         let rows = self.picked_rows();
         let mut st = self.st.borrow_mut();
+        st.edited = true;
         for r in rows {
             if st.rows[r].posted {
                 continue;
@@ -759,22 +867,12 @@ impl ResultGrid {
         self.changed();
     }
 
-    fn sort_by(&self, col: usize) {
+    pub(crate) fn sort_by(&self, col: usize) {
         {
             let mut st = self.st.borrow_mut();
             let asc = !matches!(st.sort, Some((c, true)) if c == col);
             let numeric = st.cols.get(col).is_some_and(|c| c.numeric);
-            st.rows.sort_by(|a, b| {
-                let (x, y) = (&a.cur[col], &b.cur[col]);
-                let o = match (x, y) {
-                    (None, None) => std::cmp::Ordering::Equal,
-                    (None, _) => std::cmp::Ordering::Greater, // nulls last
-                    (_, None) => std::cmp::Ordering::Less,
-                    (Some(x), Some(y)) if numeric => x.parse::<f64>().unwrap_or(f64::NAN).total_cmp(&y.parse::<f64>().unwrap_or(f64::NAN)),
-                    (Some(x), Some(y)) => x.cmp(y),
-                };
-                if asc { o } else { o.reverse() }
-            });
+            sort_rows(&mut st.rows, col, asc, numeric);
             st.sort = Some((col, asc));
         }
         // ponytail: sorts fetched rows only; re-query with ORDER BY if users expect server-side sort.
@@ -843,7 +941,8 @@ impl ResultGrid {
             b = b.append_item(ID_COUNT, "Count Rows", "Count every row of the result on the server, without fetching them");
         }
         if r >= 0 && c >= hidden {
-            b = b.append_item(ID_VIEW_VALUE, "View Value…", "Show the whole value: long text, BLOB as image / text / hex");
+            let label = if editable { "Edit Value…\tAlt+Enter" } else { "View Value…\tAlt+Enter" };
+            b = b.append_item(ID_VIEW_VALUE, label, "The whole value in an editor: long text, dates (date picker), BLOB as image / text / hex");
             b = b.append_item(ID_SAVE_VALUE, "Save Value to File…", "Write this cell (BLOB bytes or text) to a file");
             if editable {
                 b = b.append_item(ID_LOAD_VALUE, "Load Value from File…", "Replace this cell with a file's contents; Commit to post");
@@ -937,7 +1036,15 @@ impl ResultGrid {
 
     /// Write a value into a cell from code (dialogs, file loads) and mark the row dirty.
     pub(crate) fn set_cell(&self, r: usize, c: usize, v: Cell) {
+        self.put(r, c, v);
+        self.grid.force_refresh();
+        self.changed();
+    }
+
+    /// [`Self::set_cell`] without the repaint and change notice (bulk callers do those once).
+    fn put(&self, r: usize, c: usize, v: Cell) {
         let mut st = self.st.borrow_mut();
+        st.edited = true;
         let Some(row) = st.rows.get_mut(r) else { return };
         row.edit();
         row.cur[c] = v.clone();
@@ -945,9 +1052,6 @@ impl ResultGrid {
         self.grid.set_cell_value(r as i32, c as i32, v.as_deref().unwrap_or(NULL_TEXT));
         self.grid.set_cell_text_colour(r as i32, c as i32, &crate::theme::c(if v.is_some() { p.text } else { p.null }));
         Self::mark_row(self.grid, &st, r);
-        drop(st);
-        self.grid.force_refresh();
-        self.changed();
     }
 
     fn view_value(&self, r: usize, c: usize) {
@@ -972,6 +1076,27 @@ impl ResultGrid {
             crate::value::Outcome::Load => self.load_value(r, c),
             crate::value::Outcome::Keep => {}
         }
+    }
+
+    /// Edit Value (pencil, Alt+Enter): the value editor for the cursor cell.
+    pub fn edit_value(&self) {
+        let (r, c) = (self.grid.get_grid_cursor_row(), self.grid.get_grid_cursor_col());
+        let (n, hidden) = {
+            let st = self.st.borrow();
+            (st.rows.len() as i32, st.hidden as i32)
+        };
+        if r >= 0 && r < n && c >= hidden {
+            self.grid.save_edit_control_value();
+            self.view_value(r as usize, c as usize);
+        }
+    }
+
+    /// The cell is better edited in the popup than in place.
+    fn needs_popup(&self, r: usize, c: usize) -> bool {
+        let st = self.st.borrow();
+        let (Some(row), Some(col)) = (st.rows.get(r), st.cols.get(c)) else { return false };
+        let long = row.cur[c].as_deref().is_some_and(|v| v.contains('\n') || v.len() > 200 || rsqldev_core::lob::display(v) != v);
+        !Self::cell_editable(&st, r, c) || rsqldev_core::is_binary(&col.type_name) || long
     }
 
     /// Find in Results: case-insensitive, over the fetched (and not filtered-out) rows, from the
@@ -1034,12 +1159,12 @@ impl ResultGrid {
                         st.filters.push((col, t.to_lowercase()));
                     }
                     drop(st);
-                    me.apply_filters();
+                    me.apply_filters(0);
                 }
             }
             ID_CLEAR_FILTERS => {
                 me.st.borrow_mut().filters.clear();
-                me.apply_filters();
+                me.apply_filters(0);
             }
             SORT => me.sort_by(col),
             _ => {}
@@ -1048,13 +1173,14 @@ impl ResultGrid {
         m.destroy_menu();
     }
 
-    /// Hide fetched rows that fail a column filter (client side, fetched rows only).
-    fn apply_filters(&self) {
-        let st = self.st.borrow();
+    /// Hide fetched rows from `from` on that fail a column filter (client side, fetched rows
+    /// only); 0 = a filter changed, all rows again.
+    fn apply_filters(&self, from: usize) {
+        let mut st = self.st.borrow_mut();
         let g = self.grid;
         g.begin_batch();
-        let mut shown = 0;
-        for (r, row) in st.rows.iter().enumerate() {
+        let mut shown = if from == 0 { 0 } else { st.shown };
+        for (r, row) in st.rows.iter().enumerate().skip(from) {
             let ok = row.new || st.filters.iter().all(|(c, t)| row.cur[*c].as_deref().is_some_and(|v| rsqldev_core::lob::display(v).to_lowercase().contains(t)));
             if ok {
                 g.show_row(r as i32);
@@ -1064,6 +1190,7 @@ impl ResultGrid {
             }
         }
         g.end_batch();
+        st.shown = shown;
         let msg = if st.filters.is_empty() { String::new() } else { format!("Filter: {shown} of {} fetched rows shown", st.rows.len()) };
         drop(st);
         crate::app().status(0, &msg);
@@ -1072,25 +1199,37 @@ impl ResultGrid {
     /// Stream the result to a file: rows already in the grid first, then the rest of the open
     /// cursor straight into the file (never into the grid), so memory stays flat.
     fn export_to(&self, fmt: export::Format, path: std::path::PathBuf) {
-        let (cols, rows, hidden, db, rx) = {
+        let (vis, cols, hidden, db, rx) = {
             let mut st = self.st.borrow_mut();
             let vis: Vec<usize> = (st.hidden..st.cols.len()).collect();
             let cols: Vec<Column> = vis.iter().map(|&i| st.cols[i].clone()).collect();
-            let rows: Vec<Vec<Cell>> = st.rows.iter().filter(|r| !r.deleted).map(|r| vis.iter().map(|&i| r.cur[i].clone()).collect()).collect();
             // The rest of the cursor goes to the file: the grid keeps what it has.
             let rx = st.rx.take();
             st.done = true;
-            (cols, rows, st.hidden, st.db.unwrap_or(Kind::Oracle), rx)
+            (vis, cols, st.hidden, st.db.unwrap_or(Kind::Oracle), rx)
         };
         let fail = move |grid: &Grid, path: &std::path::Path, e: rsqldev_core::Error| {
             let _ = std::fs::remove_file(path);
             crate::ui::error(grid, &format!("Export failed: {e:#}"));
         };
-        let ex = match export::Export::create(&path, fmt, &cols, db, "EXPORT_TABLE").and_then(|mut x| x.rows(&rows).map(|_| x)) {
+        // Rows already in the grid, written 1,000 at a time (no copy of the whole result).
+        let written = export::Export::create(&path, fmt, &cols, db, "EXPORT_TABLE").and_then(|mut x| {
+            let st = self.st.borrow();
+            let mut buf: Vec<Vec<Cell>> = Vec::with_capacity(1000);
+            for r in st.rows.iter().filter(|r| !r.deleted) {
+                buf.push(vis.iter().map(|&i| r.cur[i].clone()).collect());
+                if buf.len() == 1000 {
+                    x.rows(&buf)?;
+                    buf.clear();
+                }
+            }
+            x.rows(&buf)?;
+            Ok(x)
+        });
+        let ex = match written {
             Ok(x) => x,
             Err(e) => return fail(&self.grid, &path, e),
         };
-        drop(rows);
         let grid = self.grid;
         let done = move |ex: export::Export, path: &std::path::Path| match ex.finish() {
             Ok(n) => crate::app().status(0, &format!("Exported {n} rows to {}", path.display())),
@@ -1234,10 +1373,14 @@ impl WeakGrid {
 /// Rows Delete Row marks: whole selected rows plus every row of the selected blocks, else the
 /// cursor row. A lone 1x1 block away from the cursor is a stale auto-selection (the cursor was
 /// moved by code since): it is ignored, so the cursor row is marked instead.
+/// A lone 1x1 block away from the cursor: left over after code moved the cursor.
+fn stale(b: &GridBlockCoords, cursor: (i32, i32)) -> bool {
+    b.top_row == b.bottom_row && b.left_col == b.right_col && (b.top_row, b.left_col) != cursor
+}
+
 fn rows_to_mark(selected: Vec<i32>, blocks: &[GridBlockCoords], cursor: (i32, i32)) -> Vec<i32> {
-    let stale = |b: &GridBlockCoords| b.top_row == b.bottom_row && b.left_col == b.right_col && (b.top_row, b.left_col) != cursor;
     let mut rows = selected;
-    if !(rows.is_empty() && blocks.len() == 1 && stale(&blocks[0])) {
+    if !(rows.is_empty() && blocks.len() == 1 && stale(&blocks[0], cursor)) {
         for b in blocks {
             rows.extend(b.top_row..=b.bottom_row);
         }
@@ -1248,6 +1391,28 @@ fn rows_to_mark(selected: Vec<i32>, blocks: &[GridBlockCoords], cursor: (i32, i3
         rows.push(cursor.0);
     }
     rows
+}
+
+/// Sort rows by one column, keys computed once per row (not parsed again per comparison):
+/// numbers as numbers (text in a numeric column after them), NULLs last when ascending.
+fn sort_rows(rows: &mut [Row], col: usize, asc: bool, numeric: bool) {
+    if numeric {
+        rows.sort_by_cached_key(|r| match &r.cur[col] {
+            None => (true, 0),
+            Some(s) => (false, ordered(s.parse::<f64>().unwrap_or(f64::NAN))),
+        });
+    } else {
+        rows.sort_by_cached_key(|r| (r.cur[col].is_none(), r.cur[col].clone()));
+    }
+    if !asc {
+        rows.reverse();
+    }
+}
+
+/// An f64 as an integer with the same order as `f64::total_cmp` (NaN after every number).
+fn ordered(x: f64) -> i64 {
+    let b = x.to_bits() as i64;
+    b ^ ((((b >> 63) as u64) >> 1) as i64)
 }
 
 /// Clipboard text as rows of tab-separated cells (trailing line break ignored).
@@ -1275,6 +1440,34 @@ mod tests {
 
     fn block(top: i32, left: i32, bottom: i32, right: i32) -> GridBlockCoords {
         GridBlockCoords { top_row: top, left_col: left, bottom_row: bottom, right_col: right }
+    }
+
+    fn rows_of(vals: &[Option<&str>]) -> Vec<Row> {
+        vals.iter().map(|v| Row::fetched(vec![v.map(str::to_owned)])).collect()
+    }
+
+    fn col0(rows: &[Row]) -> Vec<Option<String>> {
+        rows.iter().map(|r| r.cur[0].clone()).collect()
+    }
+
+    #[test]
+    fn sort_numbers_as_numbers_nulls_last() {
+        let mut rows = rows_of(&[Some("10"), None, Some("9"), Some("-1.5")]);
+        sort_rows(&mut rows, 0, true, true);
+        assert_eq!(col0(&rows), vec![Some("-1.5".into()), Some("9".into()), Some("10".into()), None]);
+        sort_rows(&mut rows, 0, false, true);
+        assert_eq!(col0(&rows), vec![None, Some("10".into()), Some("9".into()), Some("-1.5".into())]);
+    }
+
+    #[test]
+    fn sort_text_and_unparsable_numbers() {
+        let mut rows = rows_of(&[Some("b"), Some("a"), None, Some("c")]);
+        sort_rows(&mut rows, 0, true, false);
+        assert_eq!(col0(&rows), vec![Some("a".into()), Some("b".into()), Some("c".into()), None]);
+        // Text in a numeric column sorts after the numbers (NaN), before NULL.
+        let mut rows = rows_of(&[Some("x"), Some("2"), None, Some("1")]);
+        sort_rows(&mut rows, 0, true, true);
+        assert_eq!(col0(&rows), vec![Some("1".into()), Some("2".into()), Some("x".into()), None]);
     }
 
     #[test]

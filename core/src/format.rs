@@ -1,4 +1,4 @@
-//! SQL formatter (Ctrl+F7): uppercase keywords, one clause per line, select-list and
+//! SQL formatter (Ctrl+Shift+F / Ctrl+F7): uppercase keywords, one clause per line, select-list and
 //! AND / OR items on their own indented lines, subqueries indented. Only whitespace and keyword
 //! case change: strings, quoted identifiers and comments are kept verbatim. PL/SQL blocks and
 //! SQL*Plus commands are left as they are.

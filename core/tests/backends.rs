@@ -248,7 +248,13 @@ fn clickhouse() {
 #[test]
 fn sqlite() {
     let f = std::env::temp_dir().join(format!("rsq-{}.sqlite", std::process::id()));
-    exercise(ConnConfig { name: "it-sqlite".into(), driver: "sqlite".into(), database: f.display().to_string(), ..Default::default() }, "", "main");
+    let c = ConnConfig { name: "it-sqlite".into(), driver: "sqlite".into(), database: f.display().to_string(), ..Default::default() };
+    exercise(c.clone(), "", "main");
+    // Expression / CTE columns have no declared type: numeric from the first row's values, so
+    // the grid sorts them as numbers.
+    let mut b = backend::connect(&c, "", &Prefs::default()).unwrap();
+    let (cols, _) = query_all(b.as_mut(), "select 1 + 1 n, 2.5 r, 'x' t, null z union all select 3, 4, 'y', 5").unwrap();
+    assert_eq!(cols.iter().map(|c| c.numeric).collect::<Vec<_>>(), vec![true, true, false, false]);
     let _ = std::fs::remove_file(f);
 }
 

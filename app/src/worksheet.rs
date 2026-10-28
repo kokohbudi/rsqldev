@@ -23,9 +23,9 @@ pub struct Worksheet {
     conn_choice: Choice,
     bottom: AuiNotebook,
     pub results: ResultGrid,
-    script_out: TextCtrl,
+    script_out: StyledTextCtrl,
     explain: ResultGrid,
-    dbms: TextCtrl,
+    dbms: StyledTextCtrl,
     /// Query Result pane message ("All Rows Fetched: 14 in 0.003 seconds").
     status: StaticText,
     /// Script Output pane message ("Task completed in 0.04 seconds").
@@ -36,7 +36,8 @@ pub struct Worksheet {
     binds: RefCell<std::collections::HashMap<String, String>>,
     pub path: RefCell<Option<PathBuf>>,
     last: RefCell<Option<String>>,
-    spool: RefCell<Option<PathBuf>>,
+    /// SPOOL target, open for appending (unbuffered: the file shows output as it comes).
+    spool: RefCell<Option<std::fs::File>>,
     running: Cell<bool>,
     started: Cell<Option<Instant>>,
     me: Weak<Worksheet>,
@@ -44,7 +45,8 @@ pub struct Worksheet {
     busy: Cell<bool>,
     /// Autosave slot (`<config>/worksheets/<id>.toml`).
     pub autosave_id: u64,
-    pub autosaved: RefCell<String>,
+    /// Text changed since the last autosave (set by the editor's change event).
+    pub unsaved: Cell<bool>,
     /// Posts edits of a single-table query result (SQL Developer: editable query results).
     dml: RefCell<Option<Rc<crate::data_editor::Editor>>>,
     /// Bumped per Run Statement: a late editability check of an older run is dropped.
@@ -122,15 +124,9 @@ impl Worksheet {
         let split = SplitterWindow::builder(&panel).build();
         let editor = editor::new_editor(&split, &prefs.editor_font, prefs.editor_font_size);
         let bottom = AuiNotebook::builder(&split).with_style(AuiNotebookStyle::from_bits_retain(0x1 | 0x20 | 0x100)).build();
-        let mono = |p: &Panel| {
-            let t = TextCtrl::builder(p).with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::DontWrap).build();
-            crate::copy::text(t);
-            if let Some(f) = Font::new_with_details(prefs.editor_font_size, FontFamily::Teletype as i32, 0, 400, false, &prefs.editor_font) {
-                t.set_font(&f);
-            }
-            t
-        };
-        let (qp, qs, qb, status) = pane(&bottom, &[("refresh", "Refresh (re-run)"), ("export", "Export…")]);
+        // Output panes: read-only, highlighted like the editor.
+        let mono = |p: &Panel| editor::sql_view(p, "");
+        let (qp, qs, qb, status) = pane(&bottom, &[("refresh", "Refresh (re-run)"), ("export", "Export…"), ("edit", "View / Edit Value… (Alt+Enter)")]);
         let results = ResultGrid::new(&qp);
         results.st.borrow_mut().db = Some(conn.borrow().kind);
         qs.add(&results.grid, 1, SizerFlag::Expand, 0);
@@ -193,7 +189,7 @@ impl Worksheet {
             b_cancel,
             busy: Cell::new(false),
             autosave_id: crate::autosave::next_id(),
-            autosaved: RefCell::default(),
+            unsaved: Cell::new(false),
         });
         let acts: Vec<(BitmapButton, fn(&Worksheet))> = vec![
             (b_run, Worksheet::run_statement),
@@ -211,11 +207,12 @@ impl Worksheet {
             (b_cancel, Worksheet::cancel),
             (qb[0], Worksheet::rerun),
             (qb[1], |w| w.results.export_dialog()),
-            (sb[0], |w| w.script_out.clear()),
-            (sb[1], |w| save_text(&w.panel, &w.script_out.get_value())),
+            (qb[2], |w| w.results.edit_value()),
+            (sb[0], |w| editor::show(&w.script_out, "")),
+            (sb[1], |w| save_text(&w.panel, &w.script_out.get_text())),
             (db[0], |w| w.set_output(true)),
-            (db[1], |w| w.dbms.clear()),
-            (db[2], |w| save_text(&w.panel, &w.dbms.get_value())),
+            (db[1], |w| editor::show(&w.dbms, "")),
+            (db[2], |w| save_text(&w.panel, &w.dbms.get_text())),
         ];
         for (b, f) in acts {
             let w = Rc::downgrade(&ws);
@@ -249,6 +246,7 @@ impl Worksheet {
                 app.status(1, &format!("Line {} Column {col}", line + 1));
                 app.status(2, "Insert");
                 app.status(3, if e.is_modified() { "Modified" } else { "" });
+                crate::complete::insert_tip(e, &w.conn());
             }
         });
         let w = Rc::downgrade(&ws);
@@ -261,14 +259,36 @@ impl Worksheet {
                 }
             }
         });
-        // Ctrl+Click (Cmd+Click on macOS): open the object under the caret.
+        // Autosave copies the text only after a change (no 2-second full-text copy and compare).
+        let w = Rc::downgrade(&ws);
+        ws.editor.on_stc_change(move |_| {
+            if let Some(w) = w.upgrade() {
+                w.unsaved.set(true);
+            }
+        });
+        // Ctrl/Cmd+F7 formats too (SQL Developer's key; the menu shows Ctrl/Cmd+Shift+F).
+        let w = Rc::downgrade(&ws);
+        ws.editor.on_key_down(move |e| {
+            if let (WindowEventData::Keyboard(k), Some(w)) = (&e, w.upgrade()) {
+                if k.cmd_down() && k.get_key_code() == Some(wxdragon::keycode::WXK_F7) {
+                    return w.format_sql();
+                }
+            }
+            e.skip(true);
+        });
+        // Ctrl+Click (Cmd+Click on macOS): open the object under the caret, or select an alias's source.
         let w = Rc::downgrade(&ws);
         ws.editor.on_mouse_left_up(move |_| {
             let Some(w) = w.upgrade() else { return };
             if !wxdragon::utils::get_key_state(wxdragon::keycode::WXK_COMMAND) {
                 return;
             }
-            let ident = ident_at(&w.editor.get_text(), w.editor.get_current_pos() as usize);
+            let (text, pos) = (w.editor.get_text(), w.editor.get_current_pos() as usize);
+            // An alias: select what it stands for (the table, or the subquery / CTE).
+            if let Some((a, b)) = crate::editor::alias_target_at(&text, pos) {
+                return w.editor.set_selection(a as i32, b as i32);
+            }
+            let ident = ident_at(&text, pos);
             if !ident.is_empty() {
                 crate::app().goto_object(w.conn(), &ident);
             }
@@ -365,21 +385,17 @@ impl Worksheet {
     }
 
     fn out(&self, text: &str) {
-        self.script_out.append_text(text);
-        if !text.ends_with('\n') {
-            self.script_out.append_text("\n");
-        }
-        if let Some(p) = self.spool.borrow().as_ref() {
+        let nl = if text.ends_with('\n') { "" } else { "\n" };
+        editor::append(&self.script_out, &format!("{text}{nl}"));
+        if let Some(mut f) = self.spool.borrow().as_ref() {
             use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(p) {
-                let _ = writeln!(f, "{}", text.trim_end_matches('\n'));
-            }
+            let _ = writeln!(f, "{}", text.trim_end_matches('\n'));
         }
     }
 
     fn dbms_lines(&self, lines: &[String]) {
-        for l in lines {
-            self.dbms.append_text(&format!("{l}\n"));
+        if !lines.is_empty() {
+            editor::append(&self.dbms, &(lines.join("\n") + "\n"));
         }
         if !lines.is_empty() {
             self.bottom.set_selection(P_DBMS);
@@ -414,8 +430,7 @@ impl Worksheet {
     /// DELETE / UPDATE without WHERE: ask before it touches every row.
     fn allow(&self, sql: &str) -> bool {
         let Some(verb) = script::unbounded_dml(sql) else { return true };
-        let head: String = sql.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
-        crate::ui::confirm(&self.panel, &format!("{verb} without WHERE changes every row of the table:\n\n{head}\n\nRun it anyway?"))
+        crate::ui::confirm_sql(&self.panel, &format!("{verb} without WHERE changes every row of the table. Run it anyway?"), sql)
     }
 
     /// Tint editor lines named in a compile-error report (`LINE/COL  ERROR` rows, numbered from
@@ -456,6 +471,11 @@ impl Worksheet {
         }
     }
 
+    /// The Query Result is editable (self-test).
+    pub fn result_editable(&self) -> bool {
+        self.dml.borrow().is_some()
+    }
+
     /// Query Result edits not committed yet (closing the worksheet asks).
     pub fn has_unsaved_edits(&self) -> bool {
         self.dml.borrow().as_ref().is_some_and(|e| e.pending())
@@ -475,7 +495,7 @@ impl Worksheet {
         };
         let Some(item) = item else { return };
         if item.kind == script::Kind::Command {
-            self.script_out.clear();
+            editor::show(&self.script_out, "");
             self.run_items(vec![item], 0);
             return;
         }
@@ -513,7 +533,7 @@ impl Worksheet {
             let secs = format!("{:.3} seconds", d.elapsed.as_secs_f32());
             match d.result {
                 Err(e) => {
-                    me.script_out.clear();
+                    editor::show(&me.script_out, "");
                     me.out(&format!("Error starting at line : {line} in command -\n{sql2}\nError report -\n{e}"));
                     me.mark_errors(line, &e);
                     me.bottom.set_selection(P_SCRIPT);
@@ -522,7 +542,7 @@ impl Worksheet {
                     el.set_label(&secs);
                 }
                 Ok(aff) if !query => {
-                    me.script_out.clear();
+                    editor::show(&me.script_out, "");
                     me.out(&script::feedback(&sql2, aff));
                     me.bottom.set_selection(P_SCRIPT);
                     task.set_label(&format!("Task completed in {secs}"));
@@ -631,7 +651,7 @@ impl Worksheet {
         if items.is_empty() {
             return;
         }
-        self.script_out.clear();
+        editor::show(&self.script_out, "");
         self.bottom.set_selection(P_SCRIPT);
         self.started.set(Some(Instant::now()));
         self.running.set(true);
@@ -663,9 +683,17 @@ impl Worksheet {
                 Action::Run(sql) => return self.script_sql(sql, item.start, items, i, Box::new(next)),
                 Action::Print(t) => self.out(&t),
                 Action::Output(on) => self.set_output(on),
-                Action::Clear => self.script_out.clear(),
+                Action::Clear => editor::show(&self.script_out, ""),
                 Action::Nothing => {}
-                Action::Spool(p) => *self.spool.borrow_mut() = p.map(PathBuf::from),
+                Action::Spool(p) => {
+                    *self.spool.borrow_mut() = None;
+                    if let Some(p) = p {
+                        match std::fs::OpenOptions::new().append(true).create(true).open(&p) {
+                            Ok(f) => *self.spool.borrow_mut() = Some(f),
+                            Err(e) => self.out(&format!("SPOOL {p}: {e}")),
+                        }
+                    }
+                }
                 Action::Rerun => {
                     if let Some(sql) = self.last.borrow().clone() {
                         return self.script_sql(sql.trim_start_matches('\u{1}').to_string(), item.start, items, i, Box::new(next));
@@ -888,7 +916,7 @@ impl Worksheet {
     /// (fetched rows, all fetched, script output) for the self-test.
     pub fn probe(&self) -> (usize, bool, String) {
         let st = self.results.st.borrow();
-        (st.rows.len(), st.done, self.script_out.get_value())
+        (st.rows.len(), st.done, self.script_out.get_text())
     }
 
     pub fn open_file(&self, p: PathBuf) -> std::io::Result<()> {

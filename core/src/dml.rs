@@ -170,6 +170,23 @@ pub fn insert(db: Db, table: &str, cols: &[Column], skip: Option<usize>, row: &[
     )
 }
 
+/// Columns [`insert`] names for a row without bind values: the non-NULL ones (NULL columns are
+/// left out so their defaults apply). Rows with the same set can share one statement.
+pub fn insert_columns(cols: &[Column], skip: Option<usize>, row: &[Cell]) -> Vec<usize> {
+    (0..cols.len()).filter(|&i| Some(i) != skip && row[i].is_some()).collect()
+}
+
+/// Several rows in one INSERT (one round trip): multi-row VALUES, Oracle INSERT ALL. All rows
+/// name the same `idx` columns ([`insert_columns`]) and bind nothing.
+pub fn insert_many(db: Db, table: &str, cols: &[Column], idx: &[usize], rows: &[&[Cell]]) -> String {
+    let names = idx.iter().map(|&i| quote(db, &cols[i].name)).collect::<Vec<_>>().join(", ");
+    let values = |row: &[Cell]| format!("({})", idx.iter().map(|&i| literal(db, &cols[i], &row[i])).collect::<Vec<_>>().join(", "));
+    match db {
+        Db::Oracle => format!("INSERT ALL\n{}\nSELECT 1 FROM DUAL", rows.iter().map(|r| format!("  INTO {table} ({names}) VALUES {}", values(r))).collect::<Vec<_>>().join("\n")),
+        _ => format!("INSERT INTO {table} ({names}) VALUES\n{}", rows.iter().map(|r| format!("  {}", values(r))).collect::<Vec<_>>().join(",\n")),
+    }
+}
+
 pub fn delete(db: Db, table: &str, cols: &[Column], key: &Key, row: &[Cell]) -> String {
     let (top, tail) = one_row(db, key);
     format!("DELETE{top} FROM {table} WHERE {}{tail}", cond(db, cols, key, row))
@@ -239,6 +256,17 @@ pub fn single_table(sql: &str) -> Option<(Option<String>, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn insert_many_rows() {
+        let cols = vec![col("ID", "NUMBER", true), col("NAME", "VARCHAR2", false)];
+        let (a, b): (Vec<Cell>, Vec<Cell>) = (vec![Some("1".into()), Some("a".into())], vec![Some("2".into()), Some("o'k".into())]);
+        let idx = insert_columns(&cols, None, &a);
+        assert_eq!(idx, vec![0, 1]);
+        assert_eq!(insert_many(Db::Postgres, "t", &cols, &idx, &[&a, &b]), "INSERT INTO t (\"ID\", \"NAME\") VALUES\n  (1, 'a'),\n  (2, 'o''k')");
+        assert_eq!(insert_many(Db::Oracle, "T", &cols, &idx, &[&a, &b]), "INSERT ALL\n  INTO T (\"ID\", \"NAME\") VALUES (1, 'a')\n  INTO T (\"ID\", \"NAME\") VALUES (2, 'o''k')\nSELECT 1 FROM DUAL");
+        assert_eq!(insert_columns(&cols, None, &[Some("3".into()), None]), vec![0]);
+    }
 
     #[test]
     fn single_table_queries() {

@@ -14,14 +14,14 @@ Native SQL Developer clone. Rust + wxWidgets via wxDragon 0.9.23 (real Cocoa / W
 - `docs/feature-catalog.md` — SQL Developer feature spec. `docs/superpowers/` — specs + plans. `site/index.html` — download page (GitHub Pages, English).
 
 ## Commands
-- Check before every commit: `cargo check --workspace --message-format short` (<1 s warm; `target/` ≈10 GB on purpose, keep it).
+- Check before every commit: `cargo check --workspace --message-format short` (<1 s warm; `target/` ≈8 GB with tests: dependencies build without debug info, keep it).
 - Core tests: `cargo test -p rsqldev-core` (fast: unit + SQLite/DuckDB). CI runs it on Linux.
 - NEVER locally: release builds, `scripts/bundle-macos.sh` (universal), Docker / `--ignored` backend suite — slow, CI does them.
 - UI self-test: `RSQLDEV_CONFIG_DIR=/tmp/cfg RSQLDEV_SELFTEST="<conn>" RSQLDEV_SELFTEST_PW=<pw> cargo run -p rsqldev`.
 
 ## Workflow
 - Work on `develop`. Commit per change, push a few commits at once (each push = 4 CI jobs downloading ~0.8 GB caches; too many → cache egress limit → full rebuilds). Newer push cancels older run.
-- CI: `.github/workflows/build.yml` (macOS universal, Windows x64, Linux x86_64/aarch64). Release profile = fat LTO, 1 codegen unit, stripped. Changing any `[profile.*]` → bump `CACHE_PREFIX` in build.yml (cache key ignores profiles).
+- CI: `.github/workflows/build.yml` (macOS universal, Windows x64, Linux x86_64/aarch64). Release profile = fat LTO, 1 codegen unit, stripped. Changing `[profile.release]` → bump `CACHE_PREFIX` in build.yml (cache key ignores profiles); `[profile.dev]` → bump only the Linux test leg's `-devN` key suffix.
 - Release only when user asks: write the `CHANGELOG.md` entry first (version + date, **Features** and **Bug fixes** since the last tag, from `git log <last-tag>..develop`, user-facing wording), merge `develop` → `main`, bump `version` in root `Cargo.toml` (`[workspace.package]`), push `main` first, then tag `v*` (`release.yml` publishes the zips of main's build run for that commit, no second build).
 - Stage files by path, never `git add -A` (`.idea/` etc.).
 

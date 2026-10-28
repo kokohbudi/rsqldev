@@ -174,6 +174,96 @@ pub fn expects_table(text: &str, pos: usize) -> bool {
     }
 }
 
+/// Caret inside a VALUES tuple of an INSERT: the target table, the columns the statement lists
+/// (None = all, in table order) and which value is being typed (0-based).
+#[derive(Debug, PartialEq)]
+pub struct InsertHint {
+    pub owner: Option<String>,
+    pub table: String,
+    pub columns: Option<Vec<String>>,
+    pub arg: usize,
+    /// Caret in the column list (`INSERT INTO t (a, |`): the columns already written there.
+    pub written: Option<Vec<String>>,
+}
+
+/// [`InsertHint`] for the caret at byte `pos` of statement `sql`, in a VALUES tuple or in the
+/// column list (then the table's columns). Only the text before the caret is read: tuples on later lines / rows (`values (..), (..)`) and Oracle
+/// `INSERT ALL INTO .. VALUES ..` (the nearest INTO) work.
+pub fn insert_hint(sql: &str, pos: usize) -> Option<InsertHint> {
+    let t = tokens(&sql[..pos.min(sql.len())]);
+    let word = |i: usize| match t.get(i) {
+        Some(Tok::Word(w)) => Some(w.as_str()),
+        _ => None,
+    };
+    let kw = |i: usize, k: &str| word(i).is_some_and(|w| w.eq_ignore_ascii_case(k));
+    let punct = |i: usize, c: char| t.get(i) == Some(&Tok::Punct(c));
+    // Open brackets with their top-level comma count, and each closed bracket's opener.
+    let mut open: Vec<(usize, usize)> = vec![];
+    let mut opener = vec![usize::MAX; t.len()];
+    for (i, tok) in t.iter().enumerate() {
+        match tok {
+            Tok::Punct('(') => open.push((i, 0)),
+            Tok::Punct(')') => {
+                if let Some((o, _)) = open.pop() {
+                    opener[i] = o;
+                }
+            }
+            Tok::Punct(',') => {
+                if let Some(last) = open.last_mut() {
+                    last.1 += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    // The VALUES keyword of a tuple opened at `o`: right before it, or before `(..), (..),`.
+    let values_of = |mut o: usize| loop {
+        if o > 0 && kw(o - 1, "VALUES") {
+            return Some(o - 1);
+        }
+        if o < 2 || !punct(o - 1, ',') || !punct(o - 2, ')') || opener[o - 2] == usize::MAX {
+            return None;
+        }
+        o = opener[o - 2];
+    };
+    // `INTO [owner.]table` ending at token `i`.
+    let target = |i: usize| {
+        let name = word(i)?.to_string();
+        let owner = if i >= 2 && punct(i - 1, '.') { word(i - 2).map(str::to_string) } else { None };
+        let into = i.checked_sub(if owner.is_some() { 3 } else { 1 })?;
+        kw(into, "INTO").then_some((owner, name))
+    };
+    // Innermost open bracket that is a VALUES tuple or the column list (the caret may be
+    // inside a function call in it).
+    for &(o, arg) in open.iter().rev() {
+        if let Some(v) = values_of(o) {
+            let mut i = v.checked_sub(1)?;
+            let columns = if punct(i, ')') && opener[i] != usize::MAX {
+                let o = opener[i];
+                let cols = t[o + 1..i].split(|x| *x == Tok::Punct(',')).filter_map(|c| match c.last() {
+                    Some(Tok::Word(w)) => Some(w.clone()),
+                    _ => None,
+                });
+                i = o.checked_sub(1)?;
+                Some(cols.collect())
+            } else {
+                None
+            };
+            let (owner, table) = target(i)?;
+            return Some(InsertHint { owner, table, columns, arg, written: None });
+        }
+        // `INSERT INTO t (a, b, |`: the table's columns, in order.
+        if let Some((owner, table)) = o.checked_sub(1).and_then(target) {
+            let written = t[o + 1..].split(|x| *x == Tok::Punct(',')).filter_map(|c| match c.last() {
+                Some(Tok::Word(w)) => Some(w.clone()),
+                _ => None,
+            });
+            return Some(InsertHint { owner, table, columns: None, arg, written: Some(written.collect()) });
+        }
+    }
+    None
+}
+
 /// The table a qualifier (`e` in `e.`) points at: alias first, then table name.
 pub fn resolve<'a>(refs: &'a [TableRef], q: &str) -> Option<&'a TableRef> {
     let q = unquote(q);
@@ -279,5 +369,55 @@ mod tests {
     #[test]
     fn filtering() {
         assert_eq!(filter("em", ["EMP".into(), "dept".into(), "Employees".into(), "emp".into()]), vec!["EMP", "Employees"]);
+    }
+
+    fn hint(sql: &str) -> Option<InsertHint> {
+        insert_hint(&sql.replace('|', ""), sql.find('|').unwrap())
+    }
+
+    #[test]
+    fn insert_hint_with_listed_columns_counts_top_level_commas() {
+        let h = hint("insert into hr.emp (id, name, hired)\nvalues (1, upper('a,b'), to_date('x', |").unwrap();
+        assert_eq!((h.owner.as_deref(), h.table.as_str(), h.arg), (Some("hr"), "emp", 2));
+        assert_eq!(h.columns, Some(vec!["id".to_string(), "name".into(), "hired".into()]));
+    }
+
+    #[test]
+    fn insert_hint_without_columns_and_on_later_rows() {
+        let h = hint("insert into emp values\n  (1, 'a'),\n  (2, |").unwrap();
+        assert_eq!((h.owner, h.table.as_str(), h.columns, h.arg), (None, "emp", None, 1));
+        // Oracle INSERT ALL: the INTO nearest the tuple.
+        let h = hint("insert all into a (x) values (1) into b (y, z) values (2, |").unwrap();
+        assert_eq!((h.table.as_str(), h.arg), ("b", 1));
+    }
+
+    #[test]
+    fn insert_hint_for_both_insert_forms() {
+        // Columns written: the tip lists them, the value under the caret picks one.
+        let h = hint("-- 1. Kolom ditulis\ninsert into account_hist_dtl (id, account_no, amount)\nvalues (1, 'A001', |5000);").unwrap();
+        assert_eq!((h.table.as_str(), h.arg), ("account_hist_dtl", 2));
+        assert_eq!(h.columns, Some(vec!["id".to_string(), "account_no".into(), "amount".into()]));
+        // No columns: all of the table's columns (fetched), same position rule.
+        let h = hint("-- 2. Tanpa kolom\ninsert into account_hist_dtl\nvalues (1, 'A001', 5000, sysdate, |'Y');").unwrap();
+        assert_eq!((h.table.as_str(), h.columns, h.arg), ("account_hist_dtl", None, 4));
+    }
+
+    #[test]
+    fn insert_hint_in_the_column_list_offers_the_table_columns() {
+        let h = hint("insert into hr.account_hist_dtl(|").unwrap();
+        assert_eq!((h.owner.as_deref(), h.table.as_str(), h.columns, h.arg), (Some("hr"), "account_hist_dtl", None, 0));
+        let h = hint("insert into emp (id,\n name, |").unwrap();
+        assert_eq!((h.arg, h.written), (2, Some(vec!["id".to_string(), "name".into()])));
+        assert_eq!(hint("insert into emp values (1, |").unwrap().written, None);
+    }
+
+    #[test]
+    fn no_insert_hint_outside_a_values_tuple() {
+        assert_eq!(hint("create table emp (id, |"), None);
+        assert_eq!(hint("merge into emp using (|"), None);
+        assert_eq!(hint("insert into emp values (1) |"), None);
+        assert_eq!(hint("select f(1, |"), None);
+        assert_eq!(hint("insert into emp select max(|"), None);
+        assert_eq!(hint("a.b values (|"), None);
     }
 }

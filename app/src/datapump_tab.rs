@@ -149,12 +149,8 @@ pub(crate) fn view_server_file(conn: &ConnRef, user: String, dir: String, file: 
 fn show_text(title: &str, text: &str) {
     let app = crate::app();
     let dlg = Dialog::builder(&app.frame, title).with_style(DialogStyle::DefaultDialogStyle).with_size(820, 600).build();
-    let t = TextCtrl::builder(&dlg).with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::DontWrap).build();
-    let prefs = app.prefs();
-    if let Some(f) = Font::new_with_details(prefs.editor_font_size, FontFamily::Teletype as i32, 0, 400, false, &prefs.editor_font) {
-        t.set_font(&f);
-    }
-    t.set_value(text);
+    // Logs and SQL files alike: highlighted like the worksheet.
+    let t = crate::editor::sql_view(&dlg, text);
     let close = Button::builder(&dlg).with_label("Close").build();
     close.on_click(move |_| dlg.end_modal(ID_OK));
     let s = BoxSizer::builder(Orientation::Vertical).build();
@@ -432,7 +428,7 @@ impl DataPumpTab {
     fn stop(&self) {
         let Some((owner, job, _)) = self.job_sel() else { return };
         let sql = datapump::stop_block(&owner, &job, false);
-        if ui::confirm(&self.panel, &format!("Stop job {owner}.{job}?\n\nThe master table stays, so Resume can continue it.\n\n{sql}")) {
+        if ui::confirm_sql(&self.panel, &format!("Stop job {owner}.{job}?\n\nThe master table stays, so Resume can continue it."), &sql) {
             self.run_block(format!("Stop of {job}"), sql);
         }
     }
@@ -440,7 +436,7 @@ impl DataPumpTab {
     fn kill(&self) {
         let Some((owner, job, _)) = self.job_sel() else { return };
         let sql = datapump::stop_block(&owner, &job, true);
-        if ui::confirm(&self.panel, &format!("Kill job {owner}.{job}?\n\nThe job is stopped and its master table dropped: it cannot be resumed.\n\n{sql}")) {
+        if ui::confirm_sql(&self.panel, &format!("Kill job {owner}.{job}?\n\nThe job is stopped and its master table dropped: it cannot be resumed."), &sql) {
             self.run_block(format!("Kill of {job}"), sql);
         }
     }
@@ -456,7 +452,7 @@ impl DataPumpTab {
             },
         };
         let sql = datapump::resume_block(&owner, &job, parallel);
-        if ui::confirm(&self.panel, &format!("Resume job {owner}.{job}?\n\n{sql}")) {
+        if ui::confirm_sql(&self.panel, &format!("Resume job {owner}.{job}?"), &sql) {
             self.run_block(format!("Resume of {job}"), sql);
         }
     }
@@ -467,7 +463,7 @@ impl DataPumpTab {
             return ui::error(&self.panel, "Clean Up is only for jobs in state NOT RUNNING. Use Kill for a running job.");
         }
         let sql = datapump::cleanup_sql(&owner, &job);
-        if ui::confirm(&self.panel, &format!("Drop the master table of {owner}.{job}?\n\n{sql}")) {
+        if ui::confirm_sql(&self.panel, &format!("Drop the master table of {owner}.{job}?"), &sql) {
             self.run_block(format!("Clean up of {job}"), sql);
         }
     }
@@ -762,7 +758,7 @@ impl DataPumpTab {
                 Err(e) => return ui::error(&self.panel, &e),
             }
         }
-        if !ui::confirm(&self.panel, &format!("Delete from directory {}:\n\n{}\n\nThis cannot be undone.", d.dir, stmts.join("\n"))) {
+        if !ui::confirm_sql(&self.panel, &format!("Delete from directory {}? This cannot be undone.", d.dir), &stmts.join("\n")) {
             return;
         }
         let mut q = pieces;

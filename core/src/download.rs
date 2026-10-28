@@ -88,16 +88,12 @@ fn fetch(url: &str, sha256: &str, out: &Path, progress: &mut dyn FnMut(u64, Opti
             bail!("download cancelled");
         }
     }
-    let got = hex(&hasher.finalize());
+    let got = crate::hex(&hasher.finalize());
     if !got.eq_ignore_ascii_case(sha256) {
         let _ = fs::remove_file(out);
         bail!("checksum mismatch for {url}: expected {sha256}, got {got}");
     }
     Ok(())
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// Drop the first `strip` components; refuse anything that is not a plain relative path.

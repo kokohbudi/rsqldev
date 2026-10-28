@@ -125,7 +125,7 @@ impl Sessions {
             _ => return crate::ui::error(&self.panel, "Select a session row first."),
         };
         let Some(sql) = dialect::kill_sql(self.db, &row) else { return crate::ui::error(&self.panel, "This row has no session id to kill.") };
-        if !crate::ui::confirm(&self.panel, &format!("Kill this session on {}?\n\n{sql}", self.conn_name)) {
+        if !crate::ui::confirm_sql(&self.panel, &format!("Kill this session on {}?", self.conn_name), &sql) {
             return;
         }
         let (w, q) = (self.me.clone(), sql.clone());

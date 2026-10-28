@@ -201,11 +201,7 @@ fn dialog(conn: ConnRef, env: Env, dirs: Vec<String>) {
 
     // PL/SQL.
     let pp = Panel::builder(&nb).build();
-    let text = TextCtrl::builder(&pp).with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::DontWrap).build();
-    let prefs = crate::app().prefs();
-    if let Some(f) = Font::new_with_details(prefs.editor_font_size, FontFamily::Teletype as i32, 0, 400, false, &prefs.editor_font) {
-        text.set_font(&f);
-    }
+    let text = crate::editor::sql_view(&pp, "");
     let ps = BoxSizer::builder(Orientation::Vertical).build();
     ps.add(&text, 1, SizerFlag::Expand, 0);
     pp.set_sizer(ps, true);
@@ -301,7 +297,7 @@ fn dialog(conn: ConnRef, env: Env, dirs: Vec<String>) {
     nb.on_page_changed(move |e| {
         if e.get_selection() == Some(3) {
             sy();
-            text.set_value(&match bl() {
+            crate::editor::show(&text, &match bl() {
                 Ok(b) => b,
                 Err(e) => format!("-- Cannot generate the block yet:\n-- {e}"),
             });
@@ -341,7 +337,7 @@ fn dialog(conn: ConnRef, env: Env, dirs: Vec<String>) {
             Ok(x) => x,
             Err(e) => return ui::error(&dlg, &e),
         };
-        if ui::confirm(&dlg, &confirm_text(&spec, up.as_ref(), &cn, &b)) {
+        if ui::confirm_sql(&dlg, &confirm_text(&spec, up.as_ref(), &cn), &b) {
             let password = spec.encrypted.then(|| pw.get_value());
             *p2.borrow_mut() = Some(Picked::Run(spec, b, password, up));
             dlg.end_modal(ID_OK);
@@ -362,8 +358,8 @@ fn dialog(conn: ConnRef, env: Env, dirs: Vec<String>) {
     }
 }
 
-/// The confirmation: what will happen first (upload, REPLACE / TRUNCATE), then the block.
-fn confirm_text(spec: &ImportSpec, upload: Option<&PathBuf>, conn: &str, block: &str) -> String {
+/// The confirmation: what will happen first (upload, REPLACE / TRUNCATE); the block is shown under it.
+fn confirm_text(spec: &ImportSpec, upload: Option<&PathBuf>, conn: &str) -> String {
     let mut t = String::new();
     if !spec.sql_file.is_empty() {
         t.push_str(&format!("Write the DDL to {} (nothing is imported) on {conn}?\n\n", spec.sql_file));
@@ -376,10 +372,9 @@ fn confirm_text(spec: &ImportSpec, upload: Option<&PathBuf>, conn: &str, block: 
         }
     }
     if let Some(p) = upload {
-        t.push_str(&format!("First {} is uploaded to {} (an existing file of that name is overwritten).\n\n", p.display(), spec.directory));
+        t.push_str(&format!("First {} is uploaded to {} (an existing file of that name is overwritten).", p.display(), spec.directory));
     }
-    t.push_str(block);
-    t
+    t.trim_end().to_string()
 }
 
 /// Upload (when asked), then start the job.

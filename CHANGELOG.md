@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.6.0 — 2026-10-28
+
+### Features
+- **SQL editor**: incremental syntax highlighting; aliases highlighted, Ctrl/Cmd+Click on an alias selects the table it stands for.
+- Holding Ctrl (Cmd on macOS) shows object names as clickable links; opening an object (Ctrl+Click, Find DB Object) also selects it in the Connections tree.
+- **INSERT column tip**: in a VALUES tuple or the column list, a tip shows the table's columns with the one being typed highlighted; column autocomplete in the INSERT column list.
+- Format SQL on Ctrl/Cmd+Shift+F (Ctrl/Cmd+F7 still works).
+- SQL highlighting in every SQL text view: Create / Edit Table DDL, Data Pump previews, Script Output, DBMS Output, Messages - Log and every confirmation showing the exact statement.
+- Result grid: Edit Value pencil, Alt+Enter, double-click opens long values.
+- Engine icons in the connection dialog's Database Type list, the drivers list and connection lists.
+- Splash screen at startup; a little database in the status bar hops while the database works.
+- Faster result grids: fetch all, paste, filters and sorting; new rows in the data editor are committed 500 at a time in one INSERT.
+
+### Bug fixes
+- Fixed a crash on quit (macOS) when an editor popup was open.
+- Fixed a crash in the editor when editing large scripts with non-ASCII text.
+- SQLite: expression and CTE columns with numbers now sort numerically.
+- SQLite: Commit no longer fails with "database is locked" after browsing metadata; PostgreSQL: metadata queries no longer hold a transaction open.
+
 ## v0.5.0 — 2026-10-27
 
 ### Features

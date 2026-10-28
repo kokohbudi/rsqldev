@@ -82,6 +82,8 @@ fn svg(name: &str) -> String {
         "pin" => "<path d='M6 1.5h4l-.5 5 2.5 2H4l2.5-2z' fill='#9db8d9' stroke='#3a6aa0'/><path d='M8 8.5v6' stroke='#3a6aa0' stroke-width='1.5'/>".into(),
         "insertrow" => "<path d='M1.5 3h8M1.5 6.5h8M1.5 10h5' stroke='#5a7fa8' stroke-width='1.6'/><circle cx='11.5' cy='11.5' r='4.5' fill='#2f9e44'/><path d='M11.5 8.8v5.4M8.8 11.5h5.4' stroke='#fff' stroke-width='1.8'/>".into(),
         "deleterow" => "<path d='M1.5 3h8M1.5 6.5h8M1.5 10h5' stroke='#5a7fa8' stroke-width='1.6'/><circle cx='11.5' cy='11.5' r='4.5' fill='#e03131'/><path d='M9.6 9.6l3.8 3.8M13.4 9.6l-3.8 3.8' stroke='#fff' stroke-width='1.8'/>".into(),
+        // Pencil (SQL Developer's cell editor button).
+        "edit" => "<path d='M2.5 13.5l.8-3.3 7.6-7.6 2.5 2.5-7.6 7.6z' fill='#f2c94c' stroke='#8a6d1e' stroke-linejoin='round'/><path d='M9.6 3.9l2.5 2.5' stroke='#8a6d1e'/><path d='M2.5 13.5l.8-3.3 2.5 2.5z' fill='#5b4a1e'/>".into(),
         "sort" => "<path d='M4 2v11M1.5 10.5L4 13l2.5-2.5' fill='none' stroke='#3a6aa0' stroke-width='1.5'/><path d='M8 4h7M8 8h5M8 12h3' stroke='#3a6aa0' stroke-width='1.5'/>".into(),
         "actions" => "<rect x='1.5' y='3' width='13' height='10' rx='1.5' fill='#eef2f7' stroke='#6b7d93'/><path d='M5 7l3 3 3-3' fill='none' stroke='#3a6aa0' stroke-width='1.5'/>".into(),
         "export" => format!("{SHEET}<path d='M8 13V7M5.5 9.5L8 7l2.5 2.5' fill='none' stroke='#2f9e44' stroke-width='1.6'/>"),

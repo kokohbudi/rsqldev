@@ -107,6 +107,74 @@ impl Navigator {
         }
     }
 
+    /// Select `owner.name` in the tree, expanding (and loading) the path to it: the object
+    /// viewer's "select in navigator", like IntelliJ's select-in-project. Gives up quietly
+    /// after 15 s or when a step is missing.
+    pub fn reveal(&self, conn: &str, schema: &str, owner: &str, kind: &'static str, name: &str) {
+        let nav = *self;
+        let (conn, owner, name) = (conn.to_string(), owner.to_string(), name.to_string());
+        // Own schema: folders right under the connection; other schemas under Schemas ▸ owner.
+        let own = owner.eq_ignore_ascii_case(schema);
+        let steps: Vec<Box<dyn Fn(&Node) -> bool>> = {
+            let (c1, c2, o1, o2, n1) = (conn.clone(), conn.clone(), owner.clone(), owner.clone(), name.clone());
+            let mut v: Vec<Box<dyn Fn(&Node) -> bool>> = vec![Box::new(move |n| matches!(n, Node::Conn(c) if *c == c1))];
+            if !own {
+                v.push(Box::new(move |n| matches!(n, Node::Schemas { conn } if *conn == c2)));
+                v.push(Box::new(move |n| matches!(n, Node::Schema { owner, .. } if owner.eq_ignore_ascii_case(&o1))));
+            }
+            v.push(Box::new(move |n| matches!(n, Node::Kind { kind: k, owner, .. } if *k == kind && owner.eq_ignore_ascii_case(&o2))));
+            v.push(Box::new(move |n| matches!(n, Node::Obj { name: x, .. } if *x == n1)));
+            v
+        };
+        let Some(root) = self.tree.get_root_item() else { return };
+        let (mut at, mut step) = (root, 0usize);
+        let start = std::time::Instant::now();
+        crate::hub::every_tick(move || {
+            if !nav.tree.is_valid() || start.elapsed().as_secs() > 15 {
+                return false;
+            }
+            // Wait while a load replaces the Loading placeholder.
+            if nav.first_child_is_loading(&at) {
+                if !nav.tree.is_expanded(&at) {
+                    nav.tree.expand(&at);
+                }
+                return true;
+            }
+            // Connections can sit in folders: look one folder level deep at the top.
+            let found = nav.child_where(&at, &steps[step]).or_else(|| {
+                (step == 0).then(|| nav.children(&at).into_iter().filter(|c| matches!(nav.node(c), Node::Folder)).find_map(|f| nav.child_where(&f, &steps[0]))).flatten()
+            });
+            let Some(next) = found else { return false };
+            step += 1;
+            if step == steps.len() {
+                crate::copy::quietly(|| nav.tree.select_item(&next));
+                nav.tree.ensure_visible(&next);
+                return false;
+            }
+            nav.tree.expand(&next);
+            at = next;
+            true
+        });
+    }
+
+    fn children(&self, i: &TreeItemId) -> Vec<TreeItemId> {
+        let mut out = vec![];
+        if let Some((mut c, _)) = self.tree.get_first_child(i) {
+            loop {
+                out.push(c.clone());
+                match self.tree.get_next_sibling(&c) {
+                    Some(n) => c = n,
+                    None => break,
+                }
+            }
+        }
+        out
+    }
+
+    fn child_where(&self, i: &TreeItemId, f: &dyn Fn(&Node) -> bool) -> Option<TreeItemId> {
+        self.children(i).into_iter().find(|c| f(&self.node(c)))
+    }
+
     fn node(&self, i: &TreeItemId) -> Node {
         self.tree.get_custom_data(i).and_then(|d| d.downcast_ref::<Node>().cloned()).unwrap_or(Node::Leaf)
     }
@@ -389,7 +457,7 @@ impl Navigator {
                     },
                     M_COMPILE => format!("ALTER {} {q} COMPILE", if kind == dialect::PACKAGE { "PACKAGE" } else { kind }),
                     M_REBUILD => match rsqldev_core::ddl::rebuild_index(db, &owner, "", &name) {
-                        Some(s) if crate::ui::confirm(&self.tree, &format!("Rebuild index {q}?\n\n{s}")) => s,
+                        Some(s) if crate::ui::confirm_sql(&self.tree, &format!("Rebuild index {q}?"), &s) => s,
                         _ => return,
                     },
                     _ => return,
@@ -432,19 +500,23 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let dlg = Dialog::builder(parent, "New / Select Database Connection").with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(900, 600).build();
 
     let list = ListCtrl::builder(&dlg).with_style(ListCtrlStyle::Report | ListCtrlStyle::SingleSel).build();
+    list.set_image_list(crate::icons::tree_images(), 1 /* image_list_type::SMALL */);
     list.insert_column(0, "Connection Name", ListColumnFormat::Left, 150);
     list.insert_column(1, "Connection Details", ListColumnFormat::Left, 200);
     for (i, c) in saved.iter().enumerate() {
-        list.insert_item(i as i64, &c.name, None);
+        list.insert_item(i as i64, &c.name, Some(crate::icons::tree_index(&crate::icons::conn_icon(&c.driver, false))));
         list.set_item_text_by_column(i as i64, 1, &details(c));
     }
 
     let text = || TextCtrl::builder(&dlg).build();
     let name = text();
     let drivers = ordered_drivers();
-    let dbtype = Choice::builder(&dlg)
-        .with_choices(drivers.iter().map(|d| if POPULAR.contains(&d.id.as_str()) { d.label.clone() } else { format!("{}  ({}-compatible)", d.label, d.category) }).collect())
-        .build();
+    // Engine icons, as in the Connections tree.
+    let dbtype = BitmapComboBox::builder(&dlg).with_style(ComboBoxStyle::ReadOnly).build();
+    for d in &drivers {
+        let label = if POPULAR.contains(&d.id.as_str()) { d.label.clone() } else { format!("{}  ({}-compatible)", d.label, d.category) };
+        dbtype.append(&label, crate::icons::bitmap(&crate::icons::conn_icon(&d.id, false), 16).as_ref());
+    }
     let folder = text();
     let user = text();
     let pw = TextCtrl::builder(&dlg).with_style(TextCtrlStyle::Password).build();
@@ -496,7 +568,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
 
     let load = move |c: &ConnConfig| {
         name.set_value(&c.name);
-        dbtype.set_selection(ordered_drivers().iter().position(|d| d.id == c.driver).unwrap_or(0) as u32);
+        dbtype.set_selection(ordered_drivers().iter().position(|d| d.id == c.driver).unwrap_or(0) as i32);
         folder.set_value(&c.folder);
         user.set_value(&c.user);
         pw.set_value(&if c.name.is_empty() { String::new() } else { config::get_password(&c.name).unwrap_or_default() });
@@ -523,7 +595,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let sync = {
         let (ru, rd) = (rows_user.clone(), rows_det.clone());
         move || {
-            let d = ordered_drivers()[dbtype.get_selection().unwrap_or(0) as usize];
+            let d = ordered_drivers()[dbtype.get_selection().max(0) as usize];
             let ora = d.backend == Kind::Oracle;
             let file_db = d.backend.is_file();
             let ct = ctype.get_selection().unwrap_or(0);
@@ -579,7 +651,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     });
 
     let read = move || {
-        let d = ordered_drivers()[dbtype.get_selection().unwrap_or(0) as usize];
+        let d = ordered_drivers()[dbtype.get_selection().max(0) as usize];
         let mut c = ConnConfig {
             name: name.get_value().trim().to_string(),
             driver: d.id.clone(),

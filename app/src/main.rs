@@ -2,6 +2,7 @@
 //! rsqldev: a native SQL Developer. wxWidgets gives Cocoa widgets on macOS and Win32 on Windows.
 
 mod autosave;
+mod buddy;
 mod compare;
 mod complete;
 mod copy;
@@ -107,6 +108,7 @@ const ID_DP_EXPORT: i32 = ID_HIGHEST + 47;
 const ID_DP_IMPORT: i32 = ID_HIGHEST + 48;
 const ID_DP_JOBS: i32 = ID_HIGHEST + 49;
 const ID_INSERT_ROW: i32 = ID_HIGHEST + 50;
+const ID_EDIT_VALUE: i32 = ID_HIGHEST + 51;
 
 enum Page {
     Sheet(SheetRef),
@@ -148,6 +150,8 @@ pub struct App {
     pages: RefCell<Vec<Page>>,
     history: RefCell<Vec<String>>,
     _timer: Timer<Frame>,
+    /// Tab count at the last prune of `pages` (pruning only when it changes).
+    tabs_seen: std::cell::Cell<usize>,
 }
 
 thread_local! {
@@ -438,6 +442,9 @@ impl App {
 
     pub fn open_object(&self, conn: &str, owner: &str, kind: &'static str, name: &str) {
         let Some(c) = self.open_conn(conn) else { return };
+        // Select it in the Connections tree too (IntelliJ's select-in-project).
+        let schema = c.borrow().schema.clone();
+        self.nav.reveal(conn, &schema, owner, kind, name);
         let key = format!("{conn}|{owner}|{kind}|{name}");
         let idx = self.pages.borrow().iter().find(|p| matches!(p, Page::Obj(o) if o.key == key)).map(|p| self.nb.get_page_index(&p.panel()));
         if let Some(i) = idx.filter(|i| *i >= 0) {
@@ -522,13 +529,9 @@ impl App {
 
     /// Mirror worksheet text to autosave slots (called every ~2 s).
     fn autosave_tick(&self) {
-        for s in self.sheets() {
-            let text = s.editor.get_text();
-            if *s.autosaved.borrow() != text {
-                let path = s.path.borrow().as_ref().map(|p| p.display().to_string());
-                autosave::write(s.autosave_id, &s.conn().borrow().cfg.name, path, &text);
-                *s.autosaved.borrow_mut() = text;
-            }
+        for s in self.sheets().into_iter().filter(|s| s.unsaved.replace(false)) {
+            let path = s.path.borrow().as_ref().map(|p| p.display().to_string());
+            autosave::write(s.autosave_id, &s.conn().borrow().cfg.name, path, &s.editor.get_text());
         }
     }
 
@@ -578,7 +581,11 @@ impl App {
     /// Drop pages whose tab was closed with the × button (AuiNotebook destroys them itself),
     /// and keep the title / status bar in sync with the selected tab.
     fn sync_tabs(&self) {
-        self.pages.borrow_mut().retain(|p| p.panel().is_valid() && self.nb.get_page_index(&p.panel()) >= 0);
+        // A closed tab changes the count: prune then, not on every 25 ms tick.
+        let n = self.nb.page_count();
+        if n != self.tabs_seen.replace(n) {
+            self.pages.borrow_mut().retain(|p| p.panel().is_valid() && self.nb.get_page_index(&p.panel()) >= 0);
+        }
         let title = match self.current().map(|i| self.pages.borrow()[i].panel()) {
             Some(p) => self.nb.get_page_text(self.nb.get_page_index(&p) as usize),
             None => String::new(),
@@ -672,10 +679,13 @@ impl App {
         // Ctrl+D delete rows, Ctrl+R refresh, Ctrl+V paste cells.
         if let Some(o) = self.current_data() {
             match id {
-                ID_COMMIT => o.commit(),
-                ID_ROLLBACK => o.rollback(),
-                ID_INSERT_ROW => o.insert_row(),
-                ID_CLEAR => o.delete_rows(),
+                ID_COMMIT => o.editor().iter().for_each(|e| {
+                    e.commit();
+                }),
+                ID_ROLLBACK => o.editor().iter().for_each(|e| e.rollback()),
+                ID_INSERT_ROW => o.data_grid().iter().for_each(grid::ResultGrid::insert_row),
+                ID_EDIT_VALUE => o.data_grid().iter().for_each(grid::ResultGrid::edit_value),
+                ID_CLEAR => o.data_grid().iter().for_each(grid::ResultGrid::delete_selected_rows),
                 ID_REPLACE => o.refresh_data(),
                 ID_PASTE if o.paste() => {}
                 _ => return self.menu_rest(id, sheet, editor_focus),
@@ -814,6 +824,11 @@ impl App {
                     }
                 }
             }
+            ID_EDIT_VALUE => {
+                if let Some(s) = sheet {
+                    s.results.edit_value();
+                }
+            }
             ID_FORMAT => {
                 if let Some(s) = sheet {
                     s.format_sql();
@@ -941,33 +956,59 @@ fn check_updates(manual: bool) {
 fn activity_bar(sb: StatusBar) {
     const F_TIME: usize = 4;
     const F_BAR: usize = 5;
-    let gauge = Gauge::builder(&sb).with_range(100).build();
-    gauge.show(false);
+    // The buddy hops while the database works and beams for a second when it is done. Its
+    // frames and widget are made on the first busy tick, not at startup.
+    let mut buddy: Option<(buddy::Frames, StaticBitmap)> = None;
     let mut since: Option<std::time::Instant> = None;
-    let mut phase = 0;
+    let mut tick: u32 = 0;
+    let mut cheer = 0;
     hub::every_tick(move || {
-        if !gauge.is_valid() {
+        let busy = rsqldev_core::worker::busy() > 0 || conn::meta_pending() > 0;
+        // Idle (nearly always): nothing to do, nothing to repaint.
+        if !busy && since.is_none() && cheer == 0 {
+            return sb.is_valid();
+        }
+        if !sb.is_valid() {
             return false;
         }
-        let busy = rsqldev_core::worker::busy() > 0 || conn::meta_pending() > 0;
+        if buddy.is_none() {
+            let Some(f) = buddy::Frames::new() else { return false };
+            let pet = StaticBitmap::new_with_bitmap_bundle(&sb, ID_ANY as i32, &f.happy);
+            pet.show(false);
+            buddy = Some((f, pet));
+        }
+        let (frames, pet) = buddy.as_ref().unwrap();
+        let pet = *pet;
         match (busy, since) {
             (true, None) => since = Some(std::time::Instant::now()),
             (false, Some(_)) => {
                 since = None;
-                gauge.show(false);
                 sb.set_status_text("", F_TIME);
+                // ~1 s of joy at 25 ms ticks.
+                cheer = 40;
+                pet.set_bitmap_bundle(&frames.happy);
             }
             _ => {}
         }
-        // Shown at once: a click that waits on the database must never look like a hang.
-        let Some(t) = since else { return true };
-        let r = sb.get_field_rect(F_BAR);
-        gauge.set_size_with_pos(r.x + 4, r.y + 2, r.width - 8, r.height - 4);
-        gauge.show(true);
-        // No indeterminate mode in wxDragon: sweep the bar instead (~1.5 s per pass at 25 ms ticks).
-        phase = (phase + 2) % 102;
-        gauge.set_value(phase.min(100));
-        sb.set_status_text(&format!("Working {:.1} s", t.elapsed().as_secs_f32()), F_TIME);
+        if let Some(t) = since {
+            // 20 frames a second is plenty for a 20 px hop: repaint every other tick.
+            tick = tick.wrapping_add(1);
+            if tick % 2 == 1 {
+                return true;
+            }
+            let r = sb.get_field_rect(F_BAR);
+            let f = tick / 2;
+            pet.set_bitmap_bundle(frames.at(f));
+            // Shown at once: a click that waits on the database must never look like a hang.
+            pet.set_size_with_pos(r.x + 4 + buddy::walk(f * 2, r.width - 28), r.y + (r.height - 20) / 2, 20, 20);
+            pet.show(true);
+            sb.set_status_text(&format!("Working {:.1} s", t.elapsed().as_secs_f32()), F_TIME);
+        } else if cheer > 0 {
+            cheer -= 1;
+            if cheer == 0 {
+                pet.show(false);
+            }
+        }
         true
     });
 }
@@ -994,10 +1035,11 @@ fn menus(frame: &Frame) {
         .append_item(ID_COPY, "&Copy\tCtrl+C", "")
         .append_item(ID_PASTE, "&Paste\tCtrl+V", "")
         .append_item(ID_INSERT_ROW, "Insert &Row\tCtrl+I", "Data editor: new row after the cursor row")
+        .append_item(ID_EDIT_VALUE, "Edit &Value…\tAlt+Enter", "Result grid: the cursor cell in an editor (long text, date picker, LOB)")
         .append_item(ID_SELECTALL, "Select &All\tCtrl+A", "")
         .append_separator()
         .append_item(ID_COMPLETE, "Completion &Insight\tRawCtrl+Space", "Complete keywords, tables and columns")
-        .append_item(ID_FORMAT, "F&ormat SQL\tCtrl+F7", "Format the selection, or the whole worksheet")
+        .append_item(ID_FORMAT, "F&ormat SQL\tCtrl+Shift+F", "Format the selection, or the whole worksheet (also Ctrl+F7)")
         .append_item(ID_SNIPPET, "Insert S&nippet…\tCtrl+Shift+J", "Insert a SQL template at the caret")
         .append_item(ID_SNIPPET_SAVE, "Save Selection as Snippet…", "Keep the selected SQL as one of your snippets")
         .append_separator()
@@ -1112,11 +1154,12 @@ Data tab (table editor)
   Delete Selected Row(s)   Ctrl/Cmd+D
   Refresh                  Ctrl/Cmd+R
   Paste cells              Ctrl/Cmd+V
+  Edit Value (pencil)      Alt+Enter (date picker for DATE / TIMESTAMP)
   Unshared Worksheet       Ctrl/Cmd+Shift+N
 
 Editor
   Completion Insight       Ctrl+Space (also after typing alias.)
-  Format SQL               Ctrl/Cmd+F7
+  Format SQL               Ctrl/Cmd+Shift+F (or Ctrl/Cmd+F7)
   Insert Snippet           Ctrl/Cmd+Shift+J
   Duplicate Lines          Ctrl/Cmd+Shift+D
   Move Lines Up / Down     Alt+Up / Alt+Down
@@ -1236,6 +1279,27 @@ fn main() {
                 _ => wxdragon::appearance::Appearance::Light,
             });
         }
+        // Splash while the main window is built: shown first, the build runs on the next
+        // event loop turn (so the splash gets painted), and it goes once the window is up.
+        let splash = buddy::splash();
+        let go = Timer::new(&splash);
+        let once = std::cell::Cell::new(Some(prefs0.clone()));
+        go.on_tick(move |_| {
+            if let Some(p) = once.take() {
+                start(p);
+                splash.destroy();
+            }
+        });
+        go.start(1, true);
+        // ponytail: leaked on purpose; destroying the timer from its own tick is unsafe, and
+        // this one fires once at startup.
+        std::mem::forget(go);
+    });
+}
+
+/// Build and show the main window.
+fn start(prefs0: config::Prefs) {
+    {
         // Fit the usable screen area (menu bar / Dock / taskbar excluded), never off-screen.
         let (pos, size) = match wxdragon::display::Display::new(0).map(|d| d.client_area()) {
             Some(r) if r.width > 0 && r.height > 0 => {
@@ -1288,6 +1352,7 @@ fn main() {
             pages: RefCell::default(),
             history: RefCell::new(history.entries),
             _timer: timer,
+            tabs_seen: std::cell::Cell::new(usize::MAX),
         });
         APP.with(|g| *g.borrow_mut() = Some(a.clone()));
         nav.reload(&a.conns.borrow());
@@ -1306,12 +1371,24 @@ fn main() {
                 e.skip(true);
             }
         });
+        // A call tip is its own floating window: it must not stay over other apps.
+        frame.on_activate(|e| {
+            if let WindowEventData::Activate(a) = &e {
+                if !a.is_active() {
+                    complete::cancel_tip();
+                }
+            }
+            e.skip(true);
+        });
         frame.on_close(move |e| {
             let app = app();
             app.save_history();
             app.autosave_tick();
             app.open.borrow_mut().clear();
             rsqldev_core::lob::cleanup_mine();
+            // The event loop outlives the frame while other top-level windows remain (an
+            // editor's completion / call tip popup): the tick would then reach a freed frame.
+            app._timer.stop();
             e.skip(true);
         });
         frame.show(true);
@@ -1321,7 +1398,7 @@ fn main() {
         } else if a.prefs().check_updates {
             check_updates(false);
         }
-    });
+    }
 }
 
 /// RSQLDEV_SELFTEST=<connection> RSQLDEV_SELFTEST_PW=<pw>: drive the UI end to end, log, exit.
@@ -1351,6 +1428,18 @@ fn selftest(name: String) {
             match step {
                 0 if rows > 0 || el > 15.0 => {
                     eprintln!("SELFTEST run_statement rows={rows} done={done}");
+                    ws.results.fetch_all(|| {});
+                    step = 30;
+                }
+                // Fetch All drains every batch, then a sort (descending on the second click).
+                30 if done || el > 20.0 => {
+                    ws.results.sort_by(0);
+                    ws.results.sort_by(0);
+                    let st = ws.results.st.borrow();
+                    let first = st.rows.first().and_then(|r| r.cur[0].clone());
+                    let last = st.rows.last().and_then(|r| r.cur[0].clone());
+                    eprintln!("SELFTEST fetch_all rows={} done={} sorted desc first={first:?} last={last:?}", st.rows.len(), st.done);
+                    drop(st);
                     ws.editor.set_text("create table rsq_ui (id int, name varchar(20));\ninsert into rsq_ui values (1, 'a');\nselect * from rsq_ui;\ndrop table rsq_ui;\n");
                     ws.run_script();
                     step = 1;
@@ -1359,7 +1448,93 @@ fn selftest(name: String) {
                     eprintln!("SELFTEST run_script output:\n{out}");
                     step = 2;
                 }
+                // Data editor: a table edited in its Data tab, then as an editable query result.
                 2 => {
+                    ws.editor.set_text("drop table rsq_edit;\ncreate table rsq_edit (id int primary key, name varchar(20));\ninsert into rsq_edit values (1, 'a');\ninsert into rsq_edit values (2, 'b');\ncommit;\n");
+                    ws.run_script();
+                    step = 10;
+                }
+                10 if out.contains("Commit") || el > 45.0 => {
+                    let conn = ws.conn().borrow().cfg.name.clone();
+                    let schema = ws.conn().borrow().schema.clone();
+                    app().open_object(&conn, &schema, rsqldev_core::dialect::TABLE, &rsqldev_core::dialect::fold(kind, "rsq_edit"));
+                    step = 11;
+                }
+                11 | 12 | 13 => {
+                    let a = app();
+                    let v = a.pages.borrow().iter().find_map(|p| if let Page::Obj(o) = p { Some(o.clone()) } else { None });
+                    let Some(v) = v else { return true };
+                    if step == 11 {
+                        v.select_tab("Data");
+                        step = 12;
+                        return true;
+                    }
+                    let Some(g) = v.data_grid() else { return true };
+                    let n = g.st.borrow().rows.len();
+                    if step == 12 && n >= 2 && g.st.borrow().done {
+                        let w = g.st.borrow().cols.len();
+                        let name_col = w - 1;
+                        g.set_cell(0, name_col, Some("a2".into()));
+                        g.move_cursor(1, name_col as i32, false);
+                        g.delete_selected_rows();
+                        g.move_cursor(1, name_col as i32, false);
+                        g.insert_row();
+                        g.set_cell(2, name_col - 1, Some("3".into()));
+                        g.set_cell(2, name_col, Some("c".into()));
+                        eprintln!("SELFTEST data tab: {} rows, pending edits, commit", g.st.borrow().rows.len());
+                        v.editor().iter().for_each(|e| {
+                            e.commit();
+                        });
+                        step = 13;
+                    } else if step == 13 && !g.st.borrow().rows.iter().any(|r| r.dirty()) && g.st.borrow().done {
+                        eprintln!("SELFTEST data tab after commit: {:?}", g.st.borrow().rows.iter().map(|r| r.cur.iter().skip(g.st.borrow().hidden).cloned().collect::<Vec<_>>()).collect::<Vec<_>>());
+                        a.nb.set_selection(a.nb.get_page_index(&ws.panel) as usize);
+                        ws.editor.set_text("select id, name from rsq_edit order by id");
+                        ws.run_statement();
+                        step = 14;
+                    } else if el > 90.0 {
+                        eprintln!("SELFTEST data tab timed out at step {step}");
+                        step = 20;
+                    }
+                }
+                14 if ws.result_editable() && done => {
+                    ws.results.set_cell(0, 1, Some("w".into()));
+                    ws.commit();
+                    step = 15;
+                }
+                15 if !ws.has_unsaved_edits() && el > 1.0 => {
+                    step = 16;
+                }
+                16 if done && rows > 0 => {
+                    let st = ws.results.st.borrow();
+                    eprintln!("SELFTEST worksheet after commit: {:?}", st.rows.iter().map(|r| r.cur.clone()).collect::<Vec<_>>());
+                    drop(st);
+                    // INSERT column tip: columns from the table, second value highlighted.
+                    ws.editor.set_text("insert into rsq_edit values\n  (9, ");
+                    ws.editor.goto_pos(ws.editor.get_length());
+                    complete::insert_tip(ws.editor, &ws.conn());
+                    step = 17;
+                }
+                17 if !complete::tip_text().is_empty() || el > 130.0 => {
+                    eprintln!("SELFTEST insert tip: {:?} active={}", complete::tip_text(), ws.editor.call_tip_active());
+                    // Column list: the columns not written yet pop up by themselves.
+                    ws.editor.set_text("insert into rsq_edit (id, ");
+                    ws.editor.goto_pos(ws.editor.get_length());
+                    complete::typed(ws.editor, &ws.conn(), ' ');
+                    step = 18;
+                }
+                18 if ws.editor.auto_comp_active() || el > 140.0 => {
+                    eprintln!("SELFTEST column popup active={} tip={:?}", ws.editor.auto_comp_active(), complete::tip_text());
+                    ws.editor.auto_comp_cancel();
+                    ws.editor.set_text("drop table rsq_edit");
+                    ws.run_statement();
+                    step = 20;
+                }
+                14..=16 if el > 120.0 => {
+                    eprintln!("SELFTEST worksheet edit timed out at step {step} editable={}", ws.result_editable());
+                    step = 20;
+                }
+                20 => {
                     let a = app();
                     eprintln!("SELFTEST pages={} history={}", a.pages.borrow().len(), a.history().len());
                     if std::env::var("RSQLDEV_SELFTEST_KEEP").is_ok() {
