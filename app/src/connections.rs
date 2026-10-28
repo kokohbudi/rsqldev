@@ -59,6 +59,10 @@ const M_LINK_TEST: i32 = 7134;
 const M_FLASHBACK: i32 = 7135;
 const M_PURGE: i32 = 7136;
 const M_PURGE_ALL: i32 = 7137;
+const M_JOB_RUN: i32 = 7138;
+const M_JOB_STOP: i32 = 7139;
+const M_JOB_ON: i32 = 7140;
+const M_JOB_OFF: i32 = 7141;
 
 /// "MATERIALIZED VIEW" → "Materialized View".
 fn title(kind: &str) -> String {
@@ -485,12 +489,19 @@ impl Navigator {
             Node::Obj { kind, conn, .. } => {
                 b = b.append_item(M_OPEN, "Open", "").append_item(M_REFRESH, "Refresh", "");
                 // Directories, public synonyms and the recycle bin have no owner DDL here.
-                let special = matches!(*kind, dialect::DIRECTORY | dialect::PUBLIC_SYNONYM | dialect::RECYCLE);
+                let special = matches!(*kind, dialect::DIRECTORY | dialect::PUBLIC_SYNONYM | dialect::RECYCLE | dialect::JOB);
                 if !special {
                     b = b.append_item(M_DDL, "Quick DDL ▸ Worksheet", "").append_item(M_DDL_CLIP, "Quick DDL ▸ Clipboard", "").append_item(M_DDL_FILE, "Quick DDL ▸ Save to File…", "");
                 }
                 b = b.append_separator();
                 let db = crate::app().open_conn(conn).map(|c| c.borrow().kind);
+                if *kind == dialect::JOB {
+                    b = b
+                        .append_item(M_JOB_RUN, "Run", "Run the job now, in the background")
+                        .append_item(M_JOB_STOP, "Stop", "")
+                        .append_item(M_JOB_ON, "Enable", "")
+                        .append_item(M_JOB_OFF, "Disable", "");
+                }
                 if *kind == dialect::RECYCLE {
                     b = b.append_item(M_FLASHBACK, "Flashback (Restore)", "FLASHBACK TABLE ... TO BEFORE DROP").append_item(M_PURGE, "Purge…", "");
                 }
@@ -696,6 +707,7 @@ impl Navigator {
                             (Kind::Oracle, dialect::DBLINK) if name.chars().all(|ch| ch.is_ascii_alphanumeric() || "_$#.@".contains(ch)) => format!("DROP DATABASE LINK {name}"),
                             (Kind::Oracle, dialect::DBLINK) => return crate::ui::info(&self.tree, "This database link name needs to be dropped by hand."),
                             (Kind::Oracle, dialect::DIRECTORY) => format!("DROP DIRECTORY {}", dialect::quote(db, &name)),
+                            (Kind::Oracle, dialect::JOB) => rsqldev_core::table_actions::job_action(&owner, &name, "DROP"),
                             (Kind::Oracle, dialect::PUBLIC_SYNONYM) => format!("DROP PUBLIC SYNONYM {}", dialect::quote(db, &name)),
                             _ => format!("DROP {kind} {q}"),
                         };
@@ -709,6 +721,19 @@ impl Navigator {
                         Ok(s) => s,
                         Err(e) => return crate::ui::info(&self.tree, &e),
                     },
+                    M_JOB_RUN | M_JOB_STOP | M_JOB_ON | M_JOB_OFF => {
+                        let action = match id {
+                            M_JOB_RUN => "RUN",
+                            M_JOB_STOP => "STOP",
+                            M_JOB_ON => "ENABLE",
+                            _ => "DISABLE",
+                        };
+                        let s = rsqldev_core::table_actions::job_action(&owner, &name, action);
+                        if id == M_JOB_STOP && !crate::ui::confirm_sql(&self.tree, &format!("Stop job {q}?"), &s) {
+                            return;
+                        }
+                        s
+                    }
                     M_FLASHBACK | M_PURGE => {
                         let s = rsqldev_core::table_actions::recycle(&name, id == M_FLASHBACK);
                         if id == M_PURGE && !crate::ui::confirm_sql(&self.tree, "Purge it from the recycle bin? It can no longer be restored.", &s) {

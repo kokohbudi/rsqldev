@@ -22,6 +22,7 @@ pub const DBLINK: &str = "DATABASE LINK";
 pub const DIRECTORY: &str = "DIRECTORY";
 pub const PUBLIC_SYNONYM: &str = "PUBLIC SYNONYM";
 pub const RECYCLE: &str = "RECYCLE BIN";
+pub const JOB: &str = "JOB";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum View {
@@ -267,6 +268,7 @@ pub fn folders(db: Db) -> &'static [(&'static str, &'static str)] {
             ("Public Synonyms", PUBLIC_SYNONYM),
             ("Database Links", DBLINK),
             ("Directories", DIRECTORY),
+            ("Scheduler Jobs", JOB),
             ("Recycle Bin", RECYCLE),
         ],
         Db::Postgres => &[
@@ -337,6 +339,8 @@ pub fn list_sql(db: Db, kind: &str, owner: &str) -> Option<String> {
     let tpl = match (db, kind) {
         (Db::Oracle, DBLINK) => "SELECT db_link FROM all_db_links WHERE owner = '{o}' ORDER BY 1".into(),
         (Db::Oracle, DIRECTORY) => "SELECT directory_name FROM all_directories ORDER BY 1".into(),
+        // Second column INVALID paints the node red: broken / failed jobs.
+        (Db::Oracle, JOB) => "SELECT job_name, CASE WHEN state IN ('BROKEN', 'FAILED') THEN 'INVALID' END FROM all_scheduler_jobs WHERE owner = '{o}' ORDER BY 1".into(),
         (Db::Oracle, PUBLIC_SYNONYM) => "SELECT synonym_name FROM all_synonyms WHERE owner = 'PUBLIC' ORDER BY 1".into(),
         // The session user's bin (third column = the label: original name and type).
         (Db::Oracle, RECYCLE) => "SELECT object_name, NULL, original_name || ' (' || type || ', ' || droptime || ')' FROM user_recyclebin WHERE can_undrop = 'YES' ORDER BY droptime DESC".into(),
@@ -473,6 +477,11 @@ fn oracle_tabs(kind: &str) -> Vec<Tab> {
         DIRECTORY => vec![tab("Details", d("SELECT * FROM all_directories WHERE directory_name = '{n}'")), tab("Grants", g("SELECT grantee, privilege, grantable FROM all_tab_privs WHERE table_name = '{n}' AND type = 'DIRECTORY' ORDER BY 1, 2"))],
         PUBLIC_SYNONYM => vec![tab("Details", d("SELECT * FROM all_synonyms WHERE owner = 'PUBLIC' AND synonym_name = '{n}'"))],
         RECYCLE => vec![tab("Details", d("SELECT * FROM user_recyclebin WHERE object_name = '{n}'"))],
+        JOB => vec![
+            tab("Details", d("SELECT * FROM all_scheduler_jobs WHERE owner = '{o}' AND job_name = '{n}'")),
+            tab("Run Log", g("SELECT log_date, status, error#, run_duration, cpu_used, additional_info FROM all_scheduler_job_run_details WHERE owner = '{o}' AND job_name = '{n}' ORDER BY log_date DESC")),
+            tab("Arguments", g("SELECT argument_position, argument_name, argument_type, value FROM all_scheduler_job_args WHERE owner = '{o}' AND job_name = '{n}' ORDER BY 1")),
+        ],
         _ => vec![tab("Details", d(ORA_OBJECT))],
     }
 }
@@ -714,6 +723,7 @@ pub fn create_template(db: Db, kind: &str, owner: &str) -> Option<String> {
         (Db::Oracle, PACKAGE) => "CREATE OR REPLACE PACKAGE {s}.new_package AS\n  PROCEDURE run;\nEND;\n/\n\nCREATE OR REPLACE PACKAGE BODY {s}.new_package AS\n  PROCEDURE run IS\n  BEGIN\n    NULL;\n  END;\nEND;\n/\n",
         (Db::Oracle, TRIGGER) => "CREATE OR REPLACE TRIGGER {s}.new_trigger\n  BEFORE INSERT OR UPDATE ON {s}.table_name\n  FOR EACH ROW\nBEGIN\n  NULL;\nEND;\n/\n",
         (Db::Oracle, TYPE) => "CREATE OR REPLACE TYPE {s}.new_type AS OBJECT (\n  id   NUMBER,\n  name VARCHAR2(100)\n);\n/\n",
+        (Db::Oracle, JOB) => "BEGIN\n  DBMS_SCHEDULER.CREATE_JOB(\n    job_name        => '{s}.NEW_JOB',\n    job_type        => 'PLSQL_BLOCK',\n    job_action      => 'BEGIN NULL; END;',\n    start_date      => SYSTIMESTAMP,\n    repeat_interval => 'FREQ=DAILY; BYHOUR=2',\n    enabled         => TRUE,\n    comments        => '');\nEND;\n/\n",
         (Db::Oracle, DBLINK) => "CREATE DATABASE LINK new_link\n  CONNECT TO remote_user IDENTIFIED BY \"password\"\n  USING 'tns_alias';\n",
         (Db::Postgres | Db::Duckdb, VIEW) => "CREATE OR REPLACE VIEW {s}.new_view AS\nSELECT 1 AS id;\n",
         (Db::Postgres, MVIEW) => "CREATE MATERIALIZED VIEW {s}.new_mview AS\nSELECT 1 AS id;\n",

@@ -80,6 +80,18 @@ pub fn recycle(name: &str, restore: bool) -> String {
     if restore { format!("FLASHBACK TABLE {q} TO BEFORE DROP") } else { format!("PURGE TABLE {q}") }
 }
 
+/// Scheduler job node actions (Oracle DBMS_SCHEDULER): Run, Stop, Enable, Disable, Drop.
+pub fn job_action(owner: &str, name: &str, action: &str) -> String {
+    let job = lit(&format!("{}.{}", quote(Db::Oracle, owner), quote(Db::Oracle, name)));
+    match action {
+        "RUN" => format!("BEGIN DBMS_SCHEDULER.RUN_JOB('{job}', use_current_session => FALSE); END;"),
+        "STOP" => format!("BEGIN DBMS_SCHEDULER.STOP_JOB('{job}'); END;"),
+        "ENABLE" => format!("BEGIN DBMS_SCHEDULER.ENABLE('{job}'); END;"),
+        "DISABLE" => format!("BEGIN DBMS_SCHEDULER.DISABLE('{job}'); END;"),
+        _ => format!("BEGIN DBMS_SCHEDULER.DROP_JOB('{job}'); END;"),
+    }
+}
+
 /// Enable / Disable on an Oracle trigger node.
 pub fn trigger_state(db: Db, owner: &str, name: &str, on: bool) -> R<String> {
     match db {
@@ -354,6 +366,12 @@ pub fn drop_trigger(db: Db, owner: &str, name: &str, trigger: &str) -> R<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduler_jobs() {
+        assert_eq!(job_action("HR", "NIGHTLY", "RUN"), "BEGIN DBMS_SCHEDULER.RUN_JOB('\"HR\".\"NIGHTLY\"', use_current_session => FALSE); END;");
+        assert_eq!(job_action("HR", "J'1", "DROP"), "BEGIN DBMS_SCHEDULER.DROP_JOB('\"HR\".\"J''1\"'); END;");
+    }
 
     #[test]
     fn oracle_node_actions() {
