@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.7.0 — 2026-10-28
+
+### Features
+- **Connections tree**: Apply Filter / Clear Filter on object folders (name patterns, saved per connection); package members, procedure / function arguments and table partitions as child nodes; New … templates on every folder; Edit… for PL/SQL, views and sequences; Run…, Rename…, Enable / Disable, Refresh Data, Test (database links), Compile Invalid, Gather Statistics; Quick DDL to worksheet, clipboard or file.
+- Oracle folders: Directories, Public Synonyms, Scheduler Jobs (run, stop, enable, disable, run log) and Recycle Bin (flashback, purge). MySQL / SQL Server: Indexes folder.
+- **Oracle users**: New User, Edit User (password, tablespaces, quota, lock / unlock, expire), Grant, Revoke, Drop User. Passwords never appear in confirmations, errors, worksheets or history.
+- Connections: Rename, Duplicate, Reconnect, Disconnect All; colour per connection (e.g. red for production); startup SQL run on every new session; TNS aliases from tnsnames.ora to pick; Oracle external authentication (`auth=external`); an expired Oracle password can be changed at login; Export / Import connections file.
+- **Uncommitted changes**: disconnecting, deleting or editing a connection and quitting ask to commit or roll back first.
+- **Editor**: Toggle Line / Block Comment, Go to Line, F9, SQL History on Ctrl/Cmd+Up / Down, code templates (abbreviation + Tab), Popup Describe (Shift+F4), Format to Clipboard, Extended Paste, incremental find, Print, Close All, Rename Tab, next / previous tab keys.
+- **SQL History window** with connection, type and time, filter, Append / Replace / Clear.
+- **Script runner**: SET FEEDBACK / TIMING / ECHO / HEADING / NULL / AUTOCOMMIT, WHENEVER SQLERROR EXIT, EXIT / QUIT; double-click an error in Script Output to jump to its line.
+- **Result grid**: Filter Column by distinct values; Export… dialog (CSV / delimited, Excel, JSON, INSERT, HTML, XML; header, delimiter, selected rows, file or clipboard); Copy Selected Column Header(s); Pin a result in its own tab; Show SQL; Run ▸ Cancel stops a running export.
+- **Tools**: Reports (version, storage, invalid objects, tables without a primary key, unindexed foreign keys, users, locks, waits, …), Data Compare, Database Export, Database Copy, ER Diagram (SVG), Search Source Code, Explain Plan (DBMS_XPLAN).
+- Create / Edit Table: primary key Enabled flag (Oracle).
+- Preferences: Display NULL as, tnsnames directory, open a worksheet on connect, SQL History limit, line numbers, NLS timestamp format, DDL storage clauses, save bind values, reopen worksheets at start, code templates.
+- Worksheets left open at quit reopen at the next start; bind values are remembered; View ▸ Log, Recent Objects; File ▸ Recent Files.
+
+### Bug fixes
+- Oracle: Drop on a database link failed (the link name was schema-qualified).
+- Quick DDL of Oracle packages, procedures and functions gave bare source text; it is now runnable CREATE OR REPLACE … / DDL.
+- Renaming a connection left its Data Pump file records under the old name.
+
 ## v0.6.0 — 2026-10-28
 
 ### Features
