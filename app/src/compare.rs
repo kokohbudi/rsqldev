@@ -214,6 +214,60 @@ pub fn show_export(frame: &Frame, copy: bool) {
     });
 }
 
+/// Tools ▸ ER Diagram: a schema's tables (optionally a name pattern) and foreign keys as an
+/// SVG file, opened in the default viewer (a browser).
+pub fn show_er(frame: &Frame) {
+    let names = crate::app().connection_names();
+    if names.is_empty() {
+        return crate::ui::info(frame, "Create a connection first.");
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let d = SingleChoiceDialog::builder(frame, "Connection:", "ER Diagram", &refs).build();
+    if d.show_modal() != ID_OK || d.get_selection() < 0 {
+        return;
+    }
+    let conn = names[d.get_selection() as usize].clone();
+    let Some(schema) = crate::ui::ask(frame, "Schema (empty = the connection's current schema):", "ER Diagram", "") else { return };
+    let Some(pattern) = crate::ui::ask(frame, "Tables (name filter: % or * any, _ one, plain text = contains; empty = all):", "ER Diagram", "") else { return };
+    crate::app().connect(&conn, move |c| {
+        let c2 = c.clone();
+        schema_of(&c, schema, move |owner| {
+            let db = c2.borrow().kind;
+            let Some((cq, fq)) = rsqldev_core::er::queries(db, &owner) else {
+                return crate::ui::info(&crate::app().frame, "No foreign keys to draw on this database.");
+            };
+            let c3 = c2.clone();
+            crate::app().status(0, &format!("ER Diagram: reading {owner}…"));
+            Conn::meta_query(&c2, &cq, move |r| {
+                let mut tables = match r {
+                    Ok(r) => rsqldev_core::er::tables(&r.rows),
+                    Err(e) => return crate::ui::error(&crate::app().frame, &e),
+                };
+                if !pattern.trim().is_empty() {
+                    tables.retain(|n, _| rsqldev_core::config::name_matches(&pattern, n));
+                }
+                if tables.is_empty() {
+                    return crate::ui::info(&crate::app().frame, "No tables to draw.");
+                }
+                Conn::meta_query(&c3, &fq, move |r| {
+                    let app = crate::app();
+                    let fks: Vec<(String, String)> = r.map(|r| r.rows).unwrap_or_default().into_iter().filter_map(|row| Some((row.first().cloned().flatten()?, row.get(1).cloned().flatten()?))).collect();
+                    let svg = rsqldev_core::er::svg(&format!("{owner} — {} tables", tables.len()), &tables, &fks);
+                    let fd = FileDialog::builder(&app.frame).with_message("Save ER diagram").with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt).with_default_file(&format!("{owner}.svg")).with_wildcard("SVG (*.svg)|*.svg").build();
+                    let Some(path) = (fd.show_modal() == ID_OK).then(|| fd.get_path()).flatten() else { return };
+                    match std::fs::write(&path, svg) {
+                        Ok(()) => {
+                            let _ = crate::driver_manager::open::that(std::path::Path::new(&path));
+                            app.status(0, &format!("ER diagram saved to {path}"));
+                        }
+                        Err(e) => crate::ui::error(&app.frame, &format!("{path}: {e}")),
+                    }
+                });
+            });
+        });
+    });
+}
+
 /// What each export job's result is.
 enum Job {
     Setting,

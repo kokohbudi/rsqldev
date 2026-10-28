@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod compare;
+pub mod er;
 pub mod complete;
 pub mod config;
 pub mod datapump;

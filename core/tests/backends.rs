@@ -100,6 +100,13 @@ fn exercise(c: ConnConfig, pw: &str, owner: &str) {
         let sql = dialect::list_sql(db, kind, owner).unwrap();
         query_all(b, &sql).unwrap_or_else(|e| panic!("{kind}: {sql}\n=> {e:#}"));
     }
+    // ER Diagram: both queries run and list the test table with its key column.
+    if let Some((cq, fq)) = rsqldev_core::er::queries(db, owner) {
+        let cols = query_all(b, &cq).unwrap_or_else(|e| panic!("er columns: {cq}\n=> {e:#}")).1;
+        let t = rsqldev_core::er::tables(&cols);
+        assert!(t.iter().any(|(n, t)| n.eq_ignore_ascii_case("rsq_t") && t.cols.iter().any(|c| c.0.eq_ignore_ascii_case("id") && c.2)), "{t:?}");
+        query_all(b, &fq).unwrap_or_else(|e| panic!("er keys: {fq}\n=> {e:#}"));
+    }
     // Tools ▸ Reports: a candidate of every report runs (file engines need no privileges).
     for (label, qs) in dialect::reports(db) {
         let errs: Vec<String> = qs.iter().filter_map(|q| query_all(b, &dialect::fill(db, q, owner, "")).err().map(|e| format!("{e:#}"))).collect();

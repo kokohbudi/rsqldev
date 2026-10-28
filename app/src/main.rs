@@ -128,6 +128,7 @@ const ID_RECENT: i32 = ID_HIGHEST + 67;
 const ID_DATA_COMPARE: i32 = ID_HIGHEST + 68;
 const ID_DB_EXPORT: i32 = ID_HIGHEST + 69;
 const ID_DB_COPY: i32 = ID_HIGHEST + 70;
+const ID_ER: i32 = ID_HIGHEST + 71;
 const ID_DESCRIBE: i32 = ID_HIGHEST + 61;
 
 enum Page {
@@ -1302,6 +1303,7 @@ impl App {
             ID_DATA_COMPARE => compare::show_data(&self.frame),
             ID_DB_EXPORT => compare::show_export(&self.frame, false),
             ID_DB_COPY => compare::show_export(&self.frame, true),
+            ID_ER => compare::show_er(&self.frame),
             ID_PREFERENCES => prefs::show(&self.frame),
             ID_ABOUT => ui::info(
                 &self.frame,
@@ -1517,6 +1519,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_DATA_COMPARE, "Data Co&mpare…", "Compare a table's rows on two connections / schemas by primary key; open the sync script")
         .append_item(ID_DB_EXPORT, "Database E&xport…", "DDL of a schema's objects, with table data as INSERTs, into one .sql file")
         .append_item(ID_DB_COPY, "Database Cop&y…", "A schema's objects and data scripted into a worksheet on another connection / schema")
+        .append_item(ID_ER, "E&R Diagram…", "A schema's tables and foreign keys as an SVG picture")
         .append_item(ID_DRIVERS, "&Drivers…", "Download or locate native client drivers")
         .append_item(ID_PREFERENCES, "&Preferences…", "")
         .build();
