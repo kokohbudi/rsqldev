@@ -39,7 +39,7 @@ SQL Developer's workflow, menus and shortcuts, as a native app with no JVM (ligh
 - Feature scope tracks Oracle SQL Developer 26.2, specified in `docs/feature-catalog.md` (MVP / P2 / P3).
 - Clean-room: SQL Developer's behavior is studied (a decompiled reference lives outside this repo, `~/myProjects/sqldeveloper-src`), never its code, icons or text. Original artwork only.
 - Performance first: features must cost about nothing when idle; no fake delays, no idle work, work happens off the UI thread.
-- Open decision: the repository has no LICENSE file yet, although the project is public.
+- License: GNU GPL v3 only (`LICENSE`): open source; anyone may use, change, share and even sell it, but whoever distributes it must pass on the source under the GPL, so closed forks are not possible.
 
 ## Brand Commitments
 

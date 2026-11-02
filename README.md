@@ -32,3 +32,10 @@ Release: bump `version` in `Cargo.toml`, then `git tag v0.x.y && git push --tags
 UI smoke test against a saved connection:
 
     RSQLDEV_CONFIG_DIR=/tmp/cfg RSQLDEV_SELFTEST="<connection name>" RSQLDEV_SELFTEST_PW=<pw> cargo run -p rsqldev
+
+## License
+
+Copyright (C) 2026 kokohbudi. rsqldev is free software under the GNU General Public License,
+version 3 only (GPL-3.0-only): use it anywhere, study, change and share it; anyone who
+distributes it, changed or not, must pass on the source under the same license. See
+[LICENSE](LICENSE).
