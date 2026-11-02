@@ -2007,6 +2007,15 @@ fn selftest(name: String) {
                 }
                 1 if out.contains("dropped") || out.contains("Error") || el > 30.0 => {
                     eprintln!("SELFTEST run_script output:\n{out}");
+                    // Run Statement over a selection of two queries: a Query Result tab each.
+                    let dual = if kind == Kind::Oracle { " from dual" } else { "" };
+                    ws.editor.set_text(&format!("select 1 a{dual};\nselect 2 b{dual};\n"));
+                    ws.editor.select_all();
+                    ws.run_statement();
+                    step = 40;
+                }
+                40 if out.contains(">>Query Run In:Query Result 2") && !ws.is_busy() || el > 35.0 => {
+                    eprintln!("SELFTEST selection run_statement tabs={}", out.matches(">>Query Run In:").count());
                     step = 2;
                 }
                 // Data editor: a table edited in its Data tab, then as an editable query result.
@@ -2108,7 +2117,8 @@ fn selftest(name: String) {
                     a.frame.close(true);
                     return false;
                 }
-                3 if out.contains("Commit") || el > 40.0 => {
+                // Script Output keeps earlier runs: step 2 already logged one Commit.
+                3 if out.matches("Commit").count() >= 2 || el > 40.0 => {
                     let a = app();
                     ws.editor.set_text("select e.employee_id, e.first_name, e.last_name, e.salary, e.hire_date\nfrom employees e\nwhere e.salary > 10000\norder by e.salary desc;");
                     ws.run_statement();

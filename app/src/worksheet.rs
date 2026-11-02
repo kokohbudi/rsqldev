@@ -53,6 +53,10 @@ pub struct Worksheet {
     strip: Panel,
     /// Ctrl/Cmd+Up / Down position in SQL History, counted back from the newest entry.
     hist_at: Cell<Option<usize>>,
+    /// Run Statement over a multi-statement selection: queries go to Query Result tabs.
+    grid_run: Cell<bool>,
+    /// Query Result tabs opened so far (their numbers).
+    tabs: Cell<usize>,
 }
 
 const P_RESULT: usize = 0;
@@ -196,6 +200,8 @@ impl Worksheet {
             b_cancel,
             busy: Cell::new(false),
             hist_at: Cell::new(None),
+            grid_run: Cell::new(false),
+            tabs: Cell::new(0),
             strip,
             autosave_id: crate::autosave::next_id(),
             unsaved: Cell::new(false),
@@ -308,6 +314,12 @@ impl Worksheet {
                         }
                     }
                     WXK_F9 if !cmd && !alt && !shift => return w.run_statement(),
+                    // macOS: SQL Developer's Control+Enter too (the menu's Ctrl is Cmd there).
+                    wxdragon::keycode::WXK_RETURN | wxdragon::keycode::WXK_NUMPAD_ENTER
+                        if cfg!(target_os = "macos") && !cmd && !alt && wxdragon::utils::get_key_state(wxdragon::keycode::WXK_RAW_CONTROL) =>
+                    {
+                        return w.run_statement()
+                    }
                     WXK_UP | WXK_DOWN if cmd && !alt => return w.history_step(code == WXK_UP, shift),
                     c if c == '\'' as i32 && alt && !cmd => return w.toggle_case(),
                     c if c == 'C' as i32 && alt && shift && !cmd => return crate::editor::toggle_block_comment(w.editor),
@@ -349,6 +361,10 @@ impl Worksheet {
         }));
         ws.editor.set_focus();
         ws
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.busy.get()
     }
 
     /// Statement in flight: Cancel enabled, tab marked.
@@ -572,15 +588,21 @@ impl Worksheet {
         }
         let sel = self.editor.get_selected_text();
         let item = if !sel.trim().is_empty() {
-            script::split(&sel, self.kind()).into_iter().next()
+            let mut items = script::split(&sel, self.kind());
+            // SQL Developer runs every statement of the selection: queries into Query
+            // Result tabs of their own, the rest into Script Output.
+            if items.len() > 1 {
+                self.grid_run.set(true);
+                return self.run_script();
+            }
+            items.pop()
         } else {
             let text = self.editor.get_text();
             let items = script::split(&text, self.kind());
-            script::statement_at(&items, self.editor.get_current_pos() as usize).cloned()
+            script::statement_at(&text, &items, self.editor.get_current_pos() as usize).cloned()
         };
         let Some(item) = item else { return };
         if item.kind == script::Kind::Command {
-            editor::show(&self.script_out, "");
             self.run_items(vec![item], 0);
             return;
         }
@@ -617,9 +639,9 @@ impl Worksheet {
             me.dbms_lines(&d.output);
             let secs = format!("{:.3} seconds", d.elapsed.as_secs_f32());
             match d.result {
+                // Script Output keeps earlier runs (SQL Developer): append, Clear empties it.
                 Err(e) => {
-                    editor::show(&me.script_out, "");
-                    me.out(&format!("Error starting at line : {line} in command -\n{sql2}\nError report -\n{e}"));
+                    me.out(&format!("\nError starting at line : {line} in command -\n{sql2}\nError report -\n{e}\n"));
                     me.mark_errors(line, &e);
                     me.bottom.set_selection(P_SCRIPT);
                     w.set_label("");
@@ -627,8 +649,7 @@ impl Worksheet {
                     el.set_label(&secs);
                 }
                 Ok(aff) if !query => {
-                    editor::show(&me.script_out, "");
-                    me.out(&script::feedback(&sql2, aff));
+                    me.out(&format!("\n{}\n", script::feedback(&sql2, aff)));
                     me.bottom.set_selection(P_SCRIPT);
                     task.set_label(&format!("Task completed in {secs}"));
                     el.set_label(&secs);
@@ -734,9 +755,8 @@ impl Worksheet {
             })
             .collect();
         if items.is_empty() {
-            return;
+            return self.grid_run.set(false);
         }
-        editor::show(&self.script_out, "");
         self.bottom.set_selection(P_SCRIPT);
         self.started.set(Some(Instant::now()));
         self.running.set(true);
@@ -749,6 +769,7 @@ impl Worksheet {
     fn run_items(&self, items: Vec<Item>, i: usize) {
         if i >= items.len() || !self.running.get() && i > 0 {
             self.running.set(false);
+            self.grid_run.set(false);
             self.set_busy(false);
             let secs = self.started.get().map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
             self.task.set_label(&format!("Task completed in {secs:.3} seconds"));
@@ -835,12 +856,15 @@ impl Worksheet {
         }
         let Some(sql) = self.substitute(&item.text) else {
             self.running.set(false);
-            return;
+            return next(items);
         };
         if !self.allow(&sql) {
             self.out(&format!("\nScript stopped at line {}: not confirmed.\n", self.line_of(item.start)));
             self.running.set(false);
             return next(items);
+        }
+        if self.grid_run.get() && item.kind != script::Kind::Block && rsqldev_core::is_query(&sql) {
+            return self.query_tab(sql, self.line_of(item.start), items, Box::new(next));
         }
         self.script_sql(sql, item.start, items, i, Box::new(next));
     }
@@ -906,7 +930,7 @@ impl Worksheet {
         let sql = if sel.trim().is_empty() {
             let text = self.editor.get_text();
             let items = script::split(&text, self.kind());
-            script::statement_at(&items, self.editor.get_current_pos() as usize)?.text.clone()
+            script::statement_at(&text, &items, self.editor.get_current_pos() as usize)?.text.clone()
         } else {
             sel
         };
@@ -1167,14 +1191,19 @@ impl Worksheet {
             (st.cols[h..].to_vec(), st.rows.iter().filter(|r| !r.deleted).map(|r| r.cur[h..].to_vec()).collect::<Vec<_>>())
         };
         let label: String = self.last.borrow().as_deref().unwrap_or("").trim_start_matches('\u{1}').split_whitespace().collect::<Vec<_>>().join(" ").chars().take(28).collect();
-        let (p, s, btns, note) = pane(&self.bottom, &[("clear", "Close this pinned result"), ("export", "Export…")]);
+        let (g, note) = self.result_tab(&format!("Pinned: {label}"));
+        note.set_label(&format!("{} rows, pinned {}", rows.len(), chrono::Local::now().format("%H:%M:%S")));
+        g.set(cols, rows);
+    }
+
+    /// A closable result tab of its own (Pin, Run Statement over a selection).
+    fn result_tab(&self, label: &str) -> (ResultGrid, StaticText) {
+        let (p, s, btns, note) = pane(&self.bottom, &[("clear", "Close this result"), ("export", "Export…")]);
         let g = ResultGrid::new(&p);
         g.st.borrow_mut().db = Some(self.kind());
         s.add(&g.grid, 1, SizerFlag::Expand, 0);
         p.set_sizer(s, true);
-        note.set_label(&format!("{} rows, pinned {}", rows.len(), chrono::Local::now().format("%H:%M:%S")));
-        g.set(cols, rows);
-        self.bottom.add_page(&p, &format!("Pinned: {label}"), true);
+        self.bottom.add_page(&p, label, true);
         let bottom = self.bottom;
         btns[0].on_click(move |_| {
             let i = bottom.get_page_index(&p);
@@ -1184,6 +1213,47 @@ impl Worksheet {
         });
         let g2 = g.clone();
         btns[1].on_click(move |_| g2.export_dialog());
+        (g, note)
+    }
+
+    /// Run Statement over a selection: a query gets a Query Result tab of its own and Script
+    /// Output notes where it ran (SQL Developer). The next statement starts once rows arrive.
+    // ponytail: one work session, so the next statement closes this cursor: earlier tabs keep
+    // their first FETCH_ROWS rows (PostgreSQL autocommit continues via resume). A session per
+    // tab if people need to scroll them all.
+    fn query_tab(&self, sql: String, line: i32, items: Vec<Item>, next: Box<dyn FnOnce(Vec<Item>)>) {
+        *self.last.borrow_mut() = Some(sql.clone());
+        let n = self.tabs.get() + 1;
+        self.tabs.set(n);
+        let label = format!("Query Result {n}");
+        let (g, _) = self.result_tab(&label);
+        let failed = Rc::new(Cell::new(false));
+        let (me, f2, sql2) = (self.weak(), failed.clone(), sql.clone());
+        let rows = Conn::exec(&self.conn(), &sql, move |d: Done| {
+            let Some(me) = me.upgrade() else { return };
+            me.dbms_lines(&d.output);
+            if let Err(e) = d.result {
+                f2.set(true);
+                me.out(&format!("\nError starting at line : {line} in command -\n{sql2}\nError report -\n{e}\n"));
+                me.mark_errors(line, &e);
+            }
+        });
+        g.load(rows, 0, false);
+        g.st.borrow_mut().resume = Conn::resume(&self.conn(), &sql);
+        self.out(&format!(">>Query Run In:{label}"));
+        let mut next = Some((next, items));
+        crate::hub::every_tick(move || {
+            let ready = failed.get() || {
+                let st = g.st.borrow();
+                st.done || !st.rows.is_empty()
+            };
+            if ready {
+                if let Some((next, items)) = next.take() {
+                    next(items);
+                }
+            }
+            !ready
+        });
     }
 
     /// Show SQL: the statement whose result the Query Result holds.

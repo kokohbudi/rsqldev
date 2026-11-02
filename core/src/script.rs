@@ -290,9 +290,19 @@ pub fn title_case(s: &str) -> String {
     c
 }
 
-/// Statement under the cursor (Ctrl/Cmd+Enter); falls back to the closest one before it.
-pub fn statement_at(items: &[Item], pos: usize) -> Option<&Item> {
-    items.iter().find(|it| it.start <= pos && pos <= it.end).or_else(|| items.iter().rev().find(|it| it.end <= pos)).or(items.first())
+/// Statement for the cursor (Run Statement), by line like SQL Developer: the first one that
+/// ends on or after the cursor's line. A cursor on a blank line between two statements picks
+/// the next one; past the last statement there is none.
+pub fn statement_at<'a>(text: &str, items: &'a [Item], pos: usize) -> Option<&'a Item> {
+    let b = text.as_bytes();
+    let lines = |from: usize, to: usize| b[from.min(b.len())..to.min(b.len())].iter().filter(|&&c| c == b'\n').count();
+    let at = lines(0, pos);
+    let (mut line, mut from) = (0, 0);
+    items.iter().find(|it| {
+        line += lines(from, it.end);
+        from = from.max(it.end);
+        line >= at
+    })
 }
 
 /// Substitution variables (`&name`, `&&name`), SQL*Plus style, and the script's SET options.
@@ -739,8 +749,18 @@ mod tests {
     fn cursor_pick() {
         let s = "select 1 from dual;\n\nselect 2 from dual;";
         let items = split(s, Db::Oracle);
-        assert_eq!(statement_at(&items, s.len()).unwrap().text, "select 2 from dual");
-        assert_eq!(statement_at(&items, 3).unwrap().text, "select 1 from dual");
+        assert_eq!(statement_at(s, &items, s.len()).unwrap().text, "select 2 from dual");
+        assert_eq!(statement_at(s, &items, 3).unwrap().text, "select 1 from dual");
+        // End of the first statement's line, after the ';': still the first.
+        assert_eq!(statement_at(s, &items, 19).unwrap().text, "select 1 from dual");
+        // Blank line between them: the next one.
+        assert_eq!(statement_at(s, &items, 20).unwrap().text, "select 2 from dual");
+        // Blank lines after the last statement: none.
+        let t = format!("{s}\n\n");
+        assert!(statement_at(&t, &split(&t, Db::Oracle), t.len()).is_none());
+        // Multi-line statement, cursor on its first line.
+        let m = "select 1\nfrom dual;\nselect 2 from dual;";
+        assert_eq!(statement_at(m, &split(m, Db::Oracle), 2).unwrap().text, "select 1\nfrom dual");
     }
 
     #[test]
