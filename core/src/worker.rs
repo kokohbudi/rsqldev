@@ -24,11 +24,11 @@ pub fn busy() -> usize {
     BUSY.load(Ordering::Relaxed)
 }
 
-/// Counts the current thread as busy while alive.
-struct Busy;
+/// Counts the current thread as busy while alive (also for jobs on threads of their own).
+pub struct Busy;
 
 impl Busy {
-    fn new() -> Busy {
+    pub fn new() -> Busy {
         BUSY.fetch_add(1, Ordering::Relaxed);
         Busy
     }

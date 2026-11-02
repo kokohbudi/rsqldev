@@ -215,9 +215,15 @@ pub fn show_export(frame: &Frame, copy: bool) {
 }
 
 /// Tools ▸ ER Diagram: a schema's tables (optionally a name pattern) and foreign keys as an
-/// SVG file, opened in the default viewer (a browser).
+/// SVG file, opened in the default viewer (a browser). Big schemas take a while, so the whole
+/// job ([`rsqldev_core::er::generate`]) runs on a thread of its own with a connection of its
+/// own, opened for it and closed after: the app's work and metadata sessions stay free. A
+/// small modeless window shows the step and cancels.
 pub fn show_er(frame: &Frame) {
-    let names = crate::app().connection_names();
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    let app = crate::app();
+    let names = app.connection_names();
     if names.is_empty() {
         return crate::ui::info(frame, "Create a connection first.");
     }
@@ -226,45 +232,99 @@ pub fn show_er(frame: &Frame) {
     if d.show_modal() != ID_OK || d.get_selection() < 0 {
         return;
     }
-    let conn = names[d.get_selection() as usize].clone();
+    let name = names[d.get_selection() as usize].clone();
+    let Some(cfg) = app.conns.borrow().iter().find(|c| c.name == name).cloned() else { return };
     let Some(schema) = crate::ui::ask(frame, "Schema (empty = the connection's current schema):", "ER Diagram", "") else { return };
     let Some(pattern) = crate::ui::ask(frame, "Tables (name filter: % or * any, _ one, plain text = contains; empty = all):", "ER Diagram", "") else { return };
-    crate::app().connect(&conn, move |c| {
-        let c2 = c.clone();
-        schema_of(&c, schema, move |owner| {
-            let db = c2.borrow().kind;
-            let Some((cq, fq)) = rsqldev_core::er::queries(db, &owner) else {
-                return crate::ui::info(&crate::app().frame, "No foreign keys to draw on this database.");
+    let Some(pw) = rsqldev_core::config::get_password(&name).or_else(|| crate::ui::ask_password(frame, "Password:")) else { return };
+    let prefs = app.prefs();
+
+    // Progress window: the current step, Cancel (closing it cancels too).
+    let dlg = Dialog::builder(frame, &format!("ER Diagram — {name}")).with_style(DialogStyle::DefaultDialogStyle).with_size(440, 130).build();
+    let label = StaticText::builder(&dlg).with_label("Connecting…").build();
+    let cancel_btn = Button::builder(&dlg).with_label("Cancel").build();
+    let sz = BoxSizer::builder(Orientation::Vertical).build();
+    sz.add(&label, 1, SizerFlag::Expand | SizerFlag::All, 12);
+    sz.add(&cancel_btn, 0, SizerFlag::AlignRight | SizerFlag::All, 10);
+    dlg.set_sizer(sz, true);
+    dlg.centre();
+    dlg.show(true);
+
+    let (cancel, stop) = (Arc::new(Mutex::new(None::<rsqldev_core::Canceller>)), Arc::new(AtomicBool::new(false)));
+    let abort = {
+        let (cancel, stop) = (cancel.clone(), stop.clone());
+        move || {
+            stop.store(true, Ordering::Relaxed);
+            if let Some(c) = cancel.lock().unwrap().as_ref() {
+                c();
+            }
+        }
+    };
+    let a2 = abort.clone();
+    cancel_btn.on_click(move |_| a2());
+    let a3 = abort.clone();
+    dlg.on_close(move |e| {
+        a3();
+        e.skip(true);
+    });
+
+    enum Msg {
+        Step(String),
+        Done(Result<Option<(String, String, usize)>, String>),
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+    let started = std::time::Instant::now();
+    let stopped = stop.clone();
+    std::thread::Builder::new()
+        .name(format!("er diagram {name}"))
+        .spawn(move || {
+            let t2 = tx.clone();
+            let step = move |s: &str| {
+                let _ = t2.send(Msg::Step(s.to_string()));
             };
-            let c3 = c2.clone();
-            crate::app().status(0, &format!("ER Diagram: reading {owner}…"));
-            Conn::meta_query(&c2, &cq, move |r| {
-                let mut tables = match r {
-                    Ok(r) => rsqldev_core::er::tables(&r.rows),
-                    Err(e) => return crate::ui::error(&crate::app().frame, &e),
-                };
-                if !pattern.trim().is_empty() {
-                    tables.retain(|n, _| rsqldev_core::config::name_matches(&pattern, n));
-                }
-                if tables.is_empty() {
-                    return crate::ui::info(&crate::app().frame, "No tables to draw.");
-                }
-                Conn::meta_query(&c3, &fq, move |r| {
-                    let app = crate::app();
-                    let fks: Vec<(String, String)> = r.map(|r| r.rows).unwrap_or_default().into_iter().filter_map(|row| Some((row.first().cloned().flatten()?, row.get(1).cloned().flatten()?))).collect();
-                    let svg = rsqldev_core::er::svg(&format!("{owner} — {} tables", tables.len()), &tables, &fks);
-                    let fd = FileDialog::builder(&app.frame).with_message("Save ER diagram").with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt).with_default_file(&format!("{owner}.svg")).with_wildcard("SVG (*.svg)|*.svg").build();
-                    let Some(path) = (fd.show_modal() == ID_OK).then(|| fd.get_path()).flatten() else { return };
-                    match std::fs::write(&path, svg) {
-                        Ok(()) => {
-                            let _ = crate::driver_manager::open::that(std::path::Path::new(&path));
-                            app.status(0, &format!("ER diagram saved to {path}"));
-                        }
-                        Err(e) => crate::ui::error(&app.frame, &format!("{path}: {e}")),
+            let r = rsqldev_core::er::generate(&cfg, &pw, &prefs, &schema, &pattern, &cancel, &stop, &step).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::Done(r));
+        })
+        .expect("spawn ER diagram thread");
+
+    crate::hub::every_tick(move || {
+        loop {
+            match rx.try_recv() {
+                Ok(Msg::Step(s)) => {
+                    if dlg.is_valid() {
+                        label.set_label(&s);
                     }
-                });
-            });
-        });
+                }
+                Ok(Msg::Done(r)) => {
+                    if dlg.is_valid() {
+                        dlg.destroy();
+                    }
+                    let app = crate::app();
+                    let secs = started.elapsed().as_secs_f32();
+                    match r {
+                        Ok(Some((owner, svg, n))) => {
+                            crate::buddy::notify_done(&app.frame, secs, "rsqldev · ER Diagram", &format!("{owner}: {n} tables"));
+                            let fd = FileDialog::builder(&app.frame).with_message("Save ER diagram").with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt).with_default_file(&format!("{owner}.svg")).with_wildcard("SVG (*.svg)|*.svg").build();
+                            let Some(path) = (fd.show_modal() == ID_OK).then(|| fd.get_path()).flatten() else { return false };
+                            match std::fs::write(&path, svg) {
+                                Ok(()) => {
+                                    let _ = crate::driver_manager::open::that(std::path::Path::new(&path));
+                                    app.status(0, &format!("ER diagram ({n} tables, {secs:.1} s) saved to {path}"));
+                                }
+                                Err(e) => crate::ui::error(&app.frame, &format!("{path}: {e}")),
+                            }
+                        }
+                        // A cancelled statement ends in the driver's error: not one to show.
+                        _ if stopped.load(Ordering::Relaxed) => app.status(0, "ER Diagram cancelled"),
+                        Ok(None) => crate::ui::info(&app.frame, "No tables to draw."),
+                        Err(e) => crate::ui::error(&app.frame, &e),
+                    }
+                    return false;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+            }
+        }
     });
 }
 
