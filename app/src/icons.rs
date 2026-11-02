@@ -1,5 +1,6 @@
 //! Toolbar and tree icons, drawn as small SVGs in the visual language of SQL Developer
 //! (green run triangle, database cylinders, yellow folders). Original artwork, not Oracle's.
+//! Tree icons fill the 16×16 box (≈15 px), like SQL Developer's.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -8,7 +9,7 @@ use wxdragon::prelude::*;
 const DB: &str = "<path d='M3 3.5C3 2.1 5.7 1 8 1s5 1.1 5 2.5v9c0 1.4-2.7 2.5-5 2.5s-5-1.1-5-2.5z' fill='#9db8d9' stroke='#3a6aa0'/><ellipse cx='8' cy='3.5' rx='5' ry='2' fill='#c9dbef' stroke='#3a6aa0'/>";
 const SHEET: &str = "<path d='M3 1h7l3 3v11H3z' fill='#fff' stroke='#6b7d93'/><path d='M10 1v3h3' fill='none' stroke='#6b7d93'/>";
 const RUN: &str = "<path d='M5 3l8 5-8 5z' fill='#2f9e44' stroke='#1d6b2d' stroke-linejoin='round'/>";
-const GRID: &str = "<rect x='1.5' y='2.5' width='13' height='11' fill='#fff' stroke='#5a7fa8'/><rect x='1.5' y='2.5' width='13' height='3' fill='#8fb0d6' stroke='#5a7fa8'/><path d='M1.5 8.5h13M1.5 11h13M6 5.5v8M10.5 5.5v8' stroke='#9fb4cc'/>";
+const GRID: &str = "<rect x='0.5' y='1.5' width='15' height='13' fill='#fff' stroke='#5a7fa8'/><rect x='0.5' y='1.5' width='15' height='3.5' fill='#8fb0d6' stroke='#5a7fa8'/><path d='M0.5 8.5h15M0.5 11.5h15M5.5 5v9.5M10.5 5v9.5' stroke='#9fb4cc'/>";
 
 /// Database cylinder in an engine's colour (original shapes, not the vendors' logos).
 fn cyl(fill: &str, stroke: &str, top: &str) -> String {
@@ -91,21 +92,21 @@ fn svg(name: &str) -> String {
         // ---- tree nodes ----
         "conn" => DB.into(),
         "conn_up" => format!("{DB}<circle cx='12' cy='12' r='3.5' fill='#2f9e44' stroke='#fff'/>"),
-        "folder" => "<path d='M1.5 3.5h5l1.2 1.5h6.8v8.5h-13z' fill='#f2c94c' stroke='#b08a1e'/>".into(),
+        "folder" => "<path d='M0.5 2.5h5.5l1.5 2h7.5v9.5h-14.5z' fill='#f2c94c' stroke='#b08a1e'/>".into(),
         "table" => GRID.into(),
-        "view" => "<rect x='1.5' y='2.5' width='13' height='11' fill='#fff' stroke='#7a63a8'/><rect x='1.5' y='2.5' width='13' height='3' fill='#c3b3e3' stroke='#7a63a8'/><circle cx='5.5' cy='10' r='2' fill='none' stroke='#7a63a8'/><circle cx='10.5' cy='10' r='2' fill='none' stroke='#7a63a8'/><path d='M7.5 10h1' stroke='#7a63a8'/>".into(),
+        "view" => "<rect x='0.5' y='1.5' width='15' height='13' fill='#fff' stroke='#7a63a8'/><rect x='0.5' y='1.5' width='15' height='3.5' fill='#c3b3e3' stroke='#7a63a8'/><circle cx='5' cy='10' r='2.3' fill='none' stroke='#7a63a8'/><circle cx='11' cy='10' r='2.3' fill='none' stroke='#7a63a8'/><path d='M7.3 10h1.4' stroke='#7a63a8'/>".into(),
         "mview" => format!("{GRID}<circle cx='12' cy='12' r='3.5' fill='#fff' stroke='#7a63a8'/><path d='M12 10v2l1.4 1' stroke='#7a63a8' fill='none'/>"),
-        "index" => "<path d='M9 1L3 9h4l-1 6 6-8H8z' fill='#f2c94c' stroke='#b08a1e' stroke-linejoin='round'/>".into(),
+        "index" => "<path d='M10.5 0.5L2 9.5h5.5l-1.5 6 8.5-9.5H9z' fill='#f2c94c' stroke='#b08a1e' stroke-linejoin='round'/>".into(),
         "package" => "<path d='M8 1.5l6 3v7l-6 3-6-3v-7z' fill='#e6c79c' stroke='#8a6334' stroke-linejoin='round'/><path d='M2 4.5l6 3 6-3M8 7.5v7' fill='none' stroke='#8a6334'/>".into(),
-        "procedure" => "<circle cx='8' cy='8' r='4.2' fill='#9db8d9' stroke='#3a6aa0' stroke-width='2.5' stroke-dasharray='2.2 1.1'/><circle cx='8' cy='8' r='1.6' fill='#fff' stroke='#3a6aa0'/>".into(),
+        "procedure" => "<circle cx='8' cy='8' r='5.6' fill='#9db8d9' stroke='#3a6aa0' stroke-width='3.4' stroke-dasharray='2.9 1.5'/><circle cx='8' cy='8' r='2.2' fill='#fff' stroke='#3a6aa0'/>".into(),
         "function" => "<path d='M9.5 2c-2 0-2.6 1-3 3L5 12.5C4.6 14.3 4 15 2.5 15M3.5 6.5h5' fill='none' stroke='#3a6aa0' stroke-width='1.6' stroke-linecap='round'/><path d='M10 8l4 5M14 8l-4 5' stroke='#c0392b' stroke-width='1.4'/>".into(),
-        "trigger" => "<path d='M9 1L3 9h4l-1 6 6-8H8z' fill='#ff922b' stroke='#b35c00' stroke-linejoin='round'/>".into(),
-        "type" => "<rect x='2' y='2' width='12' height='12' rx='2' fill='#d0ebff' stroke='#3a6aa0'/><path d='M5 5.5h6M8 5.5v6' stroke='#3a6aa0' stroke-width='1.8'/>".into(),
-        "sequence" => "<rect x='2' y='9' width='3' height='5' fill='#9db8d9' stroke='#3a6aa0'/><rect x='6.5' y='6' width='3' height='8' fill='#9db8d9' stroke='#3a6aa0'/><rect x='11' y='2.5' width='3' height='11.5' fill='#9db8d9' stroke='#3a6aa0'/>".into(),
-        "synonym" => "<path d='M2 10a4 4 0 0 1 4-4h6' fill='none' stroke='#3a6aa0' stroke-width='1.8'/><path d='M10 3l3 3-3 3' fill='none' stroke='#3a6aa0' stroke-width='1.8'/>".into(),
-        "dblink" => "<rect x='1' y='5.5' width='7' height='5' rx='2.5' fill='none' stroke='#3a6aa0' stroke-width='1.8'/><rect x='8' y='5.5' width='7' height='5' rx='2.5' fill='none' stroke='#3a6aa0' stroke-width='1.8'/>".into(),
+        "trigger" => "<path d='M10.5 0.5L2 9.5h5.5l-1.5 6 8.5-9.5H9z' fill='#ff922b' stroke='#b35c00' stroke-linejoin='round'/>".into(),
+        "type" => "<rect x='1' y='1' width='14' height='14' rx='2' fill='#d0ebff' stroke='#3a6aa0'/><path d='M4.5 5h7M8 5v7.5' stroke='#3a6aa0' stroke-width='2'/>".into(),
+        "sequence" => "<rect x='1' y='9.5' width='3.5' height='6' fill='#9db8d9' stroke='#3a6aa0'/><rect x='6.25' y='5.5' width='3.5' height='10' fill='#9db8d9' stroke='#3a6aa0'/><rect x='11.5' y='1' width='3.5' height='14.5' fill='#9db8d9' stroke='#3a6aa0'/>".into(),
+        "synonym" => "<rect x='1.5' y='0.5' width='10' height='12' fill='#fff' stroke='#6b7d93'/><path d='M3.5 15a5.5 5.5 0 0 1 5.5-5.5h4' fill='none' stroke='#3a6aa0' stroke-width='2'/><path d='M11.5 6.5l3.5 3-3.5 3' fill='none' stroke='#3a6aa0' stroke-width='2' stroke-linejoin='round'/>".into(),
+        "dblink" => "<g transform='rotate(-40 8 8)'><rect x='0.2' y='5.2' width='9' height='5.6' rx='2.8' fill='none' stroke='#3a6aa0' stroke-width='2'/><rect x='6.8' y='5.2' width='9' height='5.6' rx='2.8' fill='none' stroke='#3a6aa0' stroke-width='2'/></g>".into(),
         "user" => "<circle cx='8' cy='5' r='3' fill='#f2c94c' stroke='#8a6334'/><path d='M2.5 15c0-3.5 2.5-5.5 5.5-5.5s5.5 2 5.5 5.5z' fill='#5b7fbd' stroke='#2f4d80'/>".into(),
-        "column" => "<rect x='5' y='1.5' width='6' height='13' fill='#fff' stroke='#5a7fa8'/><rect x='5' y='1.5' width='6' height='3' fill='#8fb0d6' stroke='#5a7fa8'/>".into(),
+        "column" => "<rect x='3.5' y='0.5' width='9' height='15' fill='#fff' stroke='#5a7fa8'/><rect x='3.5' y='0.5' width='9' height='3.5' fill='#8fb0d6' stroke='#5a7fa8'/>".into(),
         _ => "<rect x='3' y='3' width='10' height='10' fill='#ccc'/>".into(),
     };
     // Dark appearance: lift the navy strokes so line icons keep their contrast.

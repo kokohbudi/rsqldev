@@ -4,6 +4,7 @@
 //! `{lq}` = `{q}` escaped for a string literal.
 
 use crate::registry::Kind as Db;
+use std::collections::HashMap;
 
 /// Object kinds shown as folders. Oracle-style names everywhere so the UI has one vocabulary.
 pub const TABLE: &str = "TABLE";
@@ -913,25 +914,28 @@ pub fn pk_sql(db: Db, owner: &str, name: &str) -> Option<String> {
     Some(fill(db, tpl, owner, name))
 }
 
-/// Explain plan: run `stmts` in order and show the result of `stmts[show]`.
+/// Explain plan: run `stmts` in order and show the result of `stmts[show]`; `tree`: the
+/// result is `plan_table` rows for [`plan_tree`] (Oracle Explain Plan), else a grid.
 pub struct Explain {
     pub stmts: Vec<String>,
     pub show: usize,
+    pub tree: bool,
 }
 
 pub fn explain(db: Db, sql: &str) -> Explain {
     let sql = sql.trim().trim_end_matches(';');
-    let one = |p: &str| Explain { stmts: vec![format!("{p} {sql}")], show: 0 };
+    let one = |p: &str| Explain { stmts: vec![format!("{p} {sql}")], show: 0, tree: false };
     match db {
         Db::Oracle => Explain {
             stmts: vec![
                 "DELETE FROM plan_table WHERE statement_id = 'rsqldev'".into(),
                 format!("EXPLAIN PLAN SET STATEMENT_ID = 'rsqldev' FOR {sql}"),
-                "SELECT LPAD(' ', 2 * (LEVEL - 1)) || operation || NVL2(options, ' ' || options, '') AS operation, object_name, cardinality, cost, bytes, access_predicates, filter_predicates FROM plan_table START WITH id = 0 AND statement_id = 'rsqldev' CONNECT BY PRIOR id = parent_id AND statement_id = 'rsqldev' ORDER SIBLINGS BY id".into(),
+                "SELECT id, parent_id, operation, options, object_owner, object_name, cardinality, cost, access_predicates, filter_predicates, USER FROM plan_table WHERE statement_id = 'rsqldev' ORDER BY id".into(),
             ],
             show: 2,
+            tree: true,
         },
-        Db::Mssql => Explain { stmts: vec!["SET SHOWPLAN_TEXT ON".into(), sql.into(), "SET SHOWPLAN_TEXT OFF".into()], show: 1 },
+        Db::Mssql => Explain { stmts: vec!["SET SHOWPLAN_TEXT ON".into(), sql.into(), "SET SHOWPLAN_TEXT OFF".into()], show: 1, tree: false },
         Db::Sqlite => one("EXPLAIN QUERY PLAN"),
         _ => one("EXPLAIN"),
     }
@@ -941,7 +945,103 @@ pub fn explain(db: Db, sql: &str) -> Explain {
 pub fn explain_xplan(sql: &str) -> Explain {
     let mut e = explain(Db::Oracle, sql);
     e.stmts[2] = "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY('PLAN_TABLE', 'rsqldev', 'ALL'))".into();
+    e.tree = false;
     e
+}
+
+/// Explain Plan tree row: parent index in the list (None = top), then OPERATION, OBJECT_NAME,
+/// OPTIONS, CARDINALITY, COST. Parents come before their children.
+pub type PlanNode = (Option<usize>, [String; 5]);
+
+/// The Oracle Explain Plan tree, laid out like SQL Developer's: one node per plan step (the
+/// object owner prefixed when it is not the user), and under a step its "Access Predicates" /
+/// "Filter Predicates", split into AND / OR branches. `rows`: the [`explain`] query's columns
+/// (id, parent_id, operation, options, object_owner, object_name, cardinality, cost,
+/// access_predicates, filter_predicates, user), ordered by id.
+pub fn plan_tree(rows: &[Vec<crate::Cell>]) -> Vec<PlanNode> {
+    let col = |r: &Vec<crate::Cell>, i: usize| r.get(i).cloned().flatten().unwrap_or_default();
+    let mut out: Vec<PlanNode> = vec![];
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for r in rows {
+        let (owner, name) = (col(r, 4), col(r, 5));
+        let object = if !owner.is_empty() && owner != col(r, 10) && !name.is_empty() { format!("{owner}.{name}") } else { name };
+        let parent = at.get(&col(r, 1)).copied();
+        out.push((parent, [col(r, 2), object, col(r, 3), col(r, 6), col(r, 7)]));
+        let me = out.len() - 1;
+        at.insert(col(r, 0), me);
+        for (label, i) in [("Access Predicates", 8), ("Filter Predicates", 9)] {
+            let p = col(r, i).replace('"', "");
+            if !p.is_empty() {
+                out.push((Some(me), [label.into(), String::new(), String::new(), String::new(), String::new()]));
+                let n = out.len() - 1;
+                predicate_nodes(&mut out, n, &p);
+            }
+        }
+    }
+    out
+}
+
+/// One predicate under `parent`: outer parentheses dropped, then split at top-level OR (else
+/// AND) into an "OR" / "AND" node with a branch per part; anything else is a leaf.
+fn predicate_nodes(out: &mut Vec<PlanNode>, parent: usize, text: &str) {
+    let leaf = |t: &str| (Some(parent), [t.to_string(), String::new(), String::new(), String::new(), String::new()]);
+    let t = text.trim();
+    if let Some(inner) = t.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        if balanced(inner) {
+            return predicate_nodes(out, parent, inner);
+        }
+    }
+    let parts = split_top(t, "OR");
+    let (op, parts) = if parts.len() > 1 { ("OR", parts) } else { ("AND", split_top(t, "AND")) };
+    if parts.len() < 2 {
+        return out.push(leaf(t));
+    }
+    out.push(leaf(op));
+    let n = out.len() - 1;
+    for p in parts {
+        predicate_nodes(out, n, p);
+    }
+}
+
+/// Parentheses never close below the start (an outer pair can be dropped).
+fn balanced(s: &str) -> bool {
+    let mut depth = 0i32;
+    for c in s.chars() {
+        depth += match c {
+            '(' => 1,
+            ')' => -1,
+            _ => 0,
+        };
+        if depth < 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// `s` split at the word `kw` (any case) outside parentheses and string literals.
+fn split_top<'a>(s: &'a str, kw: &str) -> Vec<&'a str> {
+    let b = s.as_bytes();
+    let (mut parts, mut start, mut depth, mut quoted, mut i) = (vec![], 0, 0i32, false, 0);
+    let boundary = |j: usize| j >= b.len() || matches!(b[j], b' ' | b'(' | b')' | b'\n' | b'\t');
+    while i < b.len() {
+        match b[i] {
+            b'\'' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => depth -= 1,
+            _ if !quoted && depth == 0 && (i == 0 || boundary(i - 1)) && s[i..].len() >= kw.len() && s.is_char_boundary(i + kw.len()) && s[i..i + kw.len()].eq_ignore_ascii_case(kw) && boundary(i + kw.len()) => {
+                parts.push(s[start..i].trim());
+                i += kw.len();
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(s[start..].trim());
+    parts.retain(|p| !p.is_empty());
+    parts
 }
 
 /// Autotrace: run the query and show its plan with actual rows and timings. Queries only (the
@@ -955,7 +1055,7 @@ pub fn autotrace(db: Db, sql: &str, tag: u64) -> Option<Explain> {
     if !words.first().is_some_and(|(_, w)| w == "SELECT" || w == "WITH") || words.iter().any(|(_, w)| matches!(w.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")) {
         return None;
     }
-    let one = |p: &str| Some(Explain { stmts: vec![format!("{p} {sql}")], show: 0 });
+    let one = |p: &str| Some(Explain { stmts: vec![format!("{p} {sql}")], show: 0, tree: false });
     match db {
         Db::Oracle => {
             let at = words.iter().find(|(_, w)| w == "SELECT")?.0;
@@ -964,7 +1064,7 @@ pub fn autotrace(db: Db, sql: &str, tag: u64) -> Option<Explain> {
             let show = format!(
                 "SELECT t.plan_table_output FROM (SELECT sql_id, child_number FROM v$sql WHERE sql_text LIKE '%{marker}%' AND sql_text NOT LIKE '%v$sql%' ORDER BY last_active_time DESC FETCH FIRST 1 ROW ONLY) s, TABLE(DBMS_XPLAN.DISPLAY_CURSOR(s.sql_id, s.child_number, 'ALLSTATS LAST')) t"
             );
-            Some(Explain { stmts: vec![traced, show], show: 1 })
+            Some(Explain { stmts: vec![traced, show], show: 1, tree: false })
         }
         Db::Postgres => one("EXPLAIN (ANALYZE, BUFFERS)"),
         Db::Mysql | Db::Duckdb => one("EXPLAIN ANALYZE"),
@@ -1137,6 +1237,41 @@ pub fn order_by(db: Db, keys: &[SortKey]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_tree_like_sql_developer() {
+        let row = |v: &[&str]| v.iter().map(|s| (!s.is_empty()).then(|| s.to_string())).collect::<Vec<_>>();
+        let rows = vec![
+            row(&["0", "", "SELECT STATEMENT", "", "", "", "1", "3", "", "", "SCOTT"]),
+            row(&["1", "0", "TABLE ACCESS", "FULL", "SCOTT", "EMP", "1", "3", "", "(\"SAL\">1000 AND (\"JOB\"='A' OR \"JOB\"='B'))", "SCOTT"]),
+            row(&["2", "0", "INDEX", "UNIQUE SCAN", "HR", "PK_DEPT", "1", "0", "\"DEPTNO\"=10", "", "SCOTT"]),
+        ];
+        let t = plan_tree(&rows);
+        let ops: Vec<(Option<usize>, &str)> = t.iter().map(|(p, c)| (*p, c[0].as_str())).collect();
+        assert_eq!(
+            ops,
+            vec![
+                (None, "SELECT STATEMENT"),
+                (Some(0), "TABLE ACCESS"),
+                (Some(1), "Filter Predicates"),
+                (Some(2), "AND"),
+                (Some(3), "SAL>1000"),
+                (Some(3), "OR"),
+                (Some(5), "JOB='A'"),
+                (Some(5), "JOB='B'"),
+                (Some(0), "INDEX"),
+                (Some(8), "Access Predicates"),
+                (Some(9), "DEPTNO=10"),
+            ]
+        );
+        // Owner shown only when it is not the user; OPTIONS, CARDINALITY, COST in place.
+        assert_eq!(t[1].1, ["TABLE ACCESS", "EMP", "FULL", "1", "3"].map(String::from));
+        assert_eq!(t[8].1[1], "HR.PK_DEPT");
+        // AND inside a string literal or a word does not split.
+        assert_eq!(split_top("NAME='A AND B' AND BRAND=1", "AND"), vec!["NAME='A AND B'", "BRAND=1"]);
+        assert_eq!(split_top("(A=1) OR(B=2)", "OR"), vec!["(A=1)", "(B=2)"]);
+        assert_eq!(split_top("x=1", "AND"), vec!["x=1"]);
+    }
 
     #[test]
     fn sort_order_by() {

@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.8.0 — 2026-11-02
+
+### Features
+- **Run Statement (Ctrl/Cmd+Enter) works like SQL Developer**: a selection of several statements runs them all, each query in a Query Result tab of its own, with Script Output noting where each one ran; the statement for the cursor is picked by line (a blank line between two statements runs the next one); on macOS Control+Enter runs it too.
+- Script Output keeps earlier output across runs, as in SQL Developer; Clear empties it.
+- **Explain Plan (F10) on Oracle** shows SQL Developer's plan tree: OPERATION, OBJECT_NAME, OPTIONS, CARDINALITY, COST, with each step's Access and Filter Predicates split into AND / OR branches.
+- **See what is running**: the running worksheet shows a live timer with the activity buddy in its toolbar; the status bar names the connection and time, shows the running SQL on hover and brings that worksheet up on click. Work that takes longer than 5 s is marked; work of 30 s or more that finishes while rsqldev is in the background sends a notification.
+- **ER Diagram** runs on a connection of its own with a progress window and Cancel, so big schemas no longer hold up the connections tree, completion or object viewers.
+- Tree icons are drawn at the same size as SQL Developer's.
+
+### Bug fixes
+- Cancelling a substitution variable prompt in a script left the worksheet marked as running.
+- The activity buddy's shadow was invisible in dark mode.
+
 ## v0.7.0 — 2026-10-28
 
 ### Features

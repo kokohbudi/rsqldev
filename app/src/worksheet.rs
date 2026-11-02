@@ -25,6 +25,9 @@ pub struct Worksheet {
     pub results: ResultGrid,
     script_out: StyledTextCtrl,
     explain: ResultGrid,
+    /// Oracle Explain Plan as SQL Developer shows it: a tree of steps and predicates.
+    plan: wxdragon::widgets::treelistctrl::TreeListCtrl,
+    explain_pane: Panel,
     dbms: StyledTextCtrl,
     /// Query Result pane message ("All Rows Fetched: 14 in 0.003 seconds").
     status: StaticText,
@@ -41,6 +44,12 @@ pub struct Worksheet {
     me: Weak<Worksheet>,
     b_cancel: BitmapButton,
     busy: Cell<bool>,
+    /// When the statement in flight started, and which run it is (a ticker of an older run stops).
+    busy_since: Cell<Option<Instant>>,
+    busy_gen: Cell<u32>,
+    /// The buddy next to the timer while busy (made on the first run, in `pet_slot`).
+    pet_slot: Panel,
+    pet: Cell<Option<StaticBitmap>>,
     /// Autosave slot (`<config>/worksheets/<id>.toml`).
     pub autosave_id: u64,
     /// Text changed since the last autosave (set by the editor's change event).
@@ -53,6 +62,10 @@ pub struct Worksheet {
     strip: Panel,
     /// Ctrl/Cmd+Up / Down position in SQL History, counted back from the newest entry.
     hist_at: Cell<Option<usize>>,
+    /// Run Statement over a multi-statement selection: queries go to Query Result tabs.
+    grid_run: Cell<bool>,
+    /// Query Result tabs opened so far (their numbers).
+    tabs: Cell<usize>,
 }
 
 const P_RESULT: usize = 0;
@@ -112,6 +125,9 @@ impl Worksheet {
         let b_hist = mk("history", "SQL History (F8)");
         let b_cancel = mk("cancel", "Cancel");
         bar.add_stretch_spacer(1);
+        let pet_slot = Panel::builder(&panel).build();
+        pet_slot.set_min_size(Size::new(20, 20));
+        bar.add(&pet_slot, 0, SizerFlag::AlignCenterVertical, 0);
         let elapsed = StaticText::builder(&panel).with_label("").with_style(StaticTextStyle::AlignRight).build();
         elapsed.set_min_size(Size::new(110, -1));
         bar.add(&elapsed, 0, SizerFlag::AlignCenterVertical | SizerFlag::Right, 10);
@@ -142,6 +158,12 @@ impl Worksheet {
         let (ep, es, _, _) = pane(&bottom, &[]);
         let explain = ResultGrid::new(&ep);
         es.add(&explain.grid, 1, SizerFlag::Expand, 0);
+        let plan = wxdragon::widgets::treelistctrl::TreeListCtrl::builder(&ep).build();
+        for (h, w, a) in [("OPERATION", 320, ListColumnFormat::Left), ("OBJECT_NAME", 170, ListColumnFormat::Left), ("OPTIONS", 140, ListColumnFormat::Left), ("CARDINALITY", 90, ListColumnFormat::Right), ("COST", 70, ListColumnFormat::Right)] {
+            plan.append_column(h, w, a);
+        }
+        es.add(&plan, 1, SizerFlag::Expand, 0);
+        plan.show(false);
         ep.set_sizer(es, true);
         let (dp, ds, db, _) = pane(&bottom, &[("new", "Enable DBMS Output for this connection"), ("clear", "Clear"), ("save", "Save…")]);
         let dbms = mono(&dp);
@@ -179,6 +201,8 @@ impl Worksheet {
             results,
             script_out,
             explain,
+            plan,
+            explain_pane: ep,
             dbms,
             status,
             task,
@@ -195,7 +219,13 @@ impl Worksheet {
             last_line: Cell::new(1),
             b_cancel,
             busy: Cell::new(false),
+            busy_since: Cell::new(None),
+            busy_gen: Cell::new(0),
+            pet_slot,
+            pet: Cell::new(None),
             hist_at: Cell::new(None),
+            grid_run: Cell::new(false),
+            tabs: Cell::new(0),
             strip,
             autosave_id: crate::autosave::next_id(),
             unsaved: Cell::new(false),
@@ -308,6 +338,12 @@ impl Worksheet {
                         }
                     }
                     WXK_F9 if !cmd && !alt && !shift => return w.run_statement(),
+                    // macOS: SQL Developer's Control+Enter too (the menu's Ctrl is Cmd there).
+                    wxdragon::keycode::WXK_RETURN | wxdragon::keycode::WXK_NUMPAD_ENTER
+                        if cfg!(target_os = "macos") && !cmd && !alt && wxdragon::utils::get_key_state(wxdragon::keycode::WXK_RAW_CONTROL) =>
+                    {
+                        return w.run_statement()
+                    }
                     WXK_UP | WXK_DOWN if cmd && !alt => return w.history_step(code == WXK_UP, shift),
                     c if c == '\'' as i32 && alt && !cmd => return w.toggle_case(),
                     c if c == 'C' as i32 && alt && shift && !cmd => return crate::editor::toggle_block_comment(w.editor),
@@ -351,14 +387,80 @@ impl Worksheet {
         ws
     }
 
-    /// Statement in flight: Cancel enabled, tab marked.
+    pub fn is_busy(&self) -> bool {
+        self.busy.get()
+    }
+
+    /// The statement in flight, or the last one run (status bar tooltip, notifications).
+    pub fn running_sql(&self) -> String {
+        self.last.borrow().as_deref().unwrap_or("").trim_start_matches('\u{1}').trim().to_string()
+    }
+
+    /// Statement in flight: Cancel enabled, tab marked, the buddy hopping next to a live timer.
+    /// Done: work that took long while rsqldev was in the background notifies.
     fn set_busy(&self, on: bool) {
         if self.busy.replace(on) == on {
             return;
         }
         self.b_cancel.enable(on);
         let name = self.conn().borrow().cfg.name.clone();
-        crate::app().retitle(&self.panel, &if on { format!("⏳ {name}") } else { name });
+        crate::app().retitle(&self.panel, &if on { format!("⏳ {name}") } else { name.clone() });
+        if on {
+            self.busy_since.set(Some(Instant::now()));
+            self.busy_gen.set(self.busy_gen.get().wrapping_add(1));
+            self.animate();
+        } else if let Some(t) = self.busy_since.take() {
+            self.elapsed.set_foreground_color(crate::theme::c(crate::theme::p().text));
+            crate::buddy::notify_done(&crate::app().frame, t.elapsed().as_secs_f32(), &format!("rsqldev · {name}"), &self.running_sql());
+        }
+    }
+
+    /// While busy: the buddy hops by the timer, which counts up and turns the accent colour
+    /// once the work drags on ([`crate::buddy::TIRED_SECS`]); done: a short beam, then hidden.
+    fn animate(&self) {
+        let Some(frames) = crate::buddy::frames() else { return };
+        let pic = self.pet.get().unwrap_or_else(|| {
+            let b = StaticBitmap::new_with_bitmap_bundle(&self.pet_slot, ID_ANY as i32, &frames.happy);
+            self.pet.set(Some(b));
+            b
+        });
+        pic.set_tooltip("Working… Cancel stops it");
+        pic.show(true);
+        let (me, run) = (self.weak(), self.busy_gen.get());
+        let (mut tick, mut cheer) = (0u32, 0);
+        crate::hub::every_tick(move || {
+            let Some(w) = me.upgrade() else { return false };
+            if w.busy_gen.get() != run {
+                return false;
+            }
+            tick = tick.wrapping_add(1);
+            match w.busy_since.get().filter(|_| w.busy.get()) {
+                Some(t) => {
+                    if tick % 2 == 0 {
+                        let secs = t.elapsed().as_secs_f32();
+                        let tired = secs >= crate::buddy::TIRED_SECS;
+                        pic.set_bitmap_bundle(frames.at(tick / 2, tired));
+                        w.elapsed.set_label(&format!("{secs:.1} s"));
+                        if tired {
+                            w.elapsed.set_foreground_color(crate::theme::c(crate::theme::p().accent));
+                        }
+                    }
+                    true
+                }
+                None => {
+                    if cheer == 0 {
+                        pic.set_bitmap_bundle(&frames.happy);
+                        pic.set_tooltip("Done");
+                    }
+                    cheer += 1;
+                    if cheer < 40 {
+                        return true;
+                    }
+                    pic.show(false);
+                    false
+                }
+            }
+        });
     }
 
     fn weak(&self) -> Weak<Worksheet> {
@@ -572,15 +674,21 @@ impl Worksheet {
         }
         let sel = self.editor.get_selected_text();
         let item = if !sel.trim().is_empty() {
-            script::split(&sel, self.kind()).into_iter().next()
+            let mut items = script::split(&sel, self.kind());
+            // SQL Developer runs every statement of the selection: queries into Query
+            // Result tabs of their own, the rest into Script Output.
+            if items.len() > 1 {
+                self.grid_run.set(true);
+                return self.run_script();
+            }
+            items.pop()
         } else {
             let text = self.editor.get_text();
             let items = script::split(&text, self.kind());
-            script::statement_at(&items, self.editor.get_current_pos() as usize).cloned()
+            script::statement_at(&text, &items, self.editor.get_current_pos() as usize).cloned()
         };
         let Some(item) = item else { return };
         if item.kind == script::Kind::Command {
-            editor::show(&self.script_out, "");
             self.run_items(vec![item], 0);
             return;
         }
@@ -617,9 +725,9 @@ impl Worksheet {
             me.dbms_lines(&d.output);
             let secs = format!("{:.3} seconds", d.elapsed.as_secs_f32());
             match d.result {
+                // Script Output keeps earlier runs (SQL Developer): append, Clear empties it.
                 Err(e) => {
-                    editor::show(&me.script_out, "");
-                    me.out(&format!("Error starting at line : {line} in command -\n{sql2}\nError report -\n{e}"));
+                    me.out(&format!("\nError starting at line : {line} in command -\n{sql2}\nError report -\n{e}\n"));
                     me.mark_errors(line, &e);
                     me.bottom.set_selection(P_SCRIPT);
                     w.set_label("");
@@ -627,8 +735,7 @@ impl Worksheet {
                     el.set_label(&secs);
                 }
                 Ok(aff) if !query => {
-                    editor::show(&me.script_out, "");
-                    me.out(&script::feedback(&sql2, aff));
+                    me.out(&format!("\n{}\n", script::feedback(&sql2, aff)));
                     me.bottom.set_selection(P_SCRIPT);
                     task.set_label(&format!("Task completed in {secs}"));
                     el.set_label(&secs);
@@ -734,9 +841,8 @@ impl Worksheet {
             })
             .collect();
         if items.is_empty() {
-            return;
+            return self.grid_run.set(false);
         }
-        editor::show(&self.script_out, "");
         self.bottom.set_selection(P_SCRIPT);
         self.started.set(Some(Instant::now()));
         self.running.set(true);
@@ -749,6 +855,7 @@ impl Worksheet {
     fn run_items(&self, items: Vec<Item>, i: usize) {
         if i >= items.len() || !self.running.get() && i > 0 {
             self.running.set(false);
+            self.grid_run.set(false);
             self.set_busy(false);
             let secs = self.started.get().map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
             self.task.set_label(&format!("Task completed in {secs:.3} seconds"));
@@ -835,12 +942,15 @@ impl Worksheet {
         }
         let Some(sql) = self.substitute(&item.text) else {
             self.running.set(false);
-            return;
+            return next(items);
         };
         if !self.allow(&sql) {
             self.out(&format!("\nScript stopped at line {}: not confirmed.\n", self.line_of(item.start)));
             self.running.set(false);
             return next(items);
+        }
+        if self.grid_run.get() && item.kind != script::Kind::Block && rsqldev_core::is_query(&sql) {
+            return self.query_tab(sql, self.line_of(item.start), items, Box::new(next));
         }
         self.script_sql(sql, item.start, items, i, Box::new(next));
     }
@@ -906,7 +1016,7 @@ impl Worksheet {
         let sql = if sel.trim().is_empty() {
             let text = self.editor.get_text();
             let items = script::split(&text, self.kind());
-            script::statement_at(&items, self.editor.get_current_pos() as usize)?.text.clone()
+            script::statement_at(&text, &items, self.editor.get_current_pos() as usize)?.text.clone()
         } else {
             sel
         };
@@ -931,7 +1041,7 @@ impl Worksheet {
         self.bottom.set_selection(P_EXPLAIN);
         self.explain.reset();
         self.set_busy(true);
-        self.explain_step(ex.stmts, ex.show, 0);
+        self.explain_step(ex.stmts, ex.show, ex.tree, 0);
     }
 
     /// Run ▸ Run PL/SQL (Oracle): a worksheet with an anonymous block calling the procedure or
@@ -979,10 +1089,10 @@ impl Worksheet {
         self.bottom.set_selection(P_EXPLAIN);
         self.explain.reset();
         self.set_busy(true);
-        self.explain_step(ex.stmts, ex.show, 0);
+        self.explain_step(ex.stmts, ex.show, ex.tree, 0);
     }
 
-    fn explain_step(&self, stmts: Vec<String>, show: usize, i: usize) {
+    fn explain_step(&self, stmts: Vec<String>, show: usize, tree: bool, i: usize) {
         if i >= stmts.len() {
             return self.set_busy(false);
         }
@@ -991,7 +1101,11 @@ impl Worksheet {
         Conn::work_query(&self.conn(), &sql, move |r| {
             let Some(me) = me.upgrade() else { return };
             match r {
-                Ok(r) if i == show => me.explain.set(r.cols, r.rows),
+                Ok(r) if i == show && tree => me.show_plan(&r.rows),
+                Ok(r) if i == show => {
+                    me.plan_visible(false);
+                    me.explain.set(r.cols, r.rows)
+                }
                 Ok(_) => {}
                 Err(e) => {
                     me.out(&format!("Explain failed:\n{e}"));
@@ -1001,8 +1115,36 @@ impl Worksheet {
                     }
                 }
             }
-            me.explain_step(stmts, show, i + 1);
+            me.explain_step(stmts, show, tree, i + 1);
         });
+    }
+
+    /// The Explain Plan pane shows the plan tree (Oracle Explain Plan) or the grid.
+    fn plan_visible(&self, tree: bool) {
+        self.plan.show(tree);
+        self.explain.grid.show(!tree);
+        self.explain_pane.layout();
+    }
+
+    /// Oracle Explain Plan, laid out like SQL Developer ([`dialect::plan_tree`]), all expanded.
+    // ponytail: TreeListCtrl has no per-row colour or spanning cells, so predicates sit in the
+    // OPERATION column in the default colour; a custom-drawn tree if that matters.
+    fn show_plan(&self, rows: &[Vec<rsqldev_core::Cell>]) {
+        self.plan_visible(true);
+        let p = self.plan;
+        p.delete_all_items();
+        let root = p.get_root_item();
+        let mut items = vec![];
+        for (parent, cols) in dialect::plan_tree(rows) {
+            let Some(it) = p.append_item(&parent.map_or(root, |i| items[i]), &cols[0]) else { return };
+            for (c, t) in cols.iter().enumerate().skip(1).filter(|(_, t)| !t.is_empty()) {
+                p.set_item_text(&it, c as i32, t);
+            }
+            items.push(it);
+        }
+        for it in &items {
+            p.expand(it);
+        }
     }
 
     pub fn commit(&self) {
@@ -1167,14 +1309,19 @@ impl Worksheet {
             (st.cols[h..].to_vec(), st.rows.iter().filter(|r| !r.deleted).map(|r| r.cur[h..].to_vec()).collect::<Vec<_>>())
         };
         let label: String = self.last.borrow().as_deref().unwrap_or("").trim_start_matches('\u{1}').split_whitespace().collect::<Vec<_>>().join(" ").chars().take(28).collect();
-        let (p, s, btns, note) = pane(&self.bottom, &[("clear", "Close this pinned result"), ("export", "Export…")]);
+        let (g, note) = self.result_tab(&format!("Pinned: {label}"));
+        note.set_label(&format!("{} rows, pinned {}", rows.len(), chrono::Local::now().format("%H:%M:%S")));
+        g.set(cols, rows);
+    }
+
+    /// A closable result tab of its own (Pin, Run Statement over a selection).
+    fn result_tab(&self, label: &str) -> (ResultGrid, StaticText) {
+        let (p, s, btns, note) = pane(&self.bottom, &[("clear", "Close this result"), ("export", "Export…")]);
         let g = ResultGrid::new(&p);
         g.st.borrow_mut().db = Some(self.kind());
         s.add(&g.grid, 1, SizerFlag::Expand, 0);
         p.set_sizer(s, true);
-        note.set_label(&format!("{} rows, pinned {}", rows.len(), chrono::Local::now().format("%H:%M:%S")));
-        g.set(cols, rows);
-        self.bottom.add_page(&p, &format!("Pinned: {label}"), true);
+        self.bottom.add_page(&p, label, true);
         let bottom = self.bottom;
         btns[0].on_click(move |_| {
             let i = bottom.get_page_index(&p);
@@ -1184,6 +1331,47 @@ impl Worksheet {
         });
         let g2 = g.clone();
         btns[1].on_click(move |_| g2.export_dialog());
+        (g, note)
+    }
+
+    /// Run Statement over a selection: a query gets a Query Result tab of its own and Script
+    /// Output notes where it ran (SQL Developer). The next statement starts once rows arrive.
+    // ponytail: one work session, so the next statement closes this cursor: earlier tabs keep
+    // their first FETCH_ROWS rows (PostgreSQL autocommit continues via resume). A session per
+    // tab if people need to scroll them all.
+    fn query_tab(&self, sql: String, line: i32, items: Vec<Item>, next: Box<dyn FnOnce(Vec<Item>)>) {
+        *self.last.borrow_mut() = Some(sql.clone());
+        let n = self.tabs.get() + 1;
+        self.tabs.set(n);
+        let label = format!("Query Result {n}");
+        let (g, _) = self.result_tab(&label);
+        let failed = Rc::new(Cell::new(false));
+        let (me, f2, sql2) = (self.weak(), failed.clone(), sql.clone());
+        let rows = Conn::exec(&self.conn(), &sql, move |d: Done| {
+            let Some(me) = me.upgrade() else { return };
+            me.dbms_lines(&d.output);
+            if let Err(e) = d.result {
+                f2.set(true);
+                me.out(&format!("\nError starting at line : {line} in command -\n{sql2}\nError report -\n{e}\n"));
+                me.mark_errors(line, &e);
+            }
+        });
+        g.load(rows, 0, false);
+        g.st.borrow_mut().resume = Conn::resume(&self.conn(), &sql);
+        self.out(&format!(">>Query Run In:{label}"));
+        let mut next = Some((next, items));
+        crate::hub::every_tick(move || {
+            let ready = failed.get() || {
+                let st = g.st.borrow();
+                st.done || !st.rows.is_empty()
+            };
+            if ready {
+                if let Some((next, items)) = next.take() {
+                    next(items);
+                }
+            }
+            !ready
+        });
     }
 
     /// Show SQL: the statement whose result the Query Result holds.

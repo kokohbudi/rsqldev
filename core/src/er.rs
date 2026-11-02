@@ -40,6 +40,59 @@ pub fn queries(db: Db, owner: &str) -> Option<(String, String)> {
     Some((fill(db, &o(cols), owner, ""), fill(db, &o(fks), owner, "")))
 }
 
+/// Tools ▸ ER Diagram end to end on a connection of its own, in the calling thread (the app
+/// runs it on a thread of its own): the app's sessions stay free however long the dictionary
+/// queries take on a big schema, and the connection closes when this returns. `schema` empty
+/// = the connection's current schema; `pattern` filters table names ([`crate::config::name_matches`]).
+/// `cancel` holds the running statement's canceller, `stop` is checked between steps, `step`
+/// reports progress. Returns (schema, SVG, tables drawn), or None when there is nothing to draw.
+#[allow(clippy::too_many_arguments)]
+pub fn generate(
+    cfg: &crate::config::ConnConfig,
+    password: &str,
+    prefs: &crate::config::Prefs,
+    schema: &str,
+    pattern: &str,
+    cancel: &std::sync::Mutex<Option<crate::Canceller>>,
+    stop: &std::sync::atomic::AtomicBool,
+    step: &dyn Fn(&str),
+) -> anyhow::Result<Option<(String, String, usize)>> {
+    use std::sync::atomic::Ordering;
+    let _busy = crate::worker::Busy::new();
+    let db = crate::registry::find(&cfg.driver).map(|d| d.backend).ok_or_else(|| anyhow::anyhow!("Unknown driver {}", cfg.driver))?;
+    step("Connecting…");
+    let mut b = crate::backend::connect(cfg, password, prefs)?;
+    *cancel.lock().unwrap() = b.canceller();
+    let stopped = || stop.load(Ordering::Relaxed);
+    let owner = if schema.trim().is_empty() {
+        let (_, rows) = crate::query_all(b.as_mut(), crate::dialect::current_schema_sql(db))?;
+        rows.into_iter().next().and_then(|r| r.into_iter().next().flatten()).unwrap_or_default()
+    } else {
+        crate::dialect::fold(db, schema.trim())
+    };
+    let Some((cq, fq)) = queries(db, &owner) else { anyhow::bail!("ER diagrams are not available on this database.") };
+    if stopped() {
+        return Ok(None);
+    }
+    step(&format!("Reading the columns of {owner}…"));
+    let mut t = tables(&crate::query_all(b.as_mut(), &cq)?.1);
+    if !pattern.trim().is_empty() {
+        t.retain(|n, _| crate::config::name_matches(pattern, n));
+    }
+    if t.is_empty() || stopped() {
+        return Ok(None);
+    }
+    step(&format!("Reading the foreign keys of {owner} ({} tables)…", t.len()));
+    let fks: Vec<(String, String)> = crate::query_all(b.as_mut(), &fq)?.1.into_iter().filter_map(|r| Some((r.first().cloned().flatten()?, r.get(1).cloned().flatten()?))).collect();
+    *cancel.lock().unwrap() = None;
+    if stopped() {
+        return Ok(None);
+    }
+    step(&format!("Drawing {} tables…", t.len()));
+    let n = t.len();
+    Ok(Some((owner.clone(), svg(&format!("{owner} — {n} tables"), &t, &fks), n)))
+}
+
 /// One table in the diagram.
 #[derive(Default, Debug)]
 pub struct Table {
@@ -118,6 +171,35 @@ pub fn svg(title: &str, tables: &BTreeMap<String, Table>, fks: &[(String, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole job on a connection of its own (SQLite file): schema, columns, keys, SVG.
+    #[test]
+    fn generate_on_own_connection() {
+        let dir = std::env::temp_dir().join(format!("rsqldev-er-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("er.db");
+        let _ = std::fs::remove_file(&file);
+        let cfg = crate::config::ConnConfig { name: "er".into(), driver: "sqlite".into(), database: file.display().to_string(), ..Default::default() };
+        let prefs = crate::config::Prefs::default();
+        {
+            let mut b = crate::backend::connect(&cfg, "", &prefs).unwrap();
+            for s in ["CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT)", "CREATE TABLE emp (id INTEGER PRIMARY KEY, dept_id INTEGER REFERENCES dept(id))", "CREATE TABLE zzz (x INTEGER)"] {
+                crate::query_all(b.as_mut(), s).unwrap();
+            }
+            b.commit().unwrap();
+        }
+        let (cancel, stop) = (std::sync::Mutex::new(None), std::sync::atomic::AtomicBool::new(false));
+        let steps = std::cell::RefCell::new(vec![]);
+        let step = |s: &str| steps.borrow_mut().push(s.to_string());
+        let (owner, svg, n) = generate(&cfg, "", &prefs, "", "%e%", &cancel, &stop, &step).unwrap().unwrap();
+        assert_eq!((owner.as_str(), n), ("main", 2));
+        assert!(svg.contains(">dept<") && svg.contains(">emp<") && !svg.contains(">zzz<") && svg.contains("<line"));
+        assert!(steps.borrow().first().is_some_and(|s| s.starts_with("Connecting")));
+        // Stopped before reading: nothing drawn.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(generate(&cfg, "", &prefs, "", "", &cancel, &stop, &step).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn diagram() {

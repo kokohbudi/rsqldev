@@ -22,7 +22,7 @@ pub fn show(editor: StyledTextCtrl, conn: &ConnRef, explicit: bool) {
         (c.kind, c.schema.clone())
     };
     let items = script::split(&text, db);
-    let refs = tables(&script::statement_at(&items, pos).map(|i| i.text.clone()).unwrap_or_default());
+    let refs = tables(&script::statement_at(&text, &items, pos).map(|i| i.text.clone()).unwrap_or_default());
     let target = |owner: Option<&str>, name: &str| (owner.map_or(schema.clone(), |o| stored(db, o)), stored(db, name));
     // Names go into metadata queries as string literals: skip ones that could break the literal.
     let safe = |s: &str| !s.contains(['\'', '\\']);
