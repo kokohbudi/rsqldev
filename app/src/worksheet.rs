@@ -25,6 +25,9 @@ pub struct Worksheet {
     pub results: ResultGrid,
     script_out: StyledTextCtrl,
     explain: ResultGrid,
+    /// Oracle Explain Plan as SQL Developer shows it: a tree of steps and predicates.
+    plan: wxdragon::widgets::treelistctrl::TreeListCtrl,
+    explain_pane: Panel,
     dbms: StyledTextCtrl,
     /// Query Result pane message ("All Rows Fetched: 14 in 0.003 seconds").
     status: StaticText,
@@ -146,6 +149,12 @@ impl Worksheet {
         let (ep, es, _, _) = pane(&bottom, &[]);
         let explain = ResultGrid::new(&ep);
         es.add(&explain.grid, 1, SizerFlag::Expand, 0);
+        let plan = wxdragon::widgets::treelistctrl::TreeListCtrl::builder(&ep).build();
+        for (h, w, a) in [("OPERATION", 320, ListColumnFormat::Left), ("OBJECT_NAME", 170, ListColumnFormat::Left), ("OPTIONS", 140, ListColumnFormat::Left), ("CARDINALITY", 90, ListColumnFormat::Right), ("COST", 70, ListColumnFormat::Right)] {
+            plan.append_column(h, w, a);
+        }
+        es.add(&plan, 1, SizerFlag::Expand, 0);
+        plan.show(false);
         ep.set_sizer(es, true);
         let (dp, ds, db, _) = pane(&bottom, &[("new", "Enable DBMS Output for this connection"), ("clear", "Clear"), ("save", "Save…")]);
         let dbms = mono(&dp);
@@ -183,6 +192,8 @@ impl Worksheet {
             results,
             script_out,
             explain,
+            plan,
+            explain_pane: ep,
             dbms,
             status,
             task,
@@ -955,7 +966,7 @@ impl Worksheet {
         self.bottom.set_selection(P_EXPLAIN);
         self.explain.reset();
         self.set_busy(true);
-        self.explain_step(ex.stmts, ex.show, 0);
+        self.explain_step(ex.stmts, ex.show, ex.tree, 0);
     }
 
     /// Run ▸ Run PL/SQL (Oracle): a worksheet with an anonymous block calling the procedure or
@@ -1003,10 +1014,10 @@ impl Worksheet {
         self.bottom.set_selection(P_EXPLAIN);
         self.explain.reset();
         self.set_busy(true);
-        self.explain_step(ex.stmts, ex.show, 0);
+        self.explain_step(ex.stmts, ex.show, ex.tree, 0);
     }
 
-    fn explain_step(&self, stmts: Vec<String>, show: usize, i: usize) {
+    fn explain_step(&self, stmts: Vec<String>, show: usize, tree: bool, i: usize) {
         if i >= stmts.len() {
             return self.set_busy(false);
         }
@@ -1015,7 +1026,11 @@ impl Worksheet {
         Conn::work_query(&self.conn(), &sql, move |r| {
             let Some(me) = me.upgrade() else { return };
             match r {
-                Ok(r) if i == show => me.explain.set(r.cols, r.rows),
+                Ok(r) if i == show && tree => me.show_plan(&r.rows),
+                Ok(r) if i == show => {
+                    me.plan_visible(false);
+                    me.explain.set(r.cols, r.rows)
+                }
                 Ok(_) => {}
                 Err(e) => {
                     me.out(&format!("Explain failed:\n{e}"));
@@ -1025,8 +1040,36 @@ impl Worksheet {
                     }
                 }
             }
-            me.explain_step(stmts, show, i + 1);
+            me.explain_step(stmts, show, tree, i + 1);
         });
+    }
+
+    /// The Explain Plan pane shows the plan tree (Oracle Explain Plan) or the grid.
+    fn plan_visible(&self, tree: bool) {
+        self.plan.show(tree);
+        self.explain.grid.show(!tree);
+        self.explain_pane.layout();
+    }
+
+    /// Oracle Explain Plan, laid out like SQL Developer ([`dialect::plan_tree`]), all expanded.
+    // ponytail: TreeListCtrl has no per-row colour or spanning cells, so predicates sit in the
+    // OPERATION column in the default colour; a custom-drawn tree if that matters.
+    fn show_plan(&self, rows: &[Vec<rsqldev_core::Cell>]) {
+        self.plan_visible(true);
+        let p = self.plan;
+        p.delete_all_items();
+        let root = p.get_root_item();
+        let mut items = vec![];
+        for (parent, cols) in dialect::plan_tree(rows) {
+            let Some(it) = p.append_item(&parent.map_or(root, |i| items[i]), &cols[0]) else { return };
+            for (c, t) in cols.iter().enumerate().skip(1).filter(|(_, t)| !t.is_empty()) {
+                p.set_item_text(&it, c as i32, t);
+            }
+            items.push(it);
+        }
+        for it in &items {
+            p.expand(it);
+        }
     }
 
     pub fn commit(&self) {
