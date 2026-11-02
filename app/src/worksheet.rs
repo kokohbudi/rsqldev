@@ -44,6 +44,12 @@ pub struct Worksheet {
     me: Weak<Worksheet>,
     b_cancel: BitmapButton,
     busy: Cell<bool>,
+    /// When the statement in flight started, and which run it is (a ticker of an older run stops).
+    busy_since: Cell<Option<Instant>>,
+    busy_gen: Cell<u32>,
+    /// The buddy next to the timer while busy (made on the first run, in `pet_slot`).
+    pet_slot: Panel,
+    pet: Cell<Option<StaticBitmap>>,
     /// Autosave slot (`<config>/worksheets/<id>.toml`).
     pub autosave_id: u64,
     /// Text changed since the last autosave (set by the editor's change event).
@@ -119,6 +125,9 @@ impl Worksheet {
         let b_hist = mk("history", "SQL History (F8)");
         let b_cancel = mk("cancel", "Cancel");
         bar.add_stretch_spacer(1);
+        let pet_slot = Panel::builder(&panel).build();
+        pet_slot.set_min_size(Size::new(20, 20));
+        bar.add(&pet_slot, 0, SizerFlag::AlignCenterVertical, 0);
         let elapsed = StaticText::builder(&panel).with_label("").with_style(StaticTextStyle::AlignRight).build();
         elapsed.set_min_size(Size::new(110, -1));
         bar.add(&elapsed, 0, SizerFlag::AlignCenterVertical | SizerFlag::Right, 10);
@@ -210,6 +219,10 @@ impl Worksheet {
             last_line: Cell::new(1),
             b_cancel,
             busy: Cell::new(false),
+            busy_since: Cell::new(None),
+            busy_gen: Cell::new(0),
+            pet_slot,
+            pet: Cell::new(None),
             hist_at: Cell::new(None),
             grid_run: Cell::new(false),
             tabs: Cell::new(0),
@@ -378,14 +391,76 @@ impl Worksheet {
         self.busy.get()
     }
 
-    /// Statement in flight: Cancel enabled, tab marked.
+    /// The statement in flight, or the last one run (status bar tooltip, notifications).
+    pub fn running_sql(&self) -> String {
+        self.last.borrow().as_deref().unwrap_or("").trim_start_matches('\u{1}').trim().to_string()
+    }
+
+    /// Statement in flight: Cancel enabled, tab marked, the buddy hopping next to a live timer.
+    /// Done: work that took long while rsqldev was in the background notifies.
     fn set_busy(&self, on: bool) {
         if self.busy.replace(on) == on {
             return;
         }
         self.b_cancel.enable(on);
         let name = self.conn().borrow().cfg.name.clone();
-        crate::app().retitle(&self.panel, &if on { format!("⏳ {name}") } else { name });
+        crate::app().retitle(&self.panel, &if on { format!("⏳ {name}") } else { name.clone() });
+        if on {
+            self.busy_since.set(Some(Instant::now()));
+            self.busy_gen.set(self.busy_gen.get().wrapping_add(1));
+            self.animate();
+        } else if let Some(t) = self.busy_since.take() {
+            self.elapsed.set_foreground_color(crate::theme::c(crate::theme::p().text));
+            crate::buddy::notify_done(&crate::app().frame, t.elapsed().as_secs_f32(), &format!("rsqldev · {name}"), &self.running_sql());
+        }
+    }
+
+    /// While busy: the buddy hops by the timer, which counts up and turns the accent colour
+    /// once the work drags on ([`crate::buddy::TIRED_SECS`]); done: a short beam, then hidden.
+    fn animate(&self) {
+        let Some(frames) = crate::buddy::frames() else { return };
+        let pic = self.pet.get().unwrap_or_else(|| {
+            let b = StaticBitmap::new_with_bitmap_bundle(&self.pet_slot, ID_ANY as i32, &frames.happy);
+            self.pet.set(Some(b));
+            b
+        });
+        pic.set_tooltip("Working… Cancel stops it");
+        pic.show(true);
+        let (me, run) = (self.weak(), self.busy_gen.get());
+        let (mut tick, mut cheer) = (0u32, 0);
+        crate::hub::every_tick(move || {
+            let Some(w) = me.upgrade() else { return false };
+            if w.busy_gen.get() != run {
+                return false;
+            }
+            tick = tick.wrapping_add(1);
+            match w.busy_since.get().filter(|_| w.busy.get()) {
+                Some(t) => {
+                    if tick % 2 == 0 {
+                        let secs = t.elapsed().as_secs_f32();
+                        let tired = secs >= crate::buddy::TIRED_SECS;
+                        pic.set_bitmap_bundle(frames.at(tick / 2, tired));
+                        w.elapsed.set_label(&format!("{secs:.1} s"));
+                        if tired {
+                            w.elapsed.set_foreground_color(crate::theme::c(crate::theme::p().accent));
+                        }
+                    }
+                    true
+                }
+                None => {
+                    if cheer == 0 {
+                        pic.set_bitmap_bundle(&frames.happy);
+                        pic.set_tooltip("Done");
+                    }
+                    cheer += 1;
+                    if cheer < 40 {
+                        return true;
+                    }
+                    pic.show(false);
+                    false
+                }
+            }
+        });
     }
 
     fn weak(&self) -> Weak<Worksheet> {

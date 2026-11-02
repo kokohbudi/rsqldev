@@ -950,6 +950,22 @@ impl App {
         }
     }
 
+    /// The first worksheet with a statement in flight (status bar activity).
+    fn running_sheet(&self) -> Option<SheetRef> {
+        self.pages.borrow().iter().find_map(|p| match p {
+            Page::Sheet(s) if s.is_busy() => Some(s.clone()),
+            _ => None,
+        })
+    }
+
+    /// Bring the document tab showing `panel` to the front.
+    fn show_panel(&self, panel: &Panel) {
+        let i = self.nb.get_page_index(panel);
+        if i >= 0 {
+            self.nb.set_selection(i as usize);
+        }
+    }
+
     fn current_sheet(&self) -> Option<SheetRef> {
         let i = self.current()?;
         match &self.pages.borrow()[i] {
@@ -1440,9 +1456,17 @@ fn check_updates(manual: bool) {
 fn activity_bar(sb: StatusBar) {
     const F_TIME: usize = 4;
     const F_BAR: usize = 5;
-    // The buddy hops while the database works and beams for a second when it is done. Its
-    // frames and widget are made on the first busy tick, not at startup.
-    let mut buddy: Option<(buddy::Frames, StaticBitmap)> = None;
+    // The buddy hops along a thin rail while the database works and beams for a second when it
+    // is done. The time field names what is working (connection of the running worksheet), the
+    // buddy's tooltip shows its SQL and a click brings that worksheet up. Widgets and frames
+    // are made on the first busy tick, not at startup.
+    struct Pet {
+        frames: Rc<buddy::Frames>,
+        pic: StaticBitmap,
+        rail: Panel,
+        tip: String,
+    }
+    let mut pet: Option<Pet> = None;
     let mut since: Option<std::time::Instant> = None;
     let mut tick: u32 = 0;
     let mut cheer = 0;
@@ -1455,14 +1479,22 @@ fn activity_bar(sb: StatusBar) {
         if !sb.is_valid() {
             return false;
         }
-        if buddy.is_none() {
-            let Some(f) = buddy::Frames::new() else { return false };
-            let pet = StaticBitmap::new_with_bitmap_bundle(&sb, ID_ANY as i32, &f.happy);
-            pet.show(false);
-            buddy = Some((f, pet));
+        if pet.is_none() {
+            let Some(frames) = buddy::frames() else { return false };
+            let pic = StaticBitmap::new_with_bitmap_bundle(&sb, ID_ANY as i32, &frames.happy);
+            pic.show(false);
+            pic.on_mouse_left_up(|_| {
+                let a = app();
+                if let Some(ws) = a.running_sheet() {
+                    a.show_panel(&ws.panel);
+                }
+            });
+            let rail = Panel::builder(&sb).build();
+            rail.set_background_color(theme::c(theme::p().grid_line));
+            rail.show(false);
+            pet = Some(Pet { frames, pic, rail, tip: String::new() });
         }
-        let (frames, pet) = buddy.as_ref().unwrap();
-        let pet = *pet;
+        let p = pet.as_mut().unwrap();
         match (busy, since) {
             (true, None) => since = Some(std::time::Instant::now()),
             (false, Some(_)) => {
@@ -1470,7 +1502,8 @@ fn activity_bar(sb: StatusBar) {
                 sb.set_status_text("", F_TIME);
                 // ~1 s of joy at 25 ms ticks.
                 cheer = 40;
-                pet.set_bitmap_bundle(&frames.happy);
+                p.pic.set_bitmap_bundle(&p.frames.happy);
+                p.rail.show(false);
             }
             _ => {}
         }
@@ -1480,17 +1513,34 @@ fn activity_bar(sb: StatusBar) {
             if tick % 2 == 1 {
                 return true;
             }
+            let secs = t.elapsed().as_secs_f32();
             let r = sb.get_field_rect(F_BAR);
             let f = tick / 2;
-            pet.set_bitmap_bundle(frames.at(f));
+            let y = r.y + (r.height - 20) / 2;
+            p.pic.set_bitmap_bundle(p.frames.at(f, secs >= buddy::TIRED_SECS));
             // Shown at once: a click that waits on the database must never look like a hang.
-            pet.set_size_with_pos(r.x + 4 + buddy::walk(f * 2, r.width - 28), r.y + (r.height - 20) / 2, 20, 20);
-            pet.show(true);
-            sb.set_status_text(&format!("Working {:.1} s", t.elapsed().as_secs_f32()), F_TIME);
+            p.pic.set_size_with_pos(r.x + 4 + buddy::walk(f * 2, r.width - 28), y, 20, 20);
+            p.pic.show(true);
+            p.rail.set_size_with_pos(r.x + 4, y + 19, r.width - 8, 1);
+            p.rail.show(true);
+            let ws = app().running_sheet();
+            let who = ws.as_ref().map(|w| w.conn().borrow().cfg.name.clone());
+            sb.set_status_text(&match &who {
+                Some(n) => format!("{n} · {secs:.1} s"),
+                None => format!("Working {secs:.1} s"),
+            }, F_TIME);
+            let tip = match &ws {
+                Some(w) => format!("{} is running:\n{}\n\nClick to show the worksheet.", who.unwrap_or_default(), w.running_sql()),
+                None => "Working with the database…".into(),
+            };
+            if tip != p.tip {
+                p.pic.set_tooltip(&tip);
+                p.tip = tip;
+            }
         } else if cheer > 0 {
             cheer -= 1;
             if cheer == 0 {
-                pet.show(false);
+                p.pic.show(false);
             }
         }
         true
@@ -1833,7 +1883,7 @@ fn start(prefs0: config::Prefs) {
             frame.set_icon(&b);
         }
         let sb = frame.create_status_bar(6, 0, ID_ANY as i32, "statusbar");
-        sb.set_status_widths(&[-1, 150, 70, 90, 90, 130]);
+        sb.set_status_widths(&[-1, 150, 70, 90, 150, 130]);
         activity_bar(sb);
         let split = SplitterWindow::builder(&frame).build();
         // ponytail: AUI flags not exposed by wxDragon; values from wx/aui/auibook.h.
@@ -1902,6 +1952,7 @@ fn start(prefs0: config::Prefs) {
         // A call tip is its own floating window: it must not stay over other apps.
         frame.on_activate(|e| {
             if let WindowEventData::Activate(a) = &e {
+                buddy::set_app_active(a.is_active());
                 if !a.is_active() {
                     complete::cancel_tip();
                 }
