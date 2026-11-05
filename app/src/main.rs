@@ -1679,7 +1679,7 @@ fn menus(frame: &Frame) {
 fn toolbar(frame: &Frame) {
     let Some(tb) = frame.create_tool_bar(Some(ToolBarStyle::Default | ToolBarStyle::Flat), ID_ANY as i32) else { return };
     let add = |id: i32, icon: &str, label: &str, tip: &str| {
-        if let Some(b) = icons::bitmap(icon, 16) {
+        if let Some(b) = icons::bitmap(icon, icons::px(frame)) {
             tb.add_tool(id, label, &b, tip);
         }
     };

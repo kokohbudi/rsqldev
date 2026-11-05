@@ -90,7 +90,7 @@ pub fn show(parent: &Frame) {
     let dlg = Dialog::builder(parent, "Drivers").with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(820, 520).build();
     let list = ListCtrl::builder(&dlg).with_style(ListCtrlStyle::Report | ListCtrlStyle::SingleSel).build();
     // Engine icons, as in the Connections tree.
-    list.set_image_list(crate::icons::tree_images(), 1 /* image_list_type::SMALL */);
+    list.set_image_list(crate::icons::tree_images(list.from_dip_int(16)), 1 /* image_list_type::SMALL */);
     for (i, (h, w)) in [("Driver", 190), ("Category", 110), ("Connects via", 170), ("Status", 280)].iter().enumerate() {
         list.insert_column(i as i64, h, ListColumnFormat::Left, *w);
     }

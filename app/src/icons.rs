@@ -124,7 +124,7 @@ thread_local! {
     static CACHE: RefCell<HashMap<(String, i32), Bitmap>> = RefCell::new(HashMap::new());
 }
 
-/// Bitmap at `px` pixels (pass 32 for crisp toolbar icons on Retina).
+/// Bitmap at `px` pixels (see [`px`]).
 pub fn bitmap(name: &str, px: i32) -> Option<Bitmap> {
     CACHE.with(|c| {
         if let Some(b) = c.borrow().get(&(name.to_string(), px)) {
@@ -136,9 +136,16 @@ pub fn bitmap(name: &str, px: i32) -> Option<Bitmap> {
     })
 }
 
+/// Button / toolbar icon size for `win`: 16 DIP (identity on macOS, where pixels are points).
+/// wx itself upscales a plain bitmap 2x above 1.5x DPI, so only 1x-1.5x is scaled here.
+pub fn px(win: &dyn WxWidget) -> i32 {
+    let p = win.from_dip_int(16);
+    if p > 24 { 16 } else { p }
+}
+
 /// Flat, borderless icon button with a tooltip — SQL Developer style toolbar item.
 pub fn tool(parent: &dyn WxWidget, name: &str, tip: &str) -> BitmapButton {
-    let b = BitmapButton::builder(parent).with_bitmap(bitmap(name, 16)).with_style(BitmapButtonStyle::BorderNone | BitmapButtonStyle::ExactFit).build();
+    let b = BitmapButton::builder(parent).with_bitmap(bitmap(name, px(parent))).with_style(BitmapButtonStyle::BorderNone | BitmapButtonStyle::ExactFit).build();
     b.set_tooltip(tip);
     b
 }
@@ -154,10 +161,11 @@ pub fn tree_index(name: &str) -> i32 {
     TREE.iter().position(|n| *n == name).map_or(-1, |i| i as i32)
 }
 
-pub fn tree_images() -> ImageList {
-    let il = ImageList::new(16, 16, true, TREE.len() as i32);
+/// Tree image list at `px` pixels (image lists are not DPI scaled by wx: pass `from_dip_int(16)`).
+pub fn tree_images(px: i32) -> ImageList {
+    let il = ImageList::new(px, px, true, TREE.len() as i32);
     for n in TREE {
-        if let Some(b) = bitmap(n, 16) {
+        if let Some(b) = bitmap(n, px) {
             il.add_bitmap(&b);
         }
     }
