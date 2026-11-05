@@ -215,7 +215,8 @@ impl ResultGrid {
     pub fn new(parent: &dyn WxWidget) -> ResultGrid {
         let grid = Grid::builder(parent).build();
         grid.create_grid(0, 0, GridSelectionMode::Cells);
-        grid.use_native_col_header(true);
+        // The native Windows header ignores the label colour: white strip in dark theme.
+        grid.use_native_col_header(!cfg!(windows));
         grid.set_default_cell_overflow(false);
         grid.set_row_label_size(48);
         grid.enable_editing(false);
