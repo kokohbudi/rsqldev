@@ -93,7 +93,7 @@ pub fn new_editor(parent: &dyn WxWidget, font_face: &str, font_size: i32) -> Sty
         move |on: bool| {
             if links.replace(on) != on {
                 styled.set(0);
-                highlight(&stc, &styled, &busy, on, None);
+                highlight(&stc, &styled, &busy, on);
             }
         }
     };
@@ -121,15 +121,18 @@ pub fn new_editor(parent: &dyn WxWidget, font_face: &str, font_size: i32) -> Sty
         stc.call_tip_cancel();
         e.skip(true);
     });
+    // wxDragon's StyledTextEvent::get_position() reads wxCommandEvent::GetInt(), which wx never
+    // sets for STC events (always 0), so neither the edit position nor the StyleNeeded end is
+    // known. Restyling stopped at the first `;` and later statements stayed plain.
+    // ponytail: any edit restyles the whole text (~ms per MB). Upgrade path: once wxDragon exposes
+    // wxStyledTextEvent::GetPosition, restore min(styled, edit pos) and style up to the event end.
     let (s1, b1) = (styled.clone(), busy.clone());
-    stc.on_stc_modified(move |e| {
+    stc.on_stc_modified(move |_| {
         if !b1.get() {
-            if let Some(p) = e.get_position() {
-                s1.set(s1.get().min(p.max(0) as usize));
-            }
+            s1.set(0);
         }
     });
-    stc.on_stc_style_needed(move |e| highlight(&stc, &styled, &busy, links.get(), e.get_position()));
+    stc.on_stc_style_needed(move |_| highlight(&stc, &styled, &busy, links.get()));
     stc
 }
 
@@ -288,13 +291,10 @@ pub fn goto_bookmark(stc: StyledTextCtrl, next: bool) {
     }
 }
 
-/// Style the whole document. ponytail: full restyle per change, fine below ~1 MB scripts.
-/// Style from the first unstyled line up to `until` (Scintilla asks for what it shows), not
-/// the whole document on every keystroke.
-fn highlight(stc: &StyledTextCtrl, styled: &std::cell::Cell<usize>, busy: &std::cell::Cell<bool>, links: bool, until: Option<i32>) {
+/// Style from the first unstyled line to the end of the text.
+fn highlight(stc: &StyledTextCtrl, styled: &std::cell::Cell<usize>, busy: &std::cell::Cell<bool>, links: bool) {
     let text = stc.get_text();
     let len = text.len();
-    let until = until.map_or(len, |p| (p.max(0) as usize).min(len));
     // Start of the line holding the first unstyled byte (a token boundary)...
     let mut from = styled.get().min(len);
     from = text[..from].rfind('\n').map_or(0, |i| i + 1);
@@ -304,10 +304,6 @@ fn highlight(stc: &StyledTextCtrl, styled: &std::cell::Cell<usize>, busy: &std::
     }
     // Links need the statement's start (FROM may be lines above): restyle from the top then.
     // Aliases need their whole statement (the alias is defined after its first uses).
-    let mut until = until;
-    while !text.is_char_boundary(until) {
-        until += 1;
-    }
     let mut aliases = true;
     if links {
         from = 0;
@@ -317,16 +313,7 @@ fn highlight(stc: &StyledTextCtrl, styled: &std::cell::Cell<usize>, busy: &std::
             None => aliases = false,
         }
     }
-    let mut cap = (until + ALIAS_SPAN).min(len);
-    while !text.is_char_boundary(cap) {
-        cap -= 1;
-    }
-    match text[until..cap].find(';') {
-        Some(k) => until += k + 1,
-        None if cap == len => until = len,
-        None => aliases = false,
-    }
-    let mut toks = lex_links(&text, from, until, links);
+    let mut toks = lex_links(&text, from, len, links);
     if aliases {
         alias_styles(&text, from, &mut toks, links);
     }

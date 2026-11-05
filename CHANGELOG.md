@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.8.1 — 2026-11-05
+
+### Bug fixes
+- Syntax highlighting stopped after the first statement of a worksheet; every statement is highlighted again.
+- Windows: the result grid showed a white column header in dark mode.
+- Windows / Linux: toolbar, button and tree icons were too small at 125–150% display scaling; they now scale with the display.
+- Windows / Linux: the worksheet editor pane was short at high display scaling; its height now scales with the display.
+
 ## v0.8.0 — 2026-11-02
 
 ### Features

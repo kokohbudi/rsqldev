@@ -173,7 +173,7 @@ impl Worksheet {
         bottom.add_page(&sp, "Script Output", false);
         bottom.add_page(&ep, "Explain Plan", false);
         bottom.add_page(&dp, "DBMS Output", false);
-        split.split_horizontally(&editor, &bottom, 300);
+        split.split_horizontally(&editor, &bottom, split.from_dip_int(300));
         split.set_minimum_pane_size(60);
 
         let find = crate::find::FindBar::new(&panel, editor);

@@ -156,7 +156,7 @@ impl Navigator {
         bar.add(&filter, 0, SizerFlag::All, 3);
         bar.add(&collapse, 0, SizerFlag::All, 3);
         let tree = TreeCtrl::builder(&panel).with_style(TreeCtrlStyle::Default | TreeCtrlStyle::HideRoot).build();
-        tree.set_image_list(crate::icons::tree_images());
+        tree.set_image_list(crate::icons::tree_images(tree.from_dip_int(16)));
         let s = BoxSizer::builder(Orientation::Vertical).build();
         s.add_sizer(&bar, 0, SizerFlag::Expand, 0);
         s.add(&tree, 1, SizerFlag::Expand, 0);
@@ -882,7 +882,7 @@ pub fn edit_dialog(parent: &Frame, existing: Option<&ConnConfig>, saved: &[ConnC
     let dlg = Dialog::builder(parent, "New / Select Database Connection").with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder).with_size(900, 600).build();
 
     let list = ListCtrl::builder(&dlg).with_style(ListCtrlStyle::Report | ListCtrlStyle::SingleSel).build();
-    list.set_image_list(crate::icons::tree_images(), 1 /* image_list_type::SMALL */);
+    list.set_image_list(crate::icons::tree_images(list.from_dip_int(16)), 1 /* image_list_type::SMALL */);
     list.insert_column(0, "Connection Name", ListColumnFormat::Left, 150);
     list.insert_column(1, "Connection Details", ListColumnFormat::Left, 200);
     for (i, c) in saved.iter().enumerate() {
