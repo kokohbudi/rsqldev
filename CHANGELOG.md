@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.9.0 — 2026-11-16
+## v0.8.2 — 2026-11-16
 
 ### Features
 - **Word wrap** for the SQL editor: View ▸ Word Wrap (Alt+Z) toggles it per worksheet; Preferences ▸ "Wrap long lines in the editor" sets the default for new worksheets. Soft wrap only, the SQL sent to the database is unchanged.
