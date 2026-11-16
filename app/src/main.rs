@@ -1606,11 +1606,12 @@ fn menus(frame: &Frame) {
         .append_item(ID_FIND_PREV, "Find Pre&vious\tShift+F3", "")
         .build();
     let view = Menu::builder()
+        .append_item(ID_WORD_WRAP, "&Word Wrap\tAlt+Z", "Wrap long lines in this worksheet's editor on / off (display only)")
+        .append_separator()
         .append_item(ID_TOGGLE_NAV, "&Connections\tCtrl+Shift+L", "Show or hide the Connections navigator")
         .append_item(ID_FIND_OBJECT, "Find DB &Object…\tCtrl+Shift+O", "Find tables, views, packages… by name in every schema")
         .append_item(ID_RECENT_OBJS, "Recent O&bjects…", "Reopen one of the last objects opened in the viewer")
         .append_item(ID_LOG, "&Log…", "Status messages and errors of this session, with their time")
-        .append_item(ID_WORD_WRAP, "&Word Wrap\tAlt+Z", "Wrap long lines in this worksheet's editor on / off (display only)")
         .append_separator()
         .append_item(ID_NEXT_TAB, "&Next Tab\tAlt+PgDn", "")
         .append_item(ID_PREV_TAB, "&Previous Tab\tAlt+PgUp", "")
