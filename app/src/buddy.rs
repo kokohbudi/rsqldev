@@ -109,7 +109,9 @@ pub fn notify_done(frame: &Frame, secs: f32, title: &str, what: &str) {
         return;
     }
     let what: String = what.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(90).collect();
-    if let Ok(n) = NotificationMessage::builder().with_title(title).with_message(&format!("Finished in {secs:.1} s  ·  {what}")).with_parent(frame).build() {
+    // wxDragon's default style is 0 (no icon flag); on Windows wx then asserts in
+    // GetMessageBoxIconId ("incorrect message box icon flags"). wx's own default is Information.
+    if let Ok(n) = NotificationMessage::builder().with_style(NotificationStyle::Information).with_title(title).with_message(&format!("Finished in {secs:.1} s  ·  {what}")).with_parent(frame).build() {
         n.show(TIMEOUT_AUTO);
         NOTE.with(|x| *x.borrow_mut() = Some(n));
     }
