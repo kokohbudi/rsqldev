@@ -132,6 +132,7 @@ const ID_ER: i32 = ID_HIGHEST + 71;
 const ID_SEARCH_SOURCE: i32 = ID_HIGHEST + 72;
 const ID_RECENT_OBJS: i32 = ID_HIGHEST + 73;
 const ID_PRINT: i32 = ID_HIGHEST + 74;
+const ID_WORD_WRAP: i32 = ID_HIGHEST + 75;
 const ID_DESCRIBE: i32 = ID_HIGHEST + 61;
 
 enum Page {
@@ -1281,11 +1282,12 @@ impl App {
                     complete::show(s.editor, &s.conn(), true);
                 }
             }
-            ID_DUP_LINES | ID_LINES_UP | ID_LINES_DOWN | ID_BRACE | ID_BOOKMARK | ID_BOOKMARK_NEXT | ID_BOOKMARK_PREV | ID_COMMENT | ID_GOTO_LINE => {
+            ID_DUP_LINES | ID_LINES_UP | ID_LINES_DOWN | ID_BRACE | ID_BOOKMARK | ID_BOOKMARK_NEXT | ID_BOOKMARK_PREV | ID_COMMENT | ID_GOTO_LINE | ID_WORD_WRAP => {
                 let Some(e) = sheet.map(|s| s.editor) else { return true };
                 match id {
                     ID_COMMENT => editor::toggle_comment(e),
                     ID_GOTO_LINE => editor::goto_line(e, &self.frame),
+                    ID_WORD_WRAP => editor::toggle_wrap(e),
                     ID_DUP_LINES => editor::duplicate_lines(e),
                     ID_LINES_UP | ID_LINES_DOWN => editor::move_lines(e, id == ID_LINES_UP),
                     ID_BRACE => editor::goto_brace(e),
@@ -1608,6 +1610,7 @@ fn menus(frame: &Frame) {
         .append_item(ID_FIND_OBJECT, "Find DB &Object…\tCtrl+Shift+O", "Find tables, views, packages… by name in every schema")
         .append_item(ID_RECENT_OBJS, "Recent O&bjects…", "Reopen one of the last objects opened in the viewer")
         .append_item(ID_LOG, "&Log…", "Status messages and errors of this session, with their time")
+        .append_item(ID_WORD_WRAP, "&Word Wrap\tAlt+Z", "Wrap long lines in this worksheet's editor on / off (display only)")
         .append_separator()
         .append_item(ID_NEXT_TAB, "&Next Tab\tAlt+PgDn", "")
         .append_item(ID_PREV_TAB, "&Previous Tab\tAlt+PgUp", "")
@@ -1725,6 +1728,7 @@ Editor
   Toggle Block Comment     Alt+Shift+C
   Upper / Lower / InitCap  Alt+'
   Go to Line               Ctrl/Cmd+G
+  Word Wrap                Alt+Z
   Popup Describe           Shift+F4
   Duplicate Lines          Ctrl/Cmd+Shift+D
   Move Lines Up / Down     Alt+Up / Alt+Down

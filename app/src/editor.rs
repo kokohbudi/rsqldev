@@ -18,6 +18,18 @@ const ALIAS_COLOURS: i32 = 8;
 /// ponytail: aliases are found only in statements up to 64 KB (one rescan per keystroke stays cheap).
 const ALIAS_SPAN: usize = 64 * 1024;
 pub const MARK_ERROR: i32 = 1;
+
+// ponytail: wxDragon 0.9.23 has no binding for these; wx's non-virtual members are called by
+// mangled name (`this` first, as wxDragon's own shims cast the window pointer). Drop when
+// wxDragon exposes set_scroll_width / set_scroll_width_tracking.
+unsafe extern "C" {
+    #[cfg_attr(windows, link_name = "?SetScrollWidth@wxStyledTextCtrl@@QEAAXH@Z")]
+    #[cfg_attr(not(windows), link_name = "_ZN16wxStyledTextCtrl14SetScrollWidthEi")]
+    fn stc_set_scroll_width(stc: *mut std::ffi::c_void, px: i32);
+    #[cfg_attr(windows, link_name = "?SetScrollWidthTracking@wxStyledTextCtrl@@QEAAX_N@Z")]
+    #[cfg_attr(not(windows), link_name = "_ZN16wxStyledTextCtrl22SetScrollWidthTrackingEb")]
+    fn stc_set_scroll_width_tracking(stc: *mut std::ffi::c_void, on: bool);
+}
 pub const MARK_BOOKMARK: i32 = 2;
 // Scintilla STYLE_BRACELIGHT / STYLE_BRACEBAD.
 const S_BRACE: i32 = 34;
@@ -79,6 +91,12 @@ pub fn new_editor(parent: &dyn WxWidget, font_face: &str, font_size: i32) -> Sty
     crate::copy::editor(stc);
     stc.set_tab_width(4);
     stc.set_use_tabs(false);
+    // Horizontal scroll range follows the longest line shown (Scintilla's default is a fixed
+    // 2000 px, so long lines could not be scrolled to their end).
+    unsafe {
+        stc_set_scroll_width(stc.handle_ptr().cast(), 1);
+        stc_set_scroll_width_tracking(stc.handle_ptr().cast(), true);
+    }
     stc.set_caret_line_visible(true);
     stc.set_caret_line_background(rgb(line));
     // Incremental styling. wxDragon has no GetEndStyled, so the first unstyled byte is tracked
@@ -232,6 +250,11 @@ pub fn toggle_block_comment(stc: StyledTextCtrl) {
 }
 
 /// Navigate ▸ Go to Line…
+/// View ▸ Word Wrap: soft-wrap long lines on / off (display only, the text is unchanged).
+pub fn toggle_wrap(stc: StyledTextCtrl) {
+    stc.set_wrap_mode(if stc.get_wrap_mode() == WrapMode::None { WrapMode::Word } else { WrapMode::None });
+}
+
 pub fn goto_line(stc: StyledTextCtrl, parent: &dyn WxWidget) {
     let (cur, n) = (stc.line_from_position(stc.get_current_pos()) + 1, stc.get_line_count());
     let Some(s) = crate::ui::ask(parent, &format!("Line number (1 - {n}):"), "Go to Line", &cur.to_string()) else { return };

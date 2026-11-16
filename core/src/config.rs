@@ -103,6 +103,8 @@ pub struct Prefs {
     pub open_worksheet_on_connect: bool,
     pub history_limit: usize,
     pub line_numbers: bool,
+    /// New worksheets soft-wrap long lines (View ▸ Word Wrap toggles per worksheet).
+    pub word_wrap: bool,
     /// Oracle NLS_TIMESTAMP_FORMAT (TIMESTAMP WITH TIME ZONE adds TZH:TZM).
     pub nls_timestamp_format: String,
     /// Oracle DDL (DBMS_METADATA): include storage / tablespace / segment clauses.
@@ -177,6 +179,7 @@ impl Default for Prefs {
             open_worksheet_on_connect: true,
             history_limit: 500,
             line_numbers: true,
+            word_wrap: false,
             nls_timestamp_format: "DD-MON-RR HH.MI.SSXFF AM".into(),
             ddl_storage: true,
             save_binds: true,

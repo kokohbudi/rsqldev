@@ -23,6 +23,8 @@ pub fn show(parent: &Frame) {
     tns.set_tooltip("Folder with tnsnames.ora, used when a connection sets no tns_admin option");
     let lines = CheckBox::builder(&dlg).with_label("Show line numbers").build();
     lines.set_value(p.line_numbers);
+    let wrap = CheckBox::builder(&dlg).with_label("Wrap long lines in the editor").build();
+    wrap.set_value(p.word_wrap);
     let on_connect = CheckBox::builder(&dlg).with_label("Open a worksheet on connect").build();
     on_connect.set_value(p.open_worksheet_on_connect);
     let hist = SpinCtrl::builder(&dlg).with_range(10, 10000).with_initial_value(p.history_limit.min(10000) as i32).build();
@@ -46,6 +48,7 @@ pub fn show(parent: &Frame) {
     crate::ui::row(&dlg, &g, "", &post);
     crate::ui::row(&dlg, &g, "", &upd);
     crate::ui::row(&dlg, &g, "", &lines);
+    crate::ui::row(&dlg, &g, "", &wrap);
     crate::ui::row(&dlg, &g, "", &templates);
     crate::ui::row(&dlg, &g, "", &on_connect);
     crate::ui::row(&dlg, &g, "", &reopen);
@@ -56,7 +59,7 @@ pub fn show(parent: &Frame) {
     crate::ui::row(&dlg, &g, "", &storage);
     crate::ui::row(&dlg, &g, "Oracle NLS date format", &nls);
     crate::ui::row(&dlg, &g, "Oracle NLS timestamp format", &nls_ts);
-    let note = StaticText::builder(&dlg).with_label("Connection settings (autocommit, NLS, DDL, tnsnames) apply to new connections;\nline numbers to new worksheets.").build();
+    let note = StaticText::builder(&dlg).with_label("Connection settings (autocommit, NLS, DDL, tnsnames) apply to new connections;\nline numbers and word wrap to new worksheets.").build();
     let bs = BoxSizer::builder(Orientation::Horizontal).build();
     bs.add_stretch_spacer(1);
     let cancel = Button::builder(&dlg).with_label("Cancel").with_id(ID_CANCEL).build();
@@ -80,6 +83,7 @@ pub fn show(parent: &Frame) {
         p.null_display = null.get_value();
         p.tns_dir = tns.get_value().trim().to_string();
         p.line_numbers = lines.get_value();
+        p.word_wrap = wrap.get_value();
         p.open_worksheet_on_connect = on_connect.get_value();
         p.history_limit = hist.value().max(10) as usize;
         p.ddl_storage = storage.get_value();
