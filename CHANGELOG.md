@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.8.3 — 2026-11-16
+
+### Bug fixes
+- Windows: a "debugging check has failed" alert (incorrect message box icon flags) popped up when a long job (ER diagram, query) finished while rsqldev was in the background; the completion notification now shows normally.
+
 ## v0.8.2 — 2026-11-16
 
 ### Features
