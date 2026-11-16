@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.0 — 2026-11-16
+
+### Features
+- **Word wrap** for the SQL editor: View ▸ Word Wrap (Alt+Z) toggles it per worksheet; Preferences ▸ "Wrap long lines in the editor" sets the default for new worksheets. Soft wrap only, the SQL sent to the database is unchanged.
+
+### Bug fixes
+- The editor's horizontal scrollbar stopped at a fixed width, so long lines (e.g. a pasted one-line INSERT) could not be scrolled to their end; it now follows the longest line.
+
 ## v0.8.1 — 2026-11-05
 
 ### Bug fixes
